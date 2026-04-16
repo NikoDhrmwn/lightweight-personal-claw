@@ -473,46 +473,25 @@ function buildStructuredIncomingMessage(
   },
   content: string
 ): string {
-  const parts = [
-    'Conversation info (untrusted metadata):',
-    '```json',
-    JSON.stringify({
-      platform: 'whatsapp',
-      conversation_label: meta.conversationLabel,
-      is_group_chat: meta.isGroupChat,
-      was_mentioned: meta.wasMentioned,
-    }, null, 2),
-    '```',
-    '',
-    'Sender (untrusted metadata):',
-    '```json',
-    JSON.stringify(meta.sender, null, 2),
-    '```',
+  // Compact context header — one line for LLM context, won't clutter WebUI
+  const senderLabel = meta.sender.name || meta.sender.label || 'unknown';
+  const senderHandle = meta.sender.jid?.split('@')[0] || senderLabel;
+  const chatType = meta.isGroupChat ? 'group' : 'DM';
+
+  const parts: string[] = [
+    `[context: whatsapp | ${chatType} | ${meta.conversationLabel} | sender: ${senderLabel} (${senderHandle})]`,
   ];
 
   if (meta.mentionTargets.length > 0) {
-    parts.push(
-      '',
-      'Known participants you may address (untrusted metadata):',
-      '```json',
-      JSON.stringify(
-        meta.mentionTargets.slice(0, 8).map(target => ({
-          label: target.label,
-          handle: `@${target.aliases[0]}`,
-          aliases: target.aliases.slice(0, 4).map(alias => `@${alias}`),
-          id: target.id,
-        })),
-        null,
-        2
-      ),
-      '```',
-      '',
-      'Use only these handles if you want to tag someone in your reply.'
-    );
+    const handles = meta.mentionTargets
+      .slice(0, 8)
+      .map(t => `@${t.aliases[0]} (${t.label})`)
+      .join(', ');
+    parts.push(`[participants: ${handles}]`);
   }
 
   if (meta.replyContext) {
-    parts.push('', meta.replyContext);
+    parts.push(meta.replyContext);
   }
 
   parts.push('', content);
