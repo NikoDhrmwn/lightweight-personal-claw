@@ -417,18 +417,20 @@ function shouldRepairToolTurn(
 ): boolean {
   if (toolDefs.length === 0) return false;
 
-  const combined = `${userMessage}\n${thinkingContent}`.toLowerCase();
-  const toolMentioned = toolDefs.some(td => combined.includes(td.function.name.toLowerCase()));
+  // Only repair if the thinking text explicitly mentions a tool name from the active set.
+  // Previously this matched broad keywords like 'search', 'read', 'run' which caused
+  // the agent to spam-loop when tools returned unhelpful results.
+  const thinking = thinkingContent.toLowerCase();
+  const toolMentioned = toolDefs.some(td => thinking.includes(td.function.name.toLowerCase()));
 
-  return toolMentioned ||
-    combined.includes('tool') ||
-    combined.includes('i will use') ||
-    combined.includes('use the') ||
-    combined.includes('search') ||
-    combined.includes('read') ||
-    combined.includes('list') ||
-    combined.includes('fetch') ||
-    combined.includes('run');
+  // Also check for explicit "I will use" or "tool_call" patterns in thinking
+  const hasExplicitIntent =
+    thinking.includes('i will use') ||
+    thinking.includes('tool_call') ||
+    thinking.includes('i need to call') ||
+    thinking.includes('let me use the');
+
+  return toolMentioned || hasExplicitIntent;
 }
 
 function inferSafeToolCall(
