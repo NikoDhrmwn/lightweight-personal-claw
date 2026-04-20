@@ -25,6 +25,7 @@ memory/
 .tmp/
 tmp/
 temp/
+.kilo/
 
 # OS / editor noise
 .DS_Store

@@ -11,7 +11,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-### [0.1.0] - 2026-04-20
+### [0.2.0] - 2026-04-20
+
+#### Added
+
+- Fresh, lightweight **OpenClaw-style WebUI overhaul** with a responsive slim sidebar interface.
+- Distinctly aligned message bubbles in WebUI: user right-aligned (accented), assistant left-aligned.
+- Native injection of `{{STATE_DIR}}` into system prompts for robust agent workspace awareness.
+
+#### Changed
+
+- Replaced noisy JSON metadata blocks in Discord and WhatsApp with a compact, minimal-token context header.
+- Streamlined agent tagging logic to only tag when contextually relevant instead of blanket-tagging every reply.
+- Agent identity now gracefully extracts Discord/WhatsApp sender handles for WebUI display instead of defaulting to generic 'You'.
+
+#### Fixed
+
+- Fixed aggressive infinite loops related to the web search tool by tightening the engine's tool-repair heuristic.
+- Fixed `[object Object]` bug when restoring message chat history in the WebUI.
+- Fixed ghosts diffs and execution failures tied to permissions/ghost line endings in `skills`.
+
+### [0.1.0] - 2026-04-12
 
 #### Added
 
