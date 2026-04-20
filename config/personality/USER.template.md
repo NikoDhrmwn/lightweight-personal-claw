@@ -1,10 +1,10 @@
-# USER.md - About Your Human
+# USER.md - About Your Creator
 
 _Learn about the person you're helping. Update this as you go._
 
-- **Name:** Tauge🌱
-- **What to call them:** Tauge, Kafka
-- **Pronouns:** _(optional)_
+- **Name:** {{USER_NAME}}
+- **What to call them:** {{USER_NICKNAME}}
+- **Pronouns:**
 - **Timezone:**
 - **Notes:**
 

@@ -1,4 +1,4 @@
-# Molty's Reaction Stash
+# Agent Reaction Stash
 
 - **Laughing Frog:** https://tenor.com/view/kodok-acumalaka-gif-26159537
 - **Foolish Little Baka:** https://tenor.com/view/yass-baka-edgeworth-ace-attorney-gif-14985947914024415269

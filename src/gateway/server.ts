@@ -8,8 +8,8 @@
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
-import { existsSync, watchFile, unwatchFile } from 'fs';
-import { join, dirname } from 'path';
+import { existsSync, readdirSync, readFileSync, statSync, watchFile, unwatchFile } from 'fs';
+import { join, dirname, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager, buildWebUIConfirmation } from '../core/confirmation.js';
@@ -200,6 +200,68 @@ export class GatewayServer {
       res.json({ workspace: this.resolveWorkspace() });
     });
 
+    this.app.get('/api/workspace/tree', (req, res) => {
+      try {
+        const requestedPath = typeof req.query.path === 'string' ? req.query.path : '.';
+        const absolutePath = this.resolveWorkspacePath(requestedPath);
+        const entries = readdirSync(absolutePath, { withFileTypes: true })
+          .map((entry) => {
+            const fullPath = join(absolutePath, entry.name);
+            const stats = statSync(fullPath);
+            return {
+              name: entry.name,
+              path: this.toWorkspaceRelative(fullPath),
+              kind: entry.isDirectory() ? 'directory' : 'file',
+              size: stats.size,
+              modifiedAt: stats.mtimeMs,
+            };
+          })
+          .sort((a, b) => {
+            if (a.kind !== b.kind) return a.kind === 'directory' ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          })
+          .slice(0, 250);
+
+        res.json({
+          workspace: this.resolveWorkspace(),
+          currentPath: this.toWorkspaceRelative(absolutePath),
+          entries,
+        });
+      } catch (err: any) {
+        res.status(400).json({ error: err.message });
+      }
+    });
+
+    this.app.get('/api/workspace/file', (req, res) => {
+      try {
+        const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+        if (!requestedPath) {
+          throw new Error('path query is required');
+        }
+
+        const absolutePath = this.resolveWorkspacePath(requestedPath);
+        const stats = statSync(absolutePath);
+        if (!stats.isFile()) {
+          throw new Error('Requested path is not a file');
+        }
+
+        const raw = readFileSync(absolutePath);
+        const isBinary = raw.includes(0);
+        const text = isBinary ? null : raw.toString('utf-8').slice(0, 32_000);
+
+        res.json({
+          path: this.toWorkspaceRelative(absolutePath),
+          size: stats.size,
+          modifiedAt: stats.mtimeMs,
+          isBinary,
+          truncated: !isBinary && raw.length > 32_000,
+          content: text,
+        });
+      } catch (err: any) {
+        res.status(400).json({ error: err.message });
+      }
+    });
+
     // Fallback: serve index.html for SPA
     this.app.use((_req, res) => {
       res.sendFile(join(webuiDir, 'index.html'));
@@ -209,16 +271,48 @@ export class GatewayServer {
   private getWebUIState(): Record<string, any> {
     const config = getConfig();
     const primary = config.llm?.defaults?.primary ?? 'unknown';
+    const stateDir = getStateDir();
+    const hasDiscordToken = !!(config.channels?.discord?.token ?? process.env.DISCORD_TOKEN);
+    const hasWhatsAppCreds = existsSync(join(stateDir, 'whatsapp-session', 'creds.json'));
+    const memory = new MemoryStore();
+    const sessionCount = memory.listSessions().length;
+    memory.close();
+
     return {
       status: 'ok',
       version: '0.1.0',
       model: primary.split('/').pop() ?? primary,
+      primaryModel: primary,
       uptime: process.uptime(),
+      stateDir,
+      configPath: getConfigPath(),
       workspace: this.resolveWorkspace(),
+      sessionCount,
+      pendingConfirmations: this.confirmations.getPending().length,
       channels: {
-        webui: { connected: this.clients.size, enabled: true },
-        discord: { enabled: !!config.channels?.discord?.enabled },
-        whatsapp: { enabled: !!config.channels?.whatsapp?.enabled },
+        webui: {
+          connected: this.clients.size,
+          enabled: true,
+          status: 'online',
+        },
+        discord: {
+          enabled: !!config.channels?.discord?.enabled,
+          configured: hasDiscordToken,
+          status: !config.channels?.discord?.enabled
+            ? 'disabled'
+            : hasDiscordToken
+              ? 'configured'
+              : 'missing_credentials',
+        },
+        whatsapp: {
+          enabled: !!config.channels?.whatsapp?.enabled,
+          configured: hasWhatsAppCreds,
+          status: !config.channels?.whatsapp?.enabled
+            ? 'disabled'
+            : hasWhatsAppCreds
+              ? 'configured'
+              : 'awaiting_login',
+        },
       },
       config: this.getEditableConfig(),
     };
@@ -226,15 +320,43 @@ export class GatewayServer {
 
   private getEditableConfig(): Record<string, any> {
     const config = getConfig();
+    const providers = config.llm?.providers ?? {};
+    const availableModels = Object.entries(providers).flatMap(([providerId, provider]: [string, any]) =>
+      (provider.models ?? []).map((model: any) => ({
+        id: `${providerId}/${model.id}`,
+        provider: providerId,
+        label: `${providerId}/${model.id}`,
+        contextWindow: model.contextWindow ?? null,
+        maxTokens: model.maxTokens ?? null,
+        vision: !!model.vision,
+        reasoning: !!model.reasoning,
+      }))
+    );
+
     return {
+      meta: {
+        version: config.meta?.version ?? '0.1.0',
+      },
+      paths: {
+        stateDir: getStateDir(),
+        configPath: getConfigPath(),
+        workspace: this.resolveWorkspace(),
+      },
       llm: {
         primary: config.llm?.defaults?.primary ?? '',
+        availableModels,
       },
       agent: {
         workspace: this.resolveWorkspace(),
         maxTurns: config.agent?.maxTurns ?? 20,
         toolLoading: config.agent?.toolLoading ?? 'lazy',
         thinkingDefault: config.agent?.thinkingDefault ?? 'medium',
+        contextTokens: config.agent?.contextTokens ?? 64000,
+        contextBudgetPct: config.agent?.contextBudgetPct ?? 80,
+        skills: {
+          enabled: config.agent?.skills?.enabled ?? true,
+          maxInjected: config.agent?.skills?.maxInjected ?? 2,
+        },
       },
       channels: {
         discord: {
@@ -248,12 +370,57 @@ export class GatewayServer {
           showToolProgress: config.channels?.whatsapp?.showToolProgress ?? false,
         },
       },
+      tools: {
+        exec: {
+          enabled: config.tools?.exec?.enabled ?? true,
+          confirmDestructive: config.tools?.exec?.confirmDestructive ?? true,
+        },
+        web: {
+          fetchEnabled: config.tools?.web?.fetch?.enabled ?? true,
+          browserFallback: config.tools?.web?.search?.browserFallback ?? true,
+          provider: config.tools?.web?.search?.provider ?? 'google-grounding',
+        },
+        filesystem: {
+          enabled: config.tools?.filesystem?.enabled ?? true,
+          confirmDelete: config.tools?.filesystem?.confirmDelete ?? true,
+        },
+        vision: {
+          enabled: config.tools?.vision?.enabled ?? true,
+          maxDimensionPx: config.tools?.vision?.maxDimensionPx ?? 1024,
+        },
+      },
+      gateway: {
+        port: config.gateway?.port ?? 7860,
+        bind: config.gateway?.bind ?? 'loopback',
+        authEnabled: !!(config.gateway?.auth?.token ?? process.env.GATEWAY_TOKEN),
+      },
     };
   }
 
   private resolveWorkspace(candidate?: string): string {
     const config = getConfig();
     return candidate || config.agent?.workspace || process.cwd();
+  }
+
+  private resolveWorkspacePath(candidate: string): string {
+    const workspace = resolve(this.resolveWorkspace());
+    const target = candidate && candidate !== '.'
+      ? resolve(workspace, candidate)
+      : workspace;
+    const workspacePrefix = workspace.endsWith(sep) ? workspace : `${workspace}${sep}`;
+    if (target !== workspace && !target.startsWith(workspacePrefix)) {
+      throw new Error('Path escapes the configured workspace');
+    }
+    if (!existsSync(target)) {
+      throw new Error('Path does not exist');
+    }
+    return target;
+  }
+
+  private toWorkspaceRelative(target: string): string {
+    const workspace = resolve(this.resolveWorkspace());
+    const rel = relative(workspace, target);
+    return rel ? rel.split('\\').join('/') : '.';
   }
 
   private setupWebSocket(): void {
@@ -473,6 +640,13 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
     if (patch.agent.maxTurns !== undefined) next.agent.maxTurns = Number(patch.agent.maxTurns);
     if (patch.agent.toolLoading !== undefined) next.agent.toolLoading = patch.agent.toolLoading === 'all' ? 'all' : 'lazy';
     if (patch.agent.thinkingDefault !== undefined) next.agent.thinkingDefault = String(patch.agent.thinkingDefault);
+    if (patch.agent.contextTokens !== undefined) next.agent.contextTokens = Number(patch.agent.contextTokens);
+    if (patch.agent.contextBudgetPct !== undefined) next.agent.contextBudgetPct = Number(patch.agent.contextBudgetPct);
+    if (patch.agent.skills) {
+      next.agent.skills ??= {};
+      if (patch.agent.skills.enabled !== undefined) next.agent.skills.enabled = !!patch.agent.skills.enabled;
+      if (patch.agent.skills.maxInjected !== undefined) next.agent.skills.maxInjected = Number(patch.agent.skills.maxInjected);
+    }
   }
 
   if (patch.channels?.discord) {
@@ -491,8 +665,44 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
     next.channels.whatsapp.showToolProgress = !!patch.channels.whatsapp.showToolProgress;
   }
 
+  if (patch.tools) {
+    next.tools ??= {};
+    if (patch.tools.exec) {
+      next.tools.exec ??= {};
+      if (patch.tools.exec.enabled !== undefined) next.tools.exec.enabled = !!patch.tools.exec.enabled;
+      if (patch.tools.exec.confirmDestructive !== undefined) next.tools.exec.confirmDestructive = !!patch.tools.exec.confirmDestructive;
+    }
+    if (patch.tools.web) {
+      next.tools.web ??= {};
+      (next.tools.web as any).search ??= {};
+      (next.tools.web as any).fetch ??= {};
+      if (patch.tools.web.fetchEnabled !== undefined) (next.tools.web as any).fetch.enabled = !!patch.tools.web.fetchEnabled;
+      if (patch.tools.web.browserFallback !== undefined) (next.tools.web as any).search.browserFallback = !!patch.tools.web.browserFallback;
+    }
+    if (patch.tools.filesystem) {
+      next.tools.filesystem ??= {};
+      if (patch.tools.filesystem.enabled !== undefined) next.tools.filesystem.enabled = !!patch.tools.filesystem.enabled;
+      if (patch.tools.filesystem.confirmDelete !== undefined) next.tools.filesystem.confirmDelete = !!patch.tools.filesystem.confirmDelete;
+    }
+    if (patch.tools.vision) {
+      next.tools.vision ??= {};
+      if (patch.tools.vision.enabled !== undefined) next.tools.vision.enabled = !!patch.tools.vision.enabled;
+      if (patch.tools.vision.maxDimensionPx !== undefined) next.tools.vision.maxDimensionPx = Number(patch.tools.vision.maxDimensionPx);
+    }
+  }
+
+  if (patch.gateway) {
+    next.gateway ??= {};
+    if (patch.gateway.port !== undefined) next.gateway.port = Number(patch.gateway.port);
+    if (patch.gateway.bind !== undefined) next.gateway.bind = patch.gateway.bind === '0.0.0.0' ? '0.0.0.0' : 'loopback';
+  }
+
   if (next.agent?.maxTurns && next.agent.maxTurns < 1) {
     throw new Error('agent.maxTurns must be at least 1');
+  }
+
+  if (next.agent?.contextBudgetPct && (next.agent.contextBudgetPct < 1 || next.agent.contextBudgetPct > 100)) {
+    throw new Error('agent.contextBudgetPct must be between 1 and 100');
   }
 
   return next;

@@ -162,22 +162,6 @@ export class WhatsAppChannel {
       hasImages: images.length > 0,
     }, 'WhatsApp message received');
 
-    // Send read receipts if configured
-    if (this.config.sendReadReceipts) {
-      await this.sock?.readMessages([msg.key]);
-    }
-
-    // ── Continuous composing presence ──
-    // WhatsApp shows "typing..." when we update presence
-    const sendComposing = async () => {
-      try {
-        await this.sock?.sendPresenceUpdate('composing', jid);
-      } catch { /* ignore */ }
-    };
-
-    await sendComposing();
-    const typingInterval = setInterval(sendComposing, 5_000);
-
     // Build session key
     const sessionKey = `whatsapp:${jid}`;
 
@@ -207,6 +191,48 @@ export class WhatsAppChannel {
         await this.sendFile(jid, filePath, fileName);
       },
     };
+
+    // Ignore group chat messages unless mentioned or replied to (but save to memory for context)
+    const isGroupChat = jid.endsWith('@g.us');
+    if (isGroupChat) {
+      const selfJidRaw = this.sock?.user?.id || '';
+      const selfJid = selfJidRaw.split(':')[0] + '@s.whatsapp.net';
+      const myName = this.config.agent?.name || this.sock?.user?.name || 'Molty';
+      
+      const isMentioned = didMentionMe(messageContent, selfJid) || 
+                          didMentionMe(messageContent, selfJidRaw) ||
+                          content.toLowerCase().includes(`@${myName.toLowerCase()}`);
+                          
+      const isReplyToMe = messageContent?.extendedTextMessage?.contextInfo?.participant === selfJid ||
+                          messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw;
+      
+      log.debug({ 
+        isGroupChat, isMentioned, isReplyToMe, 
+        selfJid, selfJidRaw,
+        mentionedJids: messageContent?.extendedTextMessage?.contextInfo?.mentionedJid 
+      }, 'WhatsApp group filter check');
+
+      if (!isMentioned && !isReplyToMe) {
+        this.engine.saveMessageSilent(request);
+        return;
+      }
+    }
+
+    // Send read receipts if configured
+    if (this.config.sendReadReceipts) {
+      await this.sock?.readMessages([msg.key]);
+    }
+
+    // ── Continuous composing presence ──
+    // WhatsApp shows "typing..." when we update presence
+    const sendComposing = async () => {
+      try {
+        await this.sock?.sendPresenceUpdate('composing', jid);
+      } catch { /* ignore */ }
+    };
+
+    await sendComposing();
+    const typingInterval = setInterval(sendComposing, 5_000);
 
     // Process and accumulate response
     let fullContent = '';
@@ -473,46 +499,25 @@ function buildStructuredIncomingMessage(
   },
   content: string
 ): string {
-  const parts = [
-    'Conversation info (untrusted metadata):',
-    '```json',
-    JSON.stringify({
-      platform: 'whatsapp',
-      conversation_label: meta.conversationLabel,
-      is_group_chat: meta.isGroupChat,
-      was_mentioned: meta.wasMentioned,
-    }, null, 2),
-    '```',
-    '',
-    'Sender (untrusted metadata):',
-    '```json',
-    JSON.stringify(meta.sender, null, 2),
-    '```',
+  // Compact context header — one line for LLM context, won't clutter WebUI
+  const senderLabel = meta.sender.name || meta.sender.label || 'unknown';
+  const senderHandle = meta.sender.jid?.split('@')[0] || senderLabel;
+  const chatType = meta.isGroupChat ? 'group' : 'DM';
+
+  const parts: string[] = [
+    `[context: whatsapp | ${chatType} | ${meta.conversationLabel} | sender: ${senderLabel} (${senderHandle})]`,
   ];
 
   if (meta.mentionTargets.length > 0) {
-    parts.push(
-      '',
-      'Known participants you may address (untrusted metadata):',
-      '```json',
-      JSON.stringify(
-        meta.mentionTargets.slice(0, 8).map(target => ({
-          label: target.label,
-          handle: `@${target.aliases[0]}`,
-          aliases: target.aliases.slice(0, 4).map(alias => `@${alias}`),
-          id: target.id,
-        })),
-        null,
-        2
-      ),
-      '```',
-      '',
-      'Use only these handles if you want to tag someone in your reply.'
-    );
+    const handles = meta.mentionTargets
+      .slice(0, 8)
+      .map(t => `@${t.aliases[0]} (${t.label})`)
+      .join(', ');
+    parts.push(`[participants: ${handles}]`);
   }
 
   if (meta.replyContext) {
-    parts.push('', meta.replyContext);
+    parts.push(meta.replyContext);
   }
 
   parts.push('', content);
@@ -532,7 +537,13 @@ function didMentionMe(messageContent: any, selfJid?: string): boolean {
     messageContent?.documentMessage?.contextInfo;
 
   const mentioned = contextInfo?.mentionedJid ?? [];
-  return mentioned.includes(selfJid);
+  const matched = mentioned.includes(selfJid);
+  
+  if (!matched && mentioned.length > 0) {
+    log.debug({ selfJid, mentioned }, 'No JID match in mentions');
+  }
+  
+  return matched;
 }
 
 function createMentionTarget(id: string, ...labels: Array<string | undefined>): MentionTarget {

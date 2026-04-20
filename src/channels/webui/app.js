@@ -1,130 +1,217 @@
-/**
- * LiteClaw — WebUI Client
- * Full-featured: sessions, settings panel, channel controls,
- * WebSocket streaming, markdown rendering, confirmations, image uploads.
- */
-
 (() => {
-  // ─── State ───────────────────────────────────────────────────────
   let ws = null;
+  let reconnectTimer = null;
   let isStreaming = false;
   let currentAssistantEl = null;
-  let currentContent = '';
-  let pendingConfirmationId = null;
-  let currentSessionKey = 'webui:default';
-  const attachedImages = [];
-  let healthData = {};
+  let currentContent = "";
+  let currentSessionKey = "webui:default";
+  let currentFilter = "";
   let currentConfig = {};
+  let healthData = {};
+  let sessions = [];
+  let pendingConfirmationId = null;
+  let workspacePath = ".";
+  let selectedWorkspaceFile = "";
+  const attachedImages = [];
 
-  // ─── DOM References ──────────────────────────────────────────────
-  const $ = (sel) => document.querySelector(sel);
-  const $$ = (sel) => document.querySelectorAll(sel);
+  const $ = (selector) => document.querySelector(selector);
+  const messagesEl = $("#messages");
+  const sessionListEl = $("#sessionList");
+  const sessionSearch = $("#sessionSearch");
+  const sendBtn = $("#sendBtn");
+  const inputEl = $("#messageInput");
+  const imageInput = $("#imageInput");
+  const imagePreview = $("#imagePreview");
+  const workspaceBtn = $("#workspaceBtn");
+  const workspaceDrawer = $("#workspaceDrawer");
+  const workspaceTree = $("#workspaceTree");
+  const workspacePreviewMeta = $("#workspacePreviewMeta");
+  const workspacePreviewContent = $("#workspacePreviewContent");
+  const workspacePathLabel = $("#workspacePathLabel");
+  const closeWorkspaceBtn = $("#closeWorkspaceBtn");
+  const workspaceUpBtn = $("#workspaceUpBtn");
+  const workspaceRefreshBtn = $("#workspaceRefreshBtn");
+  const settingsBtn = $("#settingsBtn");
+  const settingsOverlay = $("#settingsOverlay");
+  const closeSettingsBtn = $("#closeSettingsBtn");
+  const saveSettingsBtn = $("#saveSettingsBtn");
+  const clearAllBtn = $("#clearAllBtn");
+  const confirmModal = $("#confirmModal");
+  const confirmBody = $("#confirmBody");
+  const confirmAccept = $("#confirmAccept");
+  const confirmReject = $("#confirmReject");
+  const noticeStack = $("#noticeStack");
+  const sidebar = $("#sidebar");
+  const sidebarToggle = $("#sidebarToggle");
+  const sidebarBackdrop = $("#sidebarBackdrop");
+  const mobileMenuBtn = $("#mobileMenuBtn");
 
-  const messagesEl = $('#messages');
-  const welcomeEl = $('#welcomeScreen');
-  const inputEl = $('#messageInput');
-  const sendBtn = $('#sendBtn');
-  const clearBtn = $('#clearBtn');
-  const newChatBtn = $('#newChatBtn');
-  const sidebarToggle = $('#sidebarToggle');
-  const sidebar = $('#sidebar');
-  const statusDot = $('.status-dot');
-  const statusText = $('#statusText');
-  const imageInput = $('#imageInput');
-  const imagePreview = $('#imagePreview');
-  const confirmModal = $('#confirmModal');
-  const confirmBody = $('#confirmBody');
-  const confirmAccept = $('#confirmAccept');
-  const confirmReject = $('#confirmReject');
-  const sessionListEl = $('#sessionList');
-  const modelBadgeEl = $('#modelBadge');
-  const chatTitle = $('#chatTitle');
-  const chatSubtitle = $('#chatSubtitle');
-  const workspacePill = $('#workspacePill');
-  const noticeStack = $('#noticeStack');
+  const refs = {
+    statusDot: $("#statusDot"),
+    statusText: $("#statusText"),
+    modelBadge: $("#modelBadge"),
+    sessionCountBadge: $("#sessionCountBadge"),
+    chatTitle: $("#chatTitle"),
+    chatSubtitle: $("#chatSubtitle"),
+    healthPill: $("#healthPill"),
+    healthDot: $("#healthDot"),
+    healthLabel: $("#healthLabel"),
+    chWebui: $("#ch-webui"),
+    chDiscord: $("#ch-discord"),
+    chWhatsapp: $("#ch-whatsapp"),
+    newChatBtn: $("#newChatBtn"),
+    clearBtn: $("#clearBtn"),
+    exportBtn: $("#exportBtn"),
+    settingModel: $("#settingModel"),
+    settingThinking: $("#settingThinking"),
+    settingWorkspace: $("#settingWorkspace"),
+    settingMaxTurns: $("#settingMaxTurns"),
+    settingContextTokens: $("#settingContextTokens"),
+    settingContextBudgetPct: $("#settingContextBudgetPct"),
+    settingSkillsMaxInjected: $("#settingSkillsMaxInjected"),
+    toggleSkillsEnabled: $("#toggleSkillsEnabled"),
+    toggleDiscord: $("#toggleDiscord"),
+    toggleWhatsapp: $("#toggleWhatsapp"),
+    discordReplyStyle: $("#discordReplyStyle"),
+    whatsappReplyStyle: $("#whatsappReplyStyle"),
+    toggleDiscordToolProgress: $("#toggleDiscordToolProgress"),
+    toggleWhatsappToolProgress: $("#toggleWhatsappToolProgress"),
+    toggleExecEnabled: $("#toggleExecEnabled"),
+    toggleExecConfirm: $("#toggleExecConfirm"),
+    toggleWebFetchEnabled: $("#toggleWebFetchEnabled"),
+    toggleWebFallback: $("#toggleWebFallback"),
+    toggleFilesystemEnabled: $("#toggleFilesystemEnabled"),
+    toggleConfirmDelete: $("#toggleConfirmDelete"),
+    toggleVisionEnabled: $("#toggleVisionEnabled"),
+    settingVisionMaxDimension: $("#settingVisionMaxDimension"),
+    settingGatewayPort: $("#settingGatewayPort"),
+    settingGatewayBind: $("#settingGatewayBind"),
+    gatewayAuthNote: $("#gatewayAuthNote"),
+  };
 
-  // Settings
-  const settingsOverlay = $('#settingsOverlay');
-  const settingsBtn = $('#settingsBtn');
-  const closeSettingsBtn = $('#closeSettingsBtn');
-  const settingTemp = $('#settingTemp');
-  const settingTempVal = $('#settingTempVal');
-  const settingModel = $('#settingModel');
-  const settingThinking = $('#settingThinking');
-  const settingMaxTurns = $('#settingMaxTurns');
-  const settingWorkspace = $('#settingWorkspace');
-  const saveSettingsBtn = $('#saveSettingsBtn');
-  const discordReplyStyle = $('#discordReplyStyle');
-  const whatsappReplyStyle = $('#whatsappReplyStyle');
-  const clearAllBtn = $('#clearAllBtn');
+  // ─── Sidebar Toggle ──────────────────────────────────────────────
 
-  // ─── Session Management ─────────────────────────────────────────
+  function setSidebarOpen(open) {
+    sidebar.classList.toggle("open", open);
+    if (sidebarBackdrop) sidebarBackdrop.classList.toggle("visible", open);
+  }
 
-  async function loadSessions() {
+  // ─── Fetch Helpers ────────────────────────────────────────────────
+
+  async function fetchJson(url, options) {
+    const res = await fetch(url, options);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  }
+
+  // ─── WebSocket ────────────────────────────────────────────────────
+
+  function connect() {
+    clearTimeout(reconnectTimer);
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+    ws.onopen = () => {
+      refs.statusDot.classList.add("connected");
+      refs.statusText.textContent = "Connected";
+      fetchHealth();
+      fetchConfig();
+      loadSessions();
+      sendSessionInit();
+      showNotice("Realtime link restored.", "success", 2200);
+    };
+
+    ws.onclose = () => {
+      refs.statusDot.classList.remove("connected");
+      refs.statusText.textContent = "Reconnecting...";
+      showNotice("Lost connection. Reconnecting...", "error", 2800);
+      reconnectTimer = setTimeout(connect, 2500);
+    };
+
+    ws.onerror = () => {
+      refs.statusText.textContent = "Connection error";
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        handleServerMessage(JSON.parse(event.data));
+      } catch (error) {
+        console.error("Failed to parse ws payload", error);
+      }
+    };
+  }
+
+  // ─── Health & Config ──────────────────────────────────────────────
+
+  async function fetchHealth() {
     try {
-      const res = await fetch('/api/sessions');
-      if (!res.ok) return;
-      const data = await res.json();
-      renderSessionList(data.sessions ?? []);
-    } catch {
-      renderSessionList([]);
+      healthData = await fetchJson("/health");
+      renderHealth();
+    } catch (error) {
+      showNotice(`Failed to refresh health: ${error.message || error}`, "error", 2600);
     }
   }
 
-  function renderSessionList(sessions) {
-    sessionListEl.innerHTML = '';
+  async function fetchConfig() {
+    try {
+      currentConfig = await fetchJson("/api/config");
+      hydrateSettings(currentConfig);
+    } catch (error) {
+      showNotice(`Failed to load config: ${error.message || error}`, "error", 3200);
+    }
+  }
 
-    // Include all sessions, no filtering!
-    let webuiSessions = sessions;
+  // ─── Sessions ─────────────────────────────────────────────────────
 
-    // Always ensure current session exists in list
-    if (!webuiSessions.find(s => s.sessionKey === currentSessionKey)) {
-      webuiSessions.unshift({ sessionKey: currentSessionKey, messageCount: 0, lastActivity: Date.now() });
+  async function loadSessions() {
+    try {
+      const data = await fetchJson("/api/sessions");
+      sessions = data.sessions || [];
+      renderSessionList();
+    } catch {
+      sessions = [];
+      renderSessionList();
+    }
+  }
+
+  function renderSessionList() {
+    const filtered = sessions.filter((session) => {
+      if (!currentFilter) return true;
+      const haystack = `${session.sessionKey} ${session.userIdentifier || ""}`.toLowerCase();
+      return haystack.includes(currentFilter.toLowerCase());
+    });
+
+    if (!filtered.find((session) => session.sessionKey === currentSessionKey)) {
+      filtered.unshift({
+        sessionKey: currentSessionKey,
+        messageCount: 0,
+        lastActivity: Date.now(),
+      });
     }
 
-    for (const session of webuiSessions) {
-      const el = document.createElement('div');
-      el.className = 'session-item' + (session.sessionKey === currentSessionKey ? ' active' : '');
+    refs.sessionCountBadge.textContent = String(filtered.length);
+    sessionListEl.innerHTML = "";
 
+    for (const session of filtered) {
+      const el = document.createElement("div");
+      el.className = `session-item${session.sessionKey === currentSessionKey ? " active" : ""}`;
       const label = formatSessionName(session);
-      const count = session.messageCount > 0 ? session.messageCount : '';
-
       el.innerHTML = `
-        <span class="session-dot"></span>
-        <span class="session-label">${escapeHtml(label)}</span>
-        ${count ? `<span class="session-count">${count}</span>` : ''}
-        <button class="session-delete" title="Delete session">&times;</button>
+        <button class="session-label" type="button" title="${escapeHtml(session.sessionKey)}">${escapeHtml(label)}</button>
+        <span class="session-count">${Number(session.messageCount || 0)}</span>
+        <button class="session-delete" type="button" title="Delete session">×</button>
       `;
 
-      el.querySelector('.session-label').addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (session.sessionKey !== currentSessionKey) {
-          switchSession(session.sessionKey);
-        }
-      });
-
-      el.querySelector('.session-dot').addEventListener('click', () => {
-        if (session.sessionKey !== currentSessionKey) {
-          switchSession(session.sessionKey);
-        }
-      });
-
-      el.querySelector('.session-delete').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (confirm(`Delete session "${label}"?`)) {
-          await fetch(`/api/sessions/${encodeURIComponent(session.sessionKey)}`, { method: 'DELETE' });
-          if (session.sessionKey === currentSessionKey) {
-            switchSession('webui:default');
-          } else {
-            loadSessions();
-          }
-        }
-      });
-
-      // Click on the whole row
-      el.addEventListener('click', () => {
-        if (session.sessionKey !== currentSessionKey) {
-          switchSession(session.sessionKey);
+      el.querySelector(".session-label").addEventListener("click", () => switchSession(session.sessionKey));
+      el.querySelector(".session-delete").addEventListener("click", async (event) => {
+        event.stopPropagation();
+        if (!confirm(`Delete session "${label}"?`)) return;
+        await fetch(`/api/sessions/${encodeURIComponent(session.sessionKey)}`, { method: "DELETE" });
+        if (session.sessionKey === currentSessionKey) {
+          switchSession("webui:default");
+        } else {
+          loadSessions();
         }
       });
 
@@ -133,721 +220,601 @@
   }
 
   function formatSessionName(sessionOrKey) {
-    const key = typeof sessionOrKey === 'string' ? sessionOrKey : sessionOrKey.sessionKey;
-    const identifier = typeof sessionOrKey === 'string' ? null : sessionOrKey.userIdentifier;
-    
-    if (key.startsWith('discord:')) {
-      return `Discord: ${identifier || key.replace('discord:', '')}`;
-    }
-    if (key.startsWith('whatsapp:')) {
-      return `WhatsApp: ${identifier || key.replace('whatsapp:', '')}`;
-    }
-    if (key.startsWith('cli:')) {
-      return `CLI: ${key.replace('cli:', '')}`;
-    }
-    return key
-      .replace('webui:', '')
-      .replace(/^chat_[a-z0-9]+$/, (m) => 'Chat ' + m.slice(5))
-      .replace(/_/g, ' ')
-      .replace(/^./, c => c.toUpperCase());
+    const key = typeof sessionOrKey === "string" ? sessionOrKey : sessionOrKey.sessionKey;
+    const identifier = typeof sessionOrKey === "string" ? "" : sessionOrKey.userIdentifier || "";
+    if (key.startsWith("discord:")) return `Discord / ${identifier || key.slice(8)}`;
+    if (key.startsWith("whatsapp:")) return `WhatsApp / ${identifier || key.slice(9)}`;
+    if (key.startsWith("cli:")) return `CLI / ${key.slice(4)}`;
+    if (key === "webui:default") return "WebUI / default";
+    if (key.startsWith("webui:chat_")) return `WebUI / ${key.slice(11)}`;
+    return key.replace(/^webui:/, "").replace(/_/g, " ");
+  }
+
+  function updateHeader() {
+    refs.chatTitle.textContent = formatSessionName(currentSessionKey);
+    refs.chatSubtitle.textContent = currentSessionKey;
   }
 
   function switchSession(sessionKey) {
     currentSessionKey = sessionKey;
-    messagesEl.innerHTML = '';
-    if (welcomeEl) {
-      welcomeEl.remove();
-    }
     currentAssistantEl = null;
-    currentContent = '';
+    currentContent = "";
     isStreaming = false;
-    inputEl.disabled = false;
-    sendBtn.disabled = inputEl.value.trim().length === 0;
-
-    // Update header
-    chatTitle.textContent = formatSessionName(sessionKey);
-    chatSubtitle.textContent = sessionKey;
-
+    messagesEl.innerHTML = "";
+    updateHeader();
     loadSessionHistory(sessionKey);
     loadSessions();
     sendSessionInit();
+    setSidebarOpen(false);
   }
 
   async function loadSessionHistory(sessionKey) {
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionKey)}/history`);
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.messages && data.messages.length > 0) {
-        for (const msg of data.messages) {
-          if (msg.role === 'user') {
-            addUserMessage(msg.content, [], false);
-          } else if (msg.role === 'assistant') {
-            addRestoredAssistantMessage(msg.content);
-          }
-        }
-        scrollToBottom();
-      } else {
+      const data = await fetchJson(`/api/sessions/${encodeURIComponent(sessionKey)}/history`);
+      const history = data.messages || [];
+      if (history.length === 0) {
         showWelcome();
+        return;
       }
+
+      hideWelcome();
+      history.forEach((msg) => {
+        if (msg.role === "user") {
+          const cleaned = cleanMessageContent(msg.content || "");
+          addUserMessage(cleaned.text, [], false, cleaned.sender);
+        }
+        if (msg.role === "assistant") {
+          addRestoredAssistantMessage(msg.content || "");
+        }
+      });
+      scrollToBottom();
     } catch {
       showWelcome();
     }
   }
 
-  function createNewSession() {
-    const id = Date.now().toString(36);
-    const sessionKey = `webui:chat_${id}`;
-    switchSession(sessionKey);
-  }
+  // ─── Health Rendering ─────────────────────────────────────────────
 
-  // ─── WebSocket Connection ────────────────────────────────────────
-
-  function connect() {
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}/ws`);
-
-    ws.onopen = () => {
-      statusDot.classList.add('connected');
-      statusText.textContent = 'Connected';
-      fetchHealth();
-      fetchConfig();
-      loadSessions();
-      sendSessionInit();
-      showNotice('Realtime connection restored.', 'success', 2000);
-    };
-
-    ws.onclose = () => {
-      statusDot.classList.remove('connected');
-      statusText.textContent = 'Reconnecting...';
-      showNotice('Lost connection to LiteClaw. Reconnecting...', 'error', 3500);
-      setTimeout(connect, 3000);
-    };
-
-    ws.onerror = () => {
-      statusText.textContent = 'Connection Error';
-      showNotice('WebSocket connection error.', 'error', 3500);
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        handleServerMessage(msg);
-      } catch (e) {
-        console.error('Failed to parse message:', e);
-      }
-    };
-  }
-
-  async function fetchHealth() {
-    try {
-      const res = await fetch('/health');
-      if (res.ok) {
-        healthData = await res.json();
-        if (healthData.model) {
-          modelBadgeEl.textContent = healthData.model;
-        }
-        if (healthData.workspace && workspacePill) {
-          workspacePill.textContent = `workspace: ${healthData.workspace}`;
-          workspacePill.title = healthData.workspace;
-        }
-        // Update system info in settings
-        const sysVersion = $('#sysVersion');
-        const sysUptime = $('#sysUptime');
-        const sysMemory = $('#sysMemory');
-        if (sysVersion) sysVersion.textContent = healthData.version || '--';
-        if (sysUptime) sysUptime.textContent = formatUptime(healthData.uptime || 0);
-        if (sysMemory) sysMemory.textContent = `${healthData.channels?.webui?.connected || 0} WebUI clients`;
-
-        // Update channel status dots
-        updateChannelDots();
-      }
-    } catch {
-      showNotice('Failed to refresh gateway health.', 'error', 2500);
+  function renderHealth() {
+    if (refs.modelBadge) refs.modelBadge.textContent = healthData.model || "--";
+    if (refs.healthLabel) {
+      const status = healthData.status || "unknown";
+      refs.healthLabel.textContent = `Health (${healthData.sessionCount || sessions.length || 0})`;
     }
+    applyChannelState(refs.chWebui, healthData.channels?.webui?.status || "online");
+    applyChannelState(refs.chDiscord, healthData.channels?.discord?.status || "unknown");
+    applyChannelState(refs.chWhatsapp, healthData.channels?.whatsapp?.status || "unknown");
   }
 
-  async function fetchConfig() {
-    try {
-      const res = await fetch('/api/config');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      currentConfig = await res.json();
-      hydrateSettings(currentConfig);
-    } catch (err) {
-      showNotice(`Failed to load config: ${err.message || err}`, 'error', 3500);
-    }
+  function applyChannelState(el, state) {
+    if (!el) return;
+    el.textContent = state;
+    el.className = "channel-status-dot";
+    if (state === "online" || state === "configured") el.classList.add("online");
+    else if (state === "disabled") el.classList.add("offline");
+    else el.classList.add("warning");
   }
 
-  function updateChannelDots() {
-    // WebUI is always online if we're connected
-    const webui = $('#ch-webui');
-    if (webui) webui.classList.add('online');
-    // Discord and WhatsApp status from health data
-    const discord = $('#ch-discord');
-    const whatsapp = $('#ch-whatsapp');
-    // We don't have per-channel status in health yet, so check if they're configured
-    if (discord) discord.classList.add('online'); // Assume online if gateway is up
-    if (whatsapp) whatsapp.classList.add('online');
-  }
-
-  function formatUptime(seconds) {
-    if (seconds < 60) return `${Math.floor(seconds)}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    return `${h}h ${m}m`;
-  }
-
-  function handleServerMessage(msg) {
-    switch (msg.type) {
-      case 'system':
-        if (msg.health) {
-          healthData = msg.health;
-          if (healthData.workspace && workspacePill) {
-            workspacePill.textContent = `workspace: ${healthData.workspace}`;
-            workspacePill.title = healthData.workspace;
-          }
-        }
-        break;
-
-      case 'thinking':
-        ensureAssistantMessage();
-        appendThinking(msg.content || '');
-        break;
-
-      case 'content':
-        ensureAssistantMessage();
-        currentContent += msg.content || '';
-        renderAssistantContent();
-        break;
-
-      case 'tool_start':
-        ensureAssistantMessage();
-        appendToolBadge(msg.tool, msg.args);
-        break;
-
-      case 'tool_result':
-        ensureAssistantMessage();
-        appendToolResult(msg.tool, msg.result);
-        break;
-
-      case 'confirmation':
-        showConfirmation(msg);
-        break;
-
-      case 'done':
-        finishStreaming();
-        loadSessions();
-        break;
-
-      case 'error':
-        ensureAssistantMessage();
-        appendError(msg.content || 'An error occurred');
-        showNotice(msg.content || 'An error occurred', 'error', 4000);
-        finishStreaming();
-        break;
-
-      case 'config_reloaded':
-        if (msg.config) {
-          currentConfig = msg.config;
-          hydrateSettings(currentConfig);
-        }
-        if (msg.health) {
-          healthData = msg.health;
-          if (workspacePill && healthData.workspace) {
-            workspacePill.textContent = `workspace: ${healthData.workspace}`;
-            workspacePill.title = healthData.workspace;
-          }
-        }
-        showNotice('Config reloaded from disk.', 'info', 3000);
-        break;
-
-      case 'pong':
-        break;
-    }
-  }
+  // ─── Settings ─────────────────────────────────────────────────────
 
   function hydrateSettings(config) {
-    if (!config) return;
-    if (config.llm?.primary) {
-      settingModel.innerHTML = `<option value="${escapeHtml(config.llm.primary)}" selected>${escapeHtml(config.llm.primary)}</option>`;
-    }
-    if (config.agent?.thinkingDefault && settingThinking) {
-      settingThinking.value = config.agent.thinkingDefault;
-    }
-    if (config.agent?.maxTurns && settingMaxTurns) {
-      settingMaxTurns.value = config.agent.maxTurns;
-    }
-    if (config.agent?.workspace && settingWorkspace) {
-      settingWorkspace.value = config.agent.workspace;
-    }
-    const toolLoadingValue = config.agent?.toolLoading === 'all' ? 'eager' : 'lazy';
-    document.querySelectorAll('.setting-toggle-group .toggle-btn').forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.value === toolLoadingValue);
+    const models = config.llm?.availableModels || [];
+    const currentPrimary = config.llm?.primary || "";
+    refs.settingModel.innerHTML = models.length
+      ? models.map((model) => `<option value="${escapeHtml(model.id)}"${model.id === currentPrimary ? " selected" : ""}>${escapeHtml(model.label)}</option>`).join("")
+      : `<option value="${escapeHtml(currentPrimary)}">${escapeHtml(currentPrimary || "unknown")}</option>`;
+
+    refs.settingThinking.value = config.agent?.thinkingDefault || "medium";
+    refs.settingWorkspace.value = config.agent?.workspace || "";
+    refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
+    refs.settingContextTokens.value = config.agent?.contextTokens || 64000;
+    refs.settingContextBudgetPct.value = config.agent?.contextBudgetPct || 80;
+    refs.settingSkillsMaxInjected.value = config.agent?.skills?.maxInjected || 2;
+    refs.toggleSkillsEnabled.checked = !!config.agent?.skills?.enabled;
+
+    document.querySelectorAll("#toolLoadingGroup .toggle-chip").forEach((button) => {
+      button.classList.toggle("active", button.dataset.value === (config.agent?.toolLoading || "lazy"));
     });
-    if (toggleDiscord) toggleDiscord.checked = !!config.channels?.discord?.enabled;
-    if (toggleWhatsapp) toggleWhatsapp.checked = !!config.channels?.whatsapp?.enabled;
-    if (discordReplyStyle) discordReplyStyle.value = config.channels?.discord?.replyStyle || 'single';
-    if (whatsappReplyStyle) whatsappReplyStyle.value = config.channels?.whatsapp?.replyStyle || 'single';
+
+    refs.toggleDiscord.checked = !!config.channels?.discord?.enabled;
+    refs.discordReplyStyle.value = config.channels?.discord?.replyStyle || "single";
+    refs.toggleDiscordToolProgress.checked = !!config.channels?.discord?.showToolProgress;
+    refs.toggleWhatsapp.checked = !!config.channels?.whatsapp?.enabled;
+    refs.whatsappReplyStyle.value = config.channels?.whatsapp?.replyStyle || "single";
+    refs.toggleWhatsappToolProgress.checked = !!config.channels?.whatsapp?.showToolProgress;
+
+    refs.toggleExecEnabled.checked = !!config.tools?.exec?.enabled;
+    refs.toggleExecConfirm.checked = !!config.tools?.exec?.confirmDestructive;
+    refs.toggleWebFetchEnabled.checked = !!config.tools?.web?.fetchEnabled;
+    refs.toggleWebFallback.checked = !!config.tools?.web?.browserFallback;
+    refs.toggleFilesystemEnabled.checked = !!config.tools?.filesystem?.enabled;
+    refs.toggleConfirmDelete.checked = !!config.tools?.filesystem?.confirmDelete;
+    refs.toggleVisionEnabled.checked = !!config.tools?.vision?.enabled;
+    refs.settingVisionMaxDimension.value = config.tools?.vision?.maxDimensionPx || 1024;
+    refs.settingGatewayPort.value = config.gateway?.port || 7860;
+    refs.settingGatewayBind.value = config.gateway?.bind || "loopback";
+    refs.gatewayAuthNote.textContent = config.gateway?.authEnabled
+      ? "Auth: gateway token configured"
+      : "Auth: local WebUI endpoints open";
   }
 
-  async function saveSettings() {
-    const payload = {
+  function gatherSettingsPayload() {
+    const toolLoading = document.querySelector("#toolLoadingGroup .toggle-chip.active")?.dataset.value || "lazy";
+    return {
       llm: {
-        primary: settingModel.value,
+        primary: refs.settingModel.value,
       },
       agent: {
-        workspace: settingWorkspace.value.trim(),
-        maxTurns: Number(settingMaxTurns.value || 20),
-        toolLoading: document.querySelector('.setting-toggle-group .toggle-btn.active')?.dataset.value === 'eager' ? 'all' : 'lazy',
-        thinkingDefault: settingThinking.value,
+        workspace: refs.settingWorkspace.value.trim(),
+        maxTurns: Number(refs.settingMaxTurns.value || 20),
+        toolLoading,
+        thinkingDefault: refs.settingThinking.value,
+        contextTokens: Number(refs.settingContextTokens.value || 64000),
+        contextBudgetPct: Number(refs.settingContextBudgetPct.value || 80),
+        skills: {
+          enabled: refs.toggleSkillsEnabled.checked,
+          maxInjected: Number(refs.settingSkillsMaxInjected.value || 2),
+        },
       },
       channels: {
         discord: {
-          enabled: !!toggleDiscord?.checked,
-          replyStyle: discordReplyStyle.value,
-          showToolProgress: false,
+          enabled: refs.toggleDiscord.checked,
+          replyStyle: refs.discordReplyStyle.value,
+          showToolProgress: refs.toggleDiscordToolProgress.checked,
         },
         whatsapp: {
-          enabled: !!toggleWhatsapp?.checked,
-          replyStyle: whatsappReplyStyle.value,
-          showToolProgress: false,
+          enabled: refs.toggleWhatsapp.checked,
+          replyStyle: refs.whatsappReplyStyle.value,
+          showToolProgress: refs.toggleWhatsappToolProgress.checked,
         },
       },
+      tools: {
+        exec: {
+          enabled: refs.toggleExecEnabled.checked,
+          confirmDestructive: refs.toggleExecConfirm.checked,
+        },
+        web: {
+          fetchEnabled: refs.toggleWebFetchEnabled.checked,
+          browserFallback: refs.toggleWebFallback.checked,
+        },
+        filesystem: {
+          enabled: refs.toggleFilesystemEnabled.checked,
+          confirmDelete: refs.toggleConfirmDelete.checked,
+        },
+        vision: {
+          enabled: refs.toggleVisionEnabled.checked,
+          maxDimensionPx: Number(refs.settingVisionMaxDimension.value || 1024),
+        },
+      },
+      gateway: {
+        port: Number(refs.settingGatewayPort.value || 7860),
+        bind: refs.settingGatewayBind.value,
+      },
     };
+  }
 
+  async function saveSettings() {
     try {
       saveSettingsBtn.disabled = true;
-      saveSettingsBtn.textContent = 'Saving...';
-      const res = await fetch('/api/config', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      saveSettingsBtn.textContent = "Saving...";
+      const data = await fetchJson("/api/config", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(gatherSettingsPayload()),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      currentConfig = data.config || payload;
+      currentConfig = data.config || currentConfig;
       hydrateSettings(currentConfig);
-      fetchHealth();
-      showNotice('Settings saved. New requests will use the updated config.', 'success', 3500);
-    } catch (err) {
-      showNotice(`Failed to save settings: ${err.message || err}`, 'error', 4500);
+      await fetchHealth();
+      showNotice("Settings saved. New turns will use the updated runtime.", "success", 2800);
+    } catch (error) {
+      showNotice(`Failed to save settings: ${error.message || error}`, "error", 3600);
     } finally {
       saveSettingsBtn.disabled = false;
-      saveSettingsBtn.textContent = 'Save Settings';
+      saveSettingsBtn.textContent = "Save settings";
     }
   }
 
-  // ─── Message Rendering ───────────────────────────────────────────
+  // ─── Workspace ────────────────────────────────────────────────────
+
+  async function loadWorkspace(path = workspacePath) {
+    try {
+      const data = await fetchJson(`/api/workspace/tree?path=${encodeURIComponent(path)}`);
+      workspacePath = data.currentPath || ".";
+      workspacePathLabel.textContent = workspacePath;
+      workspaceTree.innerHTML = "";
+
+      for (const entry of data.entries || []) {
+        const button = document.createElement("button");
+        button.className = `workspace-entry${entry.path === selectedWorkspaceFile ? " active" : ""}`;
+        button.type = "button";
+        button.innerHTML = `
+          <span class="workspace-entry-kind">${entry.kind === "directory" ? "dir" : "file"}</span>
+          <span class="workspace-entry-name">${escapeHtml(entry.name)}</span>
+          <span class="workspace-entry-meta">${formatSize(entry.size)}</span>
+        `;
+        button.addEventListener("click", () => {
+          if (entry.kind === "directory") {
+            selectedWorkspaceFile = "";
+            loadWorkspace(entry.path);
+            return;
+          }
+          selectedWorkspaceFile = entry.path;
+          openWorkspaceFile(entry.path);
+        });
+        workspaceTree.appendChild(button);
+      }
+    } catch (error) {
+      showNotice(`Workspace error: ${error.message || error}`, "error", 3000);
+    }
+  }
+
+  async function openWorkspaceFile(path) {
+    try {
+      const data = await fetchJson(`/api/workspace/file?path=${encodeURIComponent(path)}`);
+      workspacePreviewMeta.textContent = `${data.path} / ${formatSize(data.size)}${data.truncated ? " / truncated" : ""}`;
+      workspacePreviewContent.textContent = data.isBinary
+        ? "Binary preview is unavailable."
+        : (data.content || "");
+      Array.from(workspaceTree.querySelectorAll(".workspace-entry")).forEach((entry) => {
+        entry.classList.toggle("active", entry.textContent.includes(path.split("/").pop()));
+      });
+    } catch (error) {
+      workspacePreviewMeta.textContent = "Preview unavailable";
+      workspacePreviewContent.textContent = String(error.message || error);
+    }
+  }
+
+  // ─── Welcome Screen ──────────────────────────────────────────────
 
   function showWelcome() {
-    // Recreate welcome screen
-    const existing = $('#welcomeScreen');
-    if (existing) return;
-
-    const wel = document.createElement('div');
-    wel.className = 'welcome-screen';
-    wel.id = 'welcomeScreen';
-    wel.innerHTML = `
-      <div class="welcome-icon">🦎</div>
-      <h2>Welcome to LiteClaw</h2>
-      <p>Your lightweight local AI agent. Ask me anything, or use my tools to work with files, run commands, and search the web.</p>
-      <div class="welcome-chips">
-        <button class="chip" data-prompt="What files are in my current directory?">📁 List files</button>
-        <button class="chip" data-prompt="Search the web for today's top tech news">🔍 Web search</button>
-        <button class="chip" data-prompt="What can you help me with?">💡 Capabilities</button>
-        <button class="chip" data-prompt="Tell me a joke">😄 Tell a joke</button>
+    if ($("#welcomeScreen")) return;
+    messagesEl.innerHTML = `
+      <div class="welcome-panel" id="welcomeScreen">
+        <div class="welcome-content">
+          <div class="eyebrow">Launch pad</div>
+          <h3>What can I help you with?</h3>
+          <p>Chat with LiteClaw to inspect, edit, search, or plan across your workspace.</p>
+          <div class="welcome-actions">
+            <button class="welcome-chip" data-prompt="Inspect the current workspace and tell me what this project is.">Inspect workspace</button>
+            <button class="welcome-chip" data-prompt="Read README.md and propose the next milestone.">Plan next milestone</button>
+            <button class="welcome-chip" data-prompt="Search the web for today's AI news and summarize it.">Web research</button>
+            <button class="welcome-chip" data-prompt="What tools and skills should you use for editing PDFs and DOCX files?">Tooling help</button>
+          </div>
+        </div>
       </div>
     `;
-    messagesEl.appendChild(wel);
-
-    // Wire up chips
-    wel.querySelectorAll('.chip').forEach(chip => {
-      chip.addEventListener('click', () => {
-        inputEl.value = chip.dataset.prompt;
-        sendBtn.disabled = false;
-        sendMessage();
-      });
-    });
+    bindWelcomeChips();
   }
 
   function hideWelcome() {
-    const wel = $('#welcomeScreen');
-    if (wel) wel.remove();
+    const el = $("#welcomeScreen");
+    if (el) el.remove();
   }
 
-  function addUserMessage(text, images, animate = true) {
+  // ─── Message Rendering ────────────────────────────────────────────
+
+  /**
+   * Strip Discord/WhatsApp metadata prefix from user messages
+   * and extract the sender's identity.
+   */
+  function cleanMessageContent(text) {
+    if (!text) return { text, sender: "You" };
+    let cleaned = text;
+    let sender = "You";
+
+    // Extract sender from new compact format: [context: ... | sender: Alice (@alice)]
+    const contextMatch = cleaned.match(/^\[context:[^\]]*sender:\s*([^\]|]+)(?:]|\|)/m);
+    if (contextMatch && contextMatch[1]) {
+      sender = contextMatch[1].trim();
+    }
+
+    // Strip compact format loops
+    cleaned = cleaned.replace(/^\[context:[^\]]*\]\n?/gm, "");
+    cleaned = cleaned.replace(/^\[participants:[^\]]*\]\n?/gm, "");
+
+    // Old verbose format: strip everything before the actual user message
+    if (cleaned.startsWith("Conversation info (untrusted metadata):")) {
+      const lastCodeBlockEnd = cleaned.lastIndexOf("```");
+      if (lastCodeBlockEnd !== -1) {
+        cleaned = cleaned.slice(lastCodeBlockEnd + 3);
+      }
+      cleaned = cleaned.replace(/^Use only these handles[^\n]*\n?/gm, "");
+    }
+
+    return { text: cleaned.trim(), sender };
+  }
+
+  function addUserMessage(text, images, animate = true, sender = "You") {
     hideWelcome();
-    const el = document.createElement('div');
-    el.className = 'message user';
-    if (!animate) el.style.animation = 'none';
+    const el = document.createElement("div");
+    el.className = "message user";
+    if (!animate) el.style.animation = "none";
+    
+    // Generate an initial for the avatar
+    const avatarInitial = sender === "You" ? "U" : sender.charAt(0).toUpperCase();
+
     el.innerHTML = `
-      <div class="message-avatar">👤</div>
       <div class="message-body">
-        <div class="message-sender">You</div>
+        <div class="message-sender">${escapeHtml(sender)}</div>
         <div class="message-content">${escapeHtml(text)}</div>
-        ${images.length > 0 ? `<div style="display:flex;gap:6px;margin-top:8px">${images.map(img => `<img src="${img}" style="max-width:120px;border-radius:8px">`).join('')}</div>` : ''}
+        ${images.length ? `<div class="image-preview">${images.map((src) => `<img src="${src}" alt="attachment" style="max-width:140px;border:1px solid var(--line);margin-top:8px;">`).join("")}</div>` : ""}
       </div>
+      <div class="message-avatar">${escapeHtml(avatarInitial)}</div>
     `;
     messagesEl.appendChild(el);
     scrollToBottom();
   }
 
   function addRestoredAssistantMessage(content) {
-    const el = document.createElement('div');
-    el.className = 'message assistant';
-    el.style.animation = 'none';
+    const el = document.createElement("div");
+    el.className = "message assistant";
     el.innerHTML = `
-      <div class="message-avatar">🦎</div>
+      <div class="message-avatar">LC</div>
       <div class="message-body">
         <div class="message-sender">LiteClaw</div>
         <div class="message-content">${renderMarkdown(content)}</div>
       </div>
     `;
     messagesEl.appendChild(el);
-    addCopyButtons(el.querySelector('.message-content'));
+    addCopyButtons(el.querySelector(".message-content"));
   }
 
   function ensureAssistantMessage() {
     if (currentAssistantEl) return;
     hideWelcome();
-    isStreaming = true;
-
-    const el = document.createElement('div');
-    el.className = 'message assistant';
-    el.innerHTML = `
-      <div class="message-avatar">🦎</div>
+    currentAssistantEl = document.createElement("div");
+    currentAssistantEl.className = "message assistant";
+    currentAssistantEl.innerHTML = `
+      <div class="message-avatar">LC</div>
       <div class="message-body">
         <div class="message-sender">LiteClaw</div>
         <div class="message-content"></div>
       </div>
     `;
-    messagesEl.appendChild(el);
-    currentAssistantEl = el;
-    scrollToBottom();
+    messagesEl.appendChild(currentAssistantEl);
+    isStreaming = true;
   }
 
   function renderAssistantContent() {
     if (!currentAssistantEl) return;
-    const contentEl = currentAssistantEl.querySelector('.message-content');
-    contentEl.innerHTML = renderMarkdown(currentContent) + '<span class="streaming-cursor"></span>';
+    const contentEl = currentAssistantEl.querySelector(".message-content");
+    contentEl.innerHTML = renderMarkdown(currentContent) + (isStreaming ? '<span class="streaming-cursor"></span>' : "");
     addCopyButtons(contentEl);
     scrollToBottom();
   }
 
   function appendThinking(text) {
-    if (!currentAssistantEl) return;
-    const body = currentAssistantEl.querySelector('.message-body');
-    let thinkEl = body.querySelector('.thinking-block:last-of-type');
-    if (!thinkEl || thinkEl.dataset.closed) {
-      thinkEl = document.createElement('div');
-      thinkEl.className = 'thinking-block';
-      thinkEl.textContent = '';
-      body.querySelector('.message-content').before(thinkEl);
+    ensureAssistantMessage();
+    const body = currentAssistantEl.querySelector(".message-body");
+    let block = body.querySelector(".thinking-block:last-of-type");
+    if (!block || block.dataset.closed === "true") {
+      block = document.createElement("div");
+      block.className = "thinking-block";
+      body.insertBefore(block, body.querySelector(".message-content"));
     }
-    thinkEl.textContent += text;
+    block.textContent += text || "";
     scrollToBottom();
   }
 
   function appendToolBadge(toolName) {
-    if (!currentAssistantEl) return;
-    const body = currentAssistantEl.querySelector('.message-body');
-    const badge = document.createElement('div');
-    badge.className = 'tool-badge';
-    badge.innerHTML = `<span class="tool-spinner"></span> <span>${escapeHtml(toolName)}</span>`;
+    ensureAssistantMessage();
+    const badge = document.createElement("div");
+    badge.className = "tool-badge";
     badge.dataset.tool = toolName;
-    // Insert before message-content (after thinking blocks and other badges)
-    const content = body.querySelector('.message-content');
-    body.insertBefore(badge, content);
+    badge.innerHTML = `<span class="tool-spinner"></span><span>${escapeHtml(toolName)}</span>`;
+    currentAssistantEl.querySelector(".message-body").insertBefore(badge, currentAssistantEl.querySelector(".message-content"));
     scrollToBottom();
   }
 
   function appendToolResult(toolName, result) {
-    if (!currentAssistantEl) return;
-    const badges = currentAssistantEl.querySelectorAll('.tool-badge');
-    for (const badge of badges) {
-      if (badge.dataset.tool === toolName && badge.querySelector('.tool-spinner')) {
-        const icon = result?.success ? '✓' : '✗';
-        const cls = result?.success ? 'success' : 'error';
-        badge.className = `tool-badge ${cls}`;
-        badge.innerHTML = `<span>${icon}</span> <span>${escapeHtml(toolName)}</span>`;
-        break;
-      }
-    }
+    const badges = currentAssistantEl?.querySelectorAll(".tool-badge") || [];
+    badges.forEach((badge) => {
+      if (badge.dataset.tool !== toolName || badge.dataset.resolved === "true") return;
+      badge.dataset.resolved = "true";
+      badge.classList.add(result?.success ? "success" : "error");
+      badge.innerHTML = `<span>${result?.success ? "✓" : "✗"}</span><span>${escapeHtml(toolName)}</span>`;
+    });
     scrollToBottom();
   }
 
   function appendError(text) {
-    if (!currentAssistantEl) return;
-    const errEl = document.createElement('div');
-    errEl.style.cssText = 'color: var(--danger); padding: 8px; border-radius: 6px; background: rgba(248,113,113,0.08); margin: 4px 0; font-size: 13px;';
-    errEl.textContent = '⚠ ' + text;
-    currentAssistantEl.querySelector('.message-body').appendChild(errEl);
+    ensureAssistantMessage();
+    const err = document.createElement("div");
+    err.className = "error-block";
+    err.textContent = text;
+    currentAssistantEl.querySelector(".message-body").insertBefore(err, currentAssistantEl.querySelector(".message-content"));
   }
 
   function finishStreaming() {
-    if (currentAssistantEl) {
-      const cursor = currentAssistantEl.querySelector('.streaming-cursor');
-      if (cursor) cursor.remove();
-      currentAssistantEl.querySelectorAll('.thinking-block').forEach(el => el.dataset.closed = 'true');
-    }
-    currentAssistantEl = null;
-    currentContent = '';
     isStreaming = false;
+    renderAssistantContent();
+    currentAssistantEl?.querySelectorAll(".thinking-block").forEach((el) => {
+      el.dataset.closed = "true";
+    });
+    currentAssistantEl = null;
+    currentContent = "";
     inputEl.disabled = false;
+    sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
     inputEl.focus();
-    sendBtn.disabled = inputEl.value.trim().length === 0;
   }
 
-  // ─── Confirmations ──────────────────────────────────────────────
+  // ─── Server Message Handler ───────────────────────────────────────
+
+  function handleServerMessage(msg) {
+    switch (msg.type) {
+      case "system":
+        if (msg.health) {
+          healthData = msg.health;
+          renderHealth();
+        }
+        break;
+      case "thinking":
+        appendThinking(msg.content || "");
+        break;
+      case "content":
+        ensureAssistantMessage();
+        currentContent += msg.content || "";
+        renderAssistantContent();
+        break;
+      case "tool_start":
+        appendToolBadge(msg.tool || "tool");
+        break;
+      case "tool_result":
+        appendToolResult(msg.tool || "tool", msg.result || {});
+        break;
+      case "confirmation":
+        showConfirmation(msg);
+        break;
+      case "done":
+        finishStreaming();
+        loadSessions();
+        break;
+      case "error":
+        appendError(msg.content || "An unknown error occurred.");
+        showNotice(msg.content || "An unknown error occurred.", "error", 3600);
+        finishStreaming();
+        break;
+      case "config_reloaded":
+        if (msg.config) {
+          currentConfig = msg.config;
+          hydrateSettings(currentConfig);
+        }
+        if (msg.health) {
+          healthData = msg.health;
+          renderHealth();
+        }
+        showNotice("Config reloaded from disk.", "info", 2400);
+        break;
+      case "pong":
+        break;
+      default:
+        break;
+    }
+  }
+
+  // ─── Confirmation ─────────────────────────────────────────────────
 
   function showConfirmation(msg) {
-    pendingConfirmationId = msg.id;
-    confirmBody.textContent = msg.description || `Tool "${msg.tool}" requires your confirmation.`;
+    pendingConfirmationId = msg.confirmationId || msg.id || null;
+    confirmBody.innerHTML = renderMarkdown(msg.body || msg.description || msg.content || "Confirmation required.");
     confirmModal.hidden = false;
   }
 
-  confirmAccept.addEventListener('click', () => {
-    if (pendingConfirmationId && ws) {
-      ws.send(JSON.stringify({
-        type: 'confirmation_response',
-        confirmationId: pendingConfirmationId,
-        confirmed: true,
-      }));
-    }
-    confirmModal.hidden = true;
+  function respondToConfirmation(confirmed) {
+    if (!pendingConfirmationId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: "confirmation_response",
+      confirmationId: pendingConfirmationId,
+      confirmed,
+    }));
     pendingConfirmationId = null;
-  });
-
-  confirmReject.addEventListener('click', () => {
-    if (pendingConfirmationId && ws) {
-      ws.send(JSON.stringify({
-        type: 'confirmation_response',
-        confirmationId: pendingConfirmationId,
-        confirmed: false,
-      }));
-    }
     confirmModal.hidden = true;
-    pendingConfirmationId = null;
-  });
+  }
 
-  // ─── Send Message ───────────────────────────────────────────────
+  // ─── Send Message ─────────────────────────────────────────────────
 
   function sendMessage() {
     const text = inputEl.value.trim();
-    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if ((!text && attachedImages.length === 0) || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-    addUserMessage(text, [...attachedImages]);
-
+    addUserMessage(text || "(image attached)", [...attachedImages]);
     ws.send(JSON.stringify({
-      type: 'message',
+      type: "message",
       content: text,
       sessionKey: currentSessionKey,
-      workingDir: settingWorkspace?.value?.trim() || currentConfig?.agent?.workspace,
-      images: attachedImages.length > 0 ? [...attachedImages] : undefined,
+      workingDir: refs.settingWorkspace.value.trim() || currentConfig.agent?.workspace,
+      images: attachedImages.length ? [...attachedImages] : undefined,
     }));
 
-    inputEl.value = '';
-    inputEl.style.height = 'auto';
+    inputEl.value = "";
+    inputEl.style.height = "auto";
     attachedImages.length = 0;
     imagePreview.hidden = true;
-    imagePreview.innerHTML = '';
+    imagePreview.innerHTML = "";
     sendBtn.disabled = true;
     inputEl.disabled = true;
-  }
-
-  // ─── Image Attachment ───────────────────────────────────────────
-
-  imageInput.addEventListener('change', (e) => {
-    const files = Array.from(e.target.files || []);
-    for (const file of files) {
-      if (attachedImages.length >= 4) break;
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const dataUrl = ev.target.result;
-        attachedImages.push(dataUrl);
-        const img = document.createElement('img');
-        img.src = dataUrl;
-        imagePreview.appendChild(img);
-        imagePreview.hidden = false;
-      };
-      reader.readAsDataURL(file);
-    }
-    imageInput.value = '';
-  });
-
-  // ─── Input Handlers ─────────────────────────────────────────────
-
-  inputEl.addEventListener('input', () => {
-    sendBtn.disabled = inputEl.value.trim().length === 0;
-    inputEl.style.height = 'auto';
-    inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + 'px';
-  });
-
-  inputEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
-
-  sendBtn.addEventListener('click', sendMessage);
-
-  clearBtn.addEventListener('click', () => {
-    messagesEl.innerHTML = '';
     currentAssistantEl = null;
-    currentContent = '';
-    fetch(`/api/sessions/${encodeURIComponent(currentSessionKey)}`, { method: 'DELETE' }).catch(() => {});
-    showWelcome();
-    loadSessions();
-  });
-
-  newChatBtn.addEventListener('click', createNewSession);
-
-  sidebarToggle.addEventListener('click', () => {
-    sidebar.classList.toggle('open');
-  });
-
-  // Wire up chips (static ones from initial HTML)
-  $$('.chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      inputEl.value = chip.dataset.prompt;
-      sendBtn.disabled = false;
-      sendMessage();
-    });
-  });
-
-  // ─── Settings Panel ─────────────────────────────────────────────
-
-  settingsBtn.addEventListener('click', () => {
-    settingsOverlay.hidden = false;
-    fetchHealth(); // Refresh data
-    fetchConfig();
-    populateModelSelector();
-  });
-
-  closeSettingsBtn.addEventListener('click', () => {
-    settingsOverlay.hidden = true;
-  });
-
-  settingsOverlay.addEventListener('click', (e) => {
-    if (e.target === settingsOverlay) {
-      settingsOverlay.hidden = true;
-    }
-  });
-
-  // Temperature slider
-  settingTemp.addEventListener('input', () => {
-    settingTempVal.textContent = parseFloat(settingTemp.value).toFixed(1);
-  });
-
-  // Toggle button groups
-  $$('.setting-toggle-group').forEach(group => {
-    group.querySelectorAll('.toggle-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        group.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-      });
-    });
-  });
-
-  // Channel toggles
-  const toggleDiscord = $('#toggleDiscord');
-  const toggleWhatsapp = $('#toggleWhatsapp');
-  if (toggleDiscord) toggleDiscord.checked = true; // Default enabled
-  if (toggleWhatsapp) toggleWhatsapp.checked = true;
-  if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', saveSettings);
-
-  // Clear all sessions
-  clearAllBtn.addEventListener('click', async () => {
-    if (!confirm('Delete ALL sessions? This cannot be undone.')) return;
-    try {
-      const res = await fetch('/api/sessions');
-      if (res.ok) {
-        const data = await res.json();
-        for (const session of (data.sessions || [])) {
-          await fetch(`/api/sessions/${encodeURIComponent(session.sessionKey)}`, { method: 'DELETE' });
-        }
-      }
-    } catch {}
-    switchSession('webui:default');
-  });
-
-  async function populateModelSelector() {
-    if (currentConfig?.llm?.primary) {
-      settingModel.innerHTML = `<option value="${escapeHtml(currentConfig.llm.primary)}" selected>${escapeHtml(currentConfig.llm.primary)}</option>`;
-    } else if (healthData.model) {
-      settingModel.innerHTML = `<option value="${escapeHtml(healthData.model)}" selected>${escapeHtml(healthData.model)}</option>`;
-    }
-    // Update status texts
-    const discordStatus = $('#discordStatusText');
-    const whatsappStatus = $('#whatsappStatusText');
-    if (discordStatus) discordStatus.textContent = 'Online';
-    if (whatsappStatus) whatsappStatus.textContent = 'Online';
+    currentContent = "";
   }
 
-  // ─── Markdown Rendering ─────────────────────────────────────────
+  // ─── Markdown Renderer ────────────────────────────────────────────
 
   function renderMarkdown(text) {
-    let html = escapeHtml(text);
+    const codeBlocks = [];
+    let working = String(text || "");
 
-    // Code blocks (``` ... ```)
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-      return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
+    working = working.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+      const token = `@@CODE${codeBlocks.length}@@`;
+      codeBlocks.push(`<pre><code class="language-${escapeHtml(lang || "text")}">${escapeHtml(code.trim())}</code></pre>`);
+      return token;
     });
 
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    let html = escapeHtml(working)
+      .replace(/^### (.+)$/gm, "<h4>$1</h4>")
+      .replace(/^## (.+)$/gm, "<h3>$1</h3>")
+      .replace(/^# (.+)$/gm, "<h2>$1</h2>")
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^\*])\*(.+?)\*/g, "$1<em>$2</em>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
-    // Bold
-    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.split(/\n{2,}/).map((chunk) => {
+      const trimmed = chunk.trim();
+      if (!trimmed) return "";
+      if (/^@@CODE\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
+      if (/^[-*] /m.test(trimmed)) {
+        const items = trimmed.split("\n").filter(Boolean).map((line) => {
+          if (/^[-*] /.test(line)) return `<li>${line.slice(2)}</li>`;
+          return `<li>${line}</li>`;
+        }).join("");
+        return `<ul>${items}</ul>`;
+      }
+      if (/^\d+\. /m.test(trimmed)) {
+        const items = trimmed.split("\n").filter(Boolean).map((line) => `<li>${line.replace(/^\d+\. /, "")}</li>`).join("");
+        return `<ol>${items}</ol>`;
+      }
+      return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
+    }).join("");
 
-    // Italic
-    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-    // Links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--accent-secondary)">$1</a>');
-
-    // Headings
-    html = html.replace(/^### (.+)$/gm, '<h4 style="margin:8px 0 4px;font-size:14px">$1</h4>');
-    html = html.replace(/^## (.+)$/gm, '<h3 style="margin:10px 0 4px;font-size:15px">$1</h3>');
-    html = html.replace(/^# (.+)$/gm, '<h2 style="margin:12px 0 6px;font-size:16px">$1</h2>');
-
-    // Unordered lists
-    html = html.replace(/^[*-] (.+)$/gm, '<li>$1</li>');
-    html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul style="margin:4px 0;padding-left:20px">$1</ul>');
-
-    // Line breaks
-    html = html.replace(/\n/g, '<br>');
-
-    // Clean up double <ul>
-    html = html.replace(/<\/ul><br><ul[^>]*>/g, '');
+    codeBlocks.forEach((block, index) => {
+      html = html.replace(`@@CODE${index}@@`, block);
+    });
 
     return html;
   }
 
   function escapeHtml(text) {
-    const div = document.createElement('div');
+    const div = document.createElement("div");
     div.textContent = text;
     return div.innerHTML;
   }
 
   function addCopyButtons(container) {
     if (!container) return;
-    container.querySelectorAll('pre').forEach(pre => {
-      if (pre.querySelector('.copy-btn')) return;
-      const btn = document.createElement('button');
-      btn.className = 'copy-btn';
-      btn.textContent = 'Copy';
-      btn.onclick = () => {
-        const code = pre.querySelector('code');
-        navigator.clipboard.writeText(code?.textContent || '');
-        btn.textContent = 'Copied!';
-        setTimeout(() => btn.textContent = 'Copy', 1500);
-      };
-      pre.style.position = 'relative';
+    container.querySelectorAll("pre").forEach((pre) => {
+      if (pre.querySelector(".copy-btn")) return;
+      const btn = document.createElement("button");
+      btn.className = "copy-btn";
+      btn.textContent = "Copy";
+      btn.addEventListener("click", () => {
+        navigator.clipboard.writeText(pre.querySelector("code")?.textContent || "");
+        btn.textContent = "Copied";
+        setTimeout(() => {
+          btn.textContent = "Copy";
+        }, 1200);
+      });
       pre.appendChild(btn);
     });
+  }
+
+  // ─── Utilities ────────────────────────────────────────────────────
+
+  function showNotice(text, level = "info", timeout = 2600) {
+    const el = document.createElement("div");
+    el.className = `notice ${level}`;
+    el.textContent = text;
+    noticeStack.appendChild(el);
+    if (timeout > 0) setTimeout(() => el.remove(), timeout);
   }
 
   function scrollToBottom() {
@@ -856,40 +823,195 @@
     });
   }
 
-  function showNotice(text, level = 'info', timeout = 3000) {
-    if (!noticeStack) return;
-    const el = document.createElement('div');
-    el.className = `notice ${level}`;
-    el.textContent = text;
-    noticeStack.appendChild(el);
-    if (timeout > 0) {
-      setTimeout(() => {
-        el.remove();
-      }, timeout);
-    }
-  }
-
   function sendSessionInit() {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'session_init', sessionKey: currentSessionKey }));
+      ws.send(JSON.stringify({ type: "session_init", sessionKey: currentSessionKey }));
     }
   }
 
-  // ─── Init ───────────────────────────────────────────────────────
+  function bindWelcomeChips() {
+    document.querySelectorAll(".welcome-chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        inputEl.value = chip.dataset.prompt || "";
+        sendBtn.disabled = !inputEl.value.trim();
+        sendMessage();
+      });
+    });
+  }
 
-  // Set initial header
-  chatTitle.textContent = formatSessionName(currentSessionKey);
-  chatSubtitle.textContent = currentSessionKey;
+  function formatUptime(seconds) {
+    if (seconds < 60) return `${Math.floor(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return `${hours}h ${minutes}m`;
+  }
 
+  function formatSize(size) {
+    if (!Number.isFinite(size)) return "--";
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function exportCurrentSession() {
+    const transcript = Array.from(messagesEl.querySelectorAll(".message")).map((message) => {
+      const sender = message.querySelector(".message-sender")?.textContent || "Unknown";
+      const content = message.querySelector(".message-content")?.innerText || "";
+      return `${sender}\n${content}`.trim();
+    }).join("\n\n---\n\n");
+    const blob = new Blob([transcript], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${currentSessionKey.replace(/[:/]/g, "_")}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function createNewSession() {
+    switchSession(`webui:chat_${Date.now().toString(36)}`);
+  }
+
+  // ─── Event Listeners ──────────────────────────────────────────────
+
+  inputEl.addEventListener("input", () => {
+    inputEl.style.height = "auto";
+    inputEl.style.height = `${Math.min(inputEl.scrollHeight, 200)}px`;
+    sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+  });
+
+  inputEl.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+
+  imageInput.addEventListener("change", () => {
+    const files = Array.from(imageInput.files || []).slice(0, 4);
+    attachedImages.length = 0;
+    imagePreview.innerHTML = "";
+
+    files.forEach((file, index) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        attachedImages.push(String(reader.result));
+        const chip = document.createElement("div");
+        chip.className = "image-chip";
+        chip.innerHTML = `<span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        chip.querySelector("button").addEventListener("click", () => {
+          attachedImages.splice(index, 1);
+          chip.remove();
+          if (attachedImages.length === 0) imagePreview.hidden = true;
+          sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+        });
+        imagePreview.appendChild(chip);
+        imagePreview.hidden = false;
+        sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    imageInput.value = "";
+  });
+
+  sessionSearch.addEventListener("input", () => {
+    currentFilter = sessionSearch.value.trim();
+    renderSessionList();
+  });
+
+  refs.newChatBtn.addEventListener("click", createNewSession);
+  refs.clearBtn.addEventListener("click", async () => {
+    messagesEl.innerHTML = "";
+    currentAssistantEl = null;
+    currentContent = "";
+    await fetch(`/api/sessions/${encodeURIComponent(currentSessionKey)}`, { method: "DELETE" }).catch(() => {});
+    showWelcome();
+    loadSessions();
+  });
+  refs.exportBtn.addEventListener("click", exportCurrentSession);
+
+  sendBtn.addEventListener("click", sendMessage);
+  workspaceBtn.addEventListener("click", async () => {
+    workspaceDrawer.hidden = false;
+    await loadWorkspace(".");
+  });
+  closeWorkspaceBtn.addEventListener("click", () => {
+    workspaceDrawer.hidden = true;
+  });
+  workspaceRefreshBtn.addEventListener("click", () => loadWorkspace(workspacePath));
+  workspaceUpBtn.addEventListener("click", () => {
+    if (workspacePath === "." || !workspacePath) {
+      loadWorkspace(".");
+      return;
+    }
+    loadWorkspace(workspacePath.split("/").slice(0, -1).join("/") || ".");
+  });
+
+  settingsBtn.addEventListener("click", () => {
+    settingsOverlay.hidden = false;
+    fetchHealth();
+    fetchConfig();
+  });
+  closeSettingsBtn.addEventListener("click", () => {
+    settingsOverlay.hidden = true;
+  });
+  saveSettingsBtn.addEventListener("click", saveSettings);
+  clearAllBtn.addEventListener("click", async () => {
+    if (!confirm("Delete all sessions? This cannot be undone.")) return;
+    try {
+      const data = await fetchJson("/api/sessions");
+      for (const session of data.sessions || []) {
+        await fetch(`/api/sessions/${encodeURIComponent(session.sessionKey)}`, { method: "DELETE" });
+      }
+      switchSession("webui:default");
+      showNotice("All sessions deleted.", "success", 2400);
+    } catch (error) {
+      showNotice(`Failed to clear sessions: ${error.message || error}`, "error", 3200);
+    }
+  });
+
+  document.querySelectorAll("#toolLoadingGroup .toggle-chip").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll("#toolLoadingGroup .toggle-chip").forEach((peer) => peer.classList.remove("active"));
+      button.classList.add("active");
+    });
+  });
+
+  confirmAccept.addEventListener("click", () => respondToConfirmation(true));
+  confirmReject.addEventListener("click", () => respondToConfirmation(false));
+  confirmModal.addEventListener("click", (event) => {
+    if (event.target === confirmModal) respondToConfirmation(false);
+  });
+  settingsOverlay.addEventListener("click", (event) => {
+    if (event.target === settingsOverlay) settingsOverlay.hidden = true;
+  });
+
+  // Sidebar toggles (mobile)
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener("click", () => setSidebarOpen(false));
+  }
+  if (mobileMenuBtn) {
+    mobileMenuBtn.addEventListener("click", () => setSidebarOpen(!sidebar.classList.contains("open")));
+  }
+  if (sidebarBackdrop) {
+    sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
+  }
+
+  // ─── Init ─────────────────────────────────────────────────────────
+
+  updateHeader();
+  bindWelcomeChips();
   connect();
 
-  // Keepalive ping
   setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping' }));
+      ws.send(JSON.stringify({ type: "ping" }));
     }
   }, 30000);
 
-  // Refresh health every 30s
   setInterval(fetchHealth, 30000);
 })();

@@ -34,6 +34,13 @@ export interface ToolDefinition {
   description: string;
   category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility';
   parameters: ToolParameter[];
+  /** Compact retrieval-friendly guidance for weaker models */
+  usageNotes?: string[];
+  /** Short examples that can be surfaced when relevant */
+  examples?: Array<{
+    userIntent: string;
+    arguments: Record<string, any>;
+  }>;
   /** Keywords that trigger lazy-loading this tool */
   keywords: string[];
   /** Does this tool require confirmation before execution? */
@@ -91,6 +98,12 @@ class ToolRegistry {
    */
   selectRelevant(userMessage: string, maxTools: number = 6): ToolDefinition[] {
     const msgLower = userMessage.toLowerCase();
+    const mentionsLikelyFile = /[a-z0-9._-]+\.[a-z0-9]+/i.test(userMessage);
+    const wantsEdit =
+      msgLower.includes('edit') ||
+      msgLower.includes('modify') ||
+      msgLower.includes('update') ||
+      msgLower.includes('change');
     const scored: { tool: ToolDefinition; score: number }[] = [];
 
     for (const tool of this.tools.values()) {
@@ -104,10 +117,13 @@ class ToolRegistry {
       }
 
       // Category-based boosting
-      if (tool.category === 'exec' && (msgLower.includes('run') || msgLower.includes('execute') || msgLower.includes('command'))) {
+      if (tool.category === 'exec' && (msgLower.includes('run') || msgLower.includes('execute') || msgLower.includes('command') || msgLower.includes('install') || msgLower.includes('build'))) {
         score += 1;
       }
       if (tool.category === 'filesystem' && (msgLower.includes('file') || msgLower.includes('read') || msgLower.includes('write') || msgLower.includes('create') || msgLower.includes('delete') || msgLower.includes('folder') || msgLower.includes('directory'))) {
+        score += 1;
+      }
+      if (tool.category === 'web' && (msgLower.includes('search') || msgLower.includes('web') || msgLower.includes('latest') || msgLower.includes('news') || msgLower.includes('look up'))) {
         score += 1;
       }
 
@@ -116,25 +132,22 @@ class ToolRegistry {
         score += 5;
       }
 
+      if (mentionsLikelyFile && tool.name === 'read_file') {
+        score += 4;
+      }
+
+      if (mentionsLikelyFile && wantsEdit && tool.name === 'write_file') {
+        score += 3;
+      }
+
       scored.push({ tool, score });
     }
 
     // Sort by score descending
     scored.sort((a, b) => b.score - a.score);
 
-    // Always include at least exec and read_file (most commonly needed)
-    const alwaysInclude = ['exec', 'read_file', 'list_dir'];
     const result: ToolDefinition[] = [];
     const included = new Set<string>();
-
-    // Add always-include tools first
-    for (const name of alwaysInclude) {
-      const tool = this.tools.get(name);
-      if (tool) {
-        result.push(tool);
-        included.add(name);
-      }
-    }
 
     // Fill remaining slots with scored tools
     for (const { tool, score } of scored) {
@@ -146,13 +159,60 @@ class ToolRegistry {
       }
     }
 
-    // If nothing scored, include the always-include tools only
+    // Safety fallback: if nothing scored, include only the most broadly useful read-only tools.
+    if (result.length === 0) {
+      for (const name of ['read_file', 'list_dir']) {
+        const tool = this.tools.get(name);
+        if (tool && result.length < Math.min(maxTools, 2)) {
+          result.push(tool);
+        }
+      }
+    }
+
     log.debug(
       { selected: result.map(t => t.name), total: this.tools.size },
       'Selected relevant tools'
     );
 
     return result;
+  }
+
+  /**
+   * Build compact retrieval-augmented tool guidance for the selected tools.
+   * This gives smaller models concrete usage hints without dumping every tool manual.
+   */
+  buildToolGuidance(tools: ToolDefinition[], userMessage: string, maxEntries: number = 4): string {
+    const lowered = userMessage.toLowerCase();
+    const ranked = tools
+      .map(tool => ({
+        tool,
+        score: scoreToolGuidance(tool, lowered),
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxEntries)
+      .map(item => item.tool)
+      .filter(tool => (tool.usageNotes?.length ?? 0) > 0 || (tool.examples?.length ?? 0) > 0);
+
+    if (ranked.length === 0) return '';
+
+    const lines = ['# Tool Usage Notes'];
+
+    for (const tool of ranked) {
+      lines.push(`## ${tool.name}`);
+      if (tool.usageNotes && tool.usageNotes.length > 0) {
+        for (const note of tool.usageNotes.slice(0, 4)) {
+          lines.push(`- ${note}`);
+        }
+      }
+
+      const example = pickMostRelevantExample(tool, lowered);
+      if (example) {
+        lines.push(`Example intent: ${example.userIntent}`);
+        lines.push(`Example args: ${JSON.stringify(example.arguments)}`);
+      }
+    }
+
+    return lines.join('\n');
   }
 
   /**
@@ -258,6 +318,41 @@ function extractArgsFromMalformedJSON(raw: string): Record<string, any> {
   }
 
   return args;
+}
+
+function scoreToolGuidance(tool: ToolDefinition, loweredMessage: string): number {
+  let score = 0;
+  if (loweredMessage.includes(tool.name.toLowerCase())) score += 10;
+
+  for (const keyword of tool.keywords) {
+    if (loweredMessage.includes(keyword.toLowerCase())) score += 2;
+  }
+
+  if (tool.examples) {
+    for (const example of tool.examples) {
+      if (loweredMessage.includes(example.userIntent.toLowerCase())) {
+        score += 4;
+      }
+    }
+  }
+
+  return score;
+}
+
+function pickMostRelevantExample(
+  tool: ToolDefinition,
+  loweredMessage: string
+): { userIntent: string; arguments: Record<string, any> } | null {
+  if (!tool.examples || tool.examples.length === 0) return null;
+
+  const ranked = [...tool.examples]
+    .map(example => ({
+      example,
+      score: loweredMessage.includes(example.userIntent.toLowerCase()) ? 2 : 0,
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  return ranked[0]?.example ?? null;
 }
 
 // ─── Singleton Registry ──────────────────────────────────────────────

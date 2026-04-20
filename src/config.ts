@@ -26,10 +26,12 @@ export interface LiteClawConfig {
     };
   };
   agent?: {
+    name?: string;
     systemPromptFile?: string;
     workspace?: string;
     contextTokens?: number;
     maxTurns?: number;
+    historyMessageLimit?: number;
     contextBudgetPct?: number;
     toolLoading?: 'lazy' | 'all';
     thinkingDefault?: string;
@@ -158,9 +160,11 @@ export function getDefaultConfig(): LiteClawConfig {
       },
     },
     agent: {
+      name: 'Molty Bot',
       systemPromptFile: 'system_prompt.md',
       contextTokens: 64000,
       maxTurns: 20,
+      historyMessageLimit: 20,
       contextBudgetPct: 80,
       toolLoading: 'lazy',
       thinkingDefault: 'medium',
@@ -245,8 +249,9 @@ export function loadSystemPrompt(): string {
     basePrompt = `You are LiteClaw, a helpful AI assistant running locally. Be concise and helpful.`;
   }
 
-  // ── Inject date ──
-  basePrompt = basePrompt.replace('{{DATE}}', new Date().toLocaleDateString());
+  // ── Inject dynamic values ──
+  basePrompt = basePrompt.replace(/\{\{DATE\}\}/g, new Date().toLocaleDateString());
+  basePrompt = basePrompt.replace(/\{\{STATE_DIR\}\}/g, stateDir.replace(/\\/g, '/'));
 
   // ── Load personality files ──
   const PERSONALITY_FILES = [

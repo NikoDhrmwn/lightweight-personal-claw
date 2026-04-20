@@ -32,7 +32,7 @@ import { existsSync } from 'fs';
 import { basename, extname } from 'path';
 import { AgentEngine, AgentRequest } from '../core/engine.js';
 import { ConfirmationManager } from '../core/confirmation.js';
-import { getConfig } from '../config.js';
+import { getConfig, getStateDir } from '../config.js';
 import { createLogger } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
 import type { InteractiveChoiceRequest } from '../core/tools.js';
@@ -504,6 +504,7 @@ export class DiscordChannel {
       channelType: 'discord',
       channelTarget: interaction.channelId,
       userIdentifier: interaction.user.tag,
+      workingDir: this.config.workspace || getConfig().agent?.workspace || getStateDir(),
       sendInteractiveChoice: async (choiceRequest) => {
         return this.sendInteractiveChoice({
           channelId: interaction.channelId,
@@ -776,6 +777,7 @@ export class DiscordChannel {
       channelType: 'discord',
       channelTarget: message.channel.id,
       userIdentifier: message.author.tag,
+      workingDir: this.config.workspace || getConfig().agent?.workspace || getStateDir(),
       sendFile: async (filePath: string, fileName?: string) => {
         await this.sendFile(message, filePath, fileName);
       },
@@ -1175,46 +1177,25 @@ function buildStructuredIncomingMessage(
   },
   content: string
 ): string {
-  const conversationInfo = {
-    platform: meta.platform,
-    conversation_label: meta.conversationLabel,
-    is_group_chat: meta.isGroupChat,
-    was_mentioned: meta.wasMentioned,
-  };
+  // Compact context header — one line for LLM context, won't clutter WebUI
+  const senderLabel = meta.sender.name || meta.sender.label || meta.sender.username || 'unknown';
+  const senderHandle = meta.sender.username || meta.sender.tag || senderLabel;
+  const chatType = meta.isGroupChat ? 'group' : 'DM';
 
-  const participantList = meta.mentionTargets.slice(0, 8).map(target => ({
-    label: target.label,
-    handle: `@${target.aliases[0]}`,
-    aliases: target.aliases.slice(0, 4).map(alias => `@${alias}`),
-    id: target.id,
-  }));
-
-  const parts = [
-    'Conversation info (untrusted metadata):',
-    '```json',
-    JSON.stringify(conversationInfo, null, 2),
-    '```',
-    '',
-    'Sender (untrusted metadata):',
-    '```json',
-    JSON.stringify(meta.sender, null, 2),
-    '```',
+  const parts: string[] = [
+    `[context: ${meta.platform} | ${chatType} | ${meta.conversationLabel} | sender: ${senderLabel} (${senderHandle})]`,
   ];
 
-  if (participantList.length > 0) {
-    parts.push(
-      '',
-      'Known participants you may address (untrusted metadata):',
-      '```json',
-      JSON.stringify(participantList, null, 2),
-      '```',
-      '',
-      'Use only these handles if you want to tag someone in your reply.'
-    );
+  if (meta.mentionTargets.length > 0) {
+    const handles = meta.mentionTargets
+      .slice(0, 8)
+      .map(t => `@${t.aliases[0]} (${t.label})`)
+      .join(', ');
+    parts.push(`[participants: ${handles}]`);
   }
 
   if (meta.replyContext) {
-    parts.push('', meta.replyContext);
+    parts.push(meta.replyContext);
   }
 
   parts.push('', content);

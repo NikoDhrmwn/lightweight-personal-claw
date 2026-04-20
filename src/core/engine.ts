@@ -94,6 +94,20 @@ export class AgentEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Save a user message to memory without triggering processing.
+   * Useful for keeping group chat context when the bot isn't addressed.
+   */
+  saveMessageSilent(request: AgentRequest): void {
+    this.memory.saveMessage({
+      sessionKey: request.sessionKey,
+      role: 'user',
+      content: request.message,
+      timestamp: Date.now(),
+      metadata: request.userIdentifier ? JSON.stringify({ userIdentifier: request.userIdentifier }) : undefined
+    });
+  }
+
   private async *_processRequest(request: AgentRequest): AsyncGenerator<AgentStreamEvent> {
     const config = getConfig();
     const maxIterations = config.agent?.maxTurns ?? 20;
@@ -109,7 +123,8 @@ export class AgentEngine extends EventEmitter {
     const userMessage = this.buildUserMessage(request);
 
     // 3. Load conversation history from memory
-    const rawHistory = this.memory.getHistory(request.sessionKey, 30);
+    const historyLimit = config.agent?.historyMessageLimit ?? 30;
+    const rawHistory = this.memory.getHistory(request.sessionKey, historyLimit);
     let history: LLMMessage[] = rawHistory.map(entry => ({
       role: entry.role as 'user' | 'assistant',
       content: entry.content,
@@ -152,6 +167,7 @@ export class AgentEngine extends EventEmitter {
       : allTools;
 
     const toolDefs = toolRegistry.toLLMToolDefs(selectedTools);
+    const toolGuidance = toolRegistry.buildToolGuidance(selectedTools, request.message);
 
     // 7. Trim history to fit context window
     const systemTokens = estimateTokens(systemPrompt);
@@ -166,7 +182,11 @@ export class AgentEngine extends EventEmitter {
     if (toolDefs.length > 0) {
       finalSystemPrompt += `\n\n# Available Tools\nYou have access to the following tools:\n<tools>\n`;
       finalSystemPrompt += JSON.stringify(toolDefs, null, 2);
-      finalSystemPrompt += `\n</tools>\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nIf a tool is needed, do NOT narrate a plan or say what you will do next. Emit exactly one tool call immediately. After a tool call, wait for the system to provide a <tool_result> message before continuing. Use only ONE tool at a time.`;
+      finalSystemPrompt += `\n</tools>`;
+      if (toolGuidance) {
+        finalSystemPrompt += `\n\n${toolGuidance}`;
+      }
+      finalSystemPrompt += `\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nIf a tool is needed, do NOT narrate a plan or say what you will do next. Emit exactly one tool call immediately. After a tool call, wait for the system to provide a <tool_result> message before continuing. Use only ONE tool at a time.`;
     }
 
     // 9. Build message array
@@ -412,18 +432,20 @@ function shouldRepairToolTurn(
 ): boolean {
   if (toolDefs.length === 0) return false;
 
-  const combined = `${userMessage}\n${thinkingContent}`.toLowerCase();
-  const toolMentioned = toolDefs.some(td => combined.includes(td.function.name.toLowerCase()));
+  // Only repair if the thinking text explicitly mentions a tool name from the active set.
+  // Previously this matched broad keywords like 'search', 'read', 'run' which caused
+  // the agent to spam-loop when tools returned unhelpful results.
+  const thinking = thinkingContent.toLowerCase();
+  const toolMentioned = toolDefs.some(td => thinking.includes(td.function.name.toLowerCase()));
 
-  return toolMentioned ||
-    combined.includes('tool') ||
-    combined.includes('i will use') ||
-    combined.includes('use the') ||
-    combined.includes('search') ||
-    combined.includes('read') ||
-    combined.includes('list') ||
-    combined.includes('fetch') ||
-    combined.includes('run');
+  // Also check for explicit "I will use" or "tool_call" patterns in thinking
+  const hasExplicitIntent =
+    thinking.includes('i will use') ||
+    thinking.includes('tool_call') ||
+    thinking.includes('i need to call') ||
+    thinking.includes('let me use the');
+
+  return toolMentioned || hasExplicitIntent;
 }
 
 function inferSafeToolCall(

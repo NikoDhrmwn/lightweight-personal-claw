@@ -54,6 +54,14 @@ toolRegistry.register({
     { name: 'cwd', type: 'string', description: 'Working directory for the command (optional)' },
     { name: 'timeout', type: 'number', description: 'Timeout in seconds (default: 30)' },
   ],
+  usageNotes: [
+    'Use this only when the user explicitly wants a command, script, install, build, or terminal action.',
+    'Prefer read_file or list_dir for inspection tasks; do not use exec just to read project files.',
+    'Provide one complete shell command string in the command field.'
+  ],
+  examples: [
+    { userIntent: 'run npm test', arguments: { command: 'npm test' } },
+  ],
   keywords: ['run', 'execute', 'command', 'shell', 'terminal', 'cmd', 'powershell', 'script', 'install', 'npm', 'pip', 'python', 'node', 'git', 'build', 'compile'],
   handler: async (args, context): Promise<ToolResult> => {
     const command = args.command;

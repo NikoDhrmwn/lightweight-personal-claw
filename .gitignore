@@ -21,14 +21,19 @@ sessions/
 credentials/
 memory/
 
+# Agent personality (Privacy)
+config/personality/*.md
+!config/personality/*.template.md
+
 # Scratch and temp data
 .tmp/
 tmp/
 temp/
+.kilo/
 
 # OS / editor noise
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
+.gitignore

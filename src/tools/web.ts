@@ -18,6 +18,14 @@ toolRegistry.register({
     { name: 'query', type: 'string', description: 'The search query', required: true },
     { name: 'maxResults', type: 'number', description: 'Maximum results to return (default: 5)' },
   ],
+  usageNotes: [
+    'Use this for latest information, news, or facts that may have changed recently.',
+    'The query should be a plain search phrase, not a URL.',
+    'If you already have a specific URL, use web_fetch instead.'
+  ],
+  examples: [
+    { userIntent: 'latest ai news', arguments: { query: 'latest AI news', maxResults: 5 } },
+  ],
   keywords: ['search', 'google', 'web', 'find', 'lookup', 'look up', 'information', 'news', 'latest', 'what is', 'who is', 'how to'],
   handler: async (args): Promise<ToolResult> => {
     const config = getConfig();
@@ -155,6 +163,14 @@ toolRegistry.register({
   parameters: [
     { name: 'url', type: 'string', description: 'The URL to fetch', required: true },
     { name: 'maxChars', type: 'number', description: 'Maximum characters to return (default: 5000)' },
+  ],
+  usageNotes: [
+    'Use this when you already have a specific URL and need the page contents.',
+    'Do not use this for general search tasks; use web_search first.',
+    'Keep maxChars modest when you only need a quick inspection.'
+  ],
+  examples: [
+    { userIntent: 'fetch this article', arguments: { url: 'https://example.com', maxChars: 4000 } },
   ],
   keywords: ['fetch', 'url', 'website', 'page', 'http', 'download', 'get', 'load', 'scrape'],
   handler: async (args): Promise<ToolResult> => {
