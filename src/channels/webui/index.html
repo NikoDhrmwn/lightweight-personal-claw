@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="LiteClaw — Lightweight AI Agent Interface">
+  <title>LiteClaw</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <span class="logo-icon">🦎</span>
+          <span class="logo-text">LiteClaw</span>
+        </div>
+        <button class="btn-icon" id="newChatBtn" title="New chat">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+
+      <div class="sidebar-content">
+        <!-- Sessions Section -->
+        <div class="sidebar-section">
+          <div class="sidebar-label">Sessions</div>
+          <div id="sessionList" class="session-list">
+            <div class="session-item active">
+              <span class="session-dot"></span>
+              <span>Default Session</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Channels Section -->
+        <div class="sidebar-section">
+          <div class="sidebar-label">Channels</div>
+          <div id="channelList" class="channel-list">
+            <div class="channel-item" data-channel="webui">
+              <span class="channel-icon">🌐</span>
+              <span class="channel-name">WebUI</span>
+              <span class="channel-status online" id="ch-webui"></span>
+            </div>
+            <div class="channel-item" data-channel="discord">
+              <span class="channel-icon">🎮</span>
+              <span class="channel-name">Discord</span>
+              <span class="channel-status" id="ch-discord"></span>
+            </div>
+            <div class="channel-item" data-channel="whatsapp">
+              <span class="channel-icon">💬</span>
+              <span class="channel-name">WhatsApp</span>
+              <span class="channel-status" id="ch-whatsapp"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="status-badge" id="statusBadge">
+          <span class="status-dot"></span>
+          <span id="statusText">Connecting...</span>
+        </div>
+        <div class="footer-row">
+          <div class="model-badge" id="modelBadge">connecting...</div>
+          <button class="btn-icon settings-btn" id="settingsBtn" title="Settings">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Settings Panel (slide-over) -->
+    <div class="settings-overlay" id="settingsOverlay" hidden>
+      <div class="settings-panel" id="settingsPanel">
+        <div class="settings-header">
+          <h2>⚙️ Settings</h2>
+          <button class="btn-icon" id="closeSettingsBtn">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+
+        <div class="settings-body">
+          <!-- Model Settings -->
+          <div class="settings-group">
+            <div class="settings-group-title">Model</div>
+            <div class="setting-row">
+              <label for="settingModel">Primary Model</label>
+              <select id="settingModel" class="setting-select"></select>
+            </div>
+            <div class="setting-row">
+              <label for="settingTemp">Temperature</label>
+              <div class="setting-slider-row">
+                <input type="range" id="settingTemp" min="0" max="2" step="0.1" value="1.0" class="setting-range">
+                <span id="settingTempVal" class="setting-range-val">1.0</span>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label for="settingThinking">Thinking Level</label>
+              <select id="settingThinking" class="setting-select">
+                <option value="off">Off</option>
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Agent Settings -->
+          <div class="settings-group">
+            <div class="settings-group-title">Agent</div>
+            <div class="setting-row setting-row-stack">
+              <label for="settingWorkspace">Workspace</label>
+              <input type="text" id="settingWorkspace" value="" class="setting-input setting-input-wide" placeholder="D:\projects\workspace">
+            </div>
+            <div class="setting-row">
+              <label for="settingMaxTurns">Max Turns</label>
+              <input type="number" id="settingMaxTurns" value="20" min="1" max="50" class="setting-input">
+            </div>
+            <div class="setting-row">
+              <label>Tool Loading</label>
+              <div class="setting-toggle-group">
+                <button class="toggle-btn active" data-value="lazy">Lazy</button>
+                <button class="toggle-btn" data-value="eager">Eager</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Channel Controls -->
+          <div class="settings-group">
+            <div class="settings-group-title">Channels</div>
+            <div class="setting-row">
+              <label>Discord</label>
+              <div class="setting-status-row">
+                <span class="channel-status-text" id="discordStatusText">--</span>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="toggleDiscord">
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label for="discordReplyStyle">Discord Reply Style</label>
+              <select id="discordReplyStyle" class="setting-select">
+                <option value="single">Single message</option>
+                <option value="rapid">Rapid short bursts</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <label>WhatsApp</label>
+              <div class="setting-status-row">
+                <span class="channel-status-text" id="whatsappStatusText">--</span>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="toggleWhatsapp">
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label for="whatsappReplyStyle">WhatsApp Reply Style</label>
+              <select id="whatsappReplyStyle" class="setting-select">
+                <option value="single">Single message</option>
+                <option value="rapid">Rapid short bursts</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- System Info -->
+          <div class="settings-group">
+            <div class="settings-group-title">System</div>
+            <div class="setting-row">
+              <label>Version</label>
+              <span class="setting-value" id="sysVersion">--</span>
+            </div>
+            <div class="setting-row">
+              <label>Uptime</label>
+              <span class="setting-value" id="sysUptime">--</span>
+            </div>
+            <div class="setting-row">
+              <label>Memory (sessions)</label>
+              <span class="setting-value" id="sysMemory">--</span>
+            </div>
+            <div class="setting-row">
+              <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
+            </div>
+            <div class="setting-row">
+              <button class="btn btn-danger-outline" id="clearAllBtn">🗑️ Clear All Sessions</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Chat Area -->
+    <main class="chat-area">
+      <header class="chat-header">
+        <button class="btn-icon sidebar-toggle" id="sidebarToggle">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+        </button>
+        <div class="chat-title">
+          <h1 id="chatTitle">LiteClaw</h1>
+          <span class="chat-subtitle" id="chatSubtitle">Local AI Agent</span>
+        </div>
+        <div class="header-actions">
+          <div class="workspace-pill" id="workspacePill" title="Agent workspace">workspace: --</div>
+          <button class="btn-icon" id="clearBtn" title="Clear chat">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="notice-stack" id="noticeStack"></div>
+
+      <div class="messages" id="messages">
+        <div class="welcome-screen" id="welcomeScreen">
+          <div class="welcome-icon">🦎</div>
+          <h2>Welcome to LiteClaw</h2>
+          <p>Your lightweight local AI agent. Ask me anything, or use my tools to work with files, run commands, and search the web.</p>
+          <div class="welcome-chips">
+            <button class="chip" data-prompt="What files are in my current directory?">📁 List files</button>
+            <button class="chip" data-prompt="Search the web for today's top tech news">🔍 Web search</button>
+            <button class="chip" data-prompt="What can you help me with?">💡 Capabilities</button>
+            <button class="chip" data-prompt="Tell me a joke">😄 Tell a joke</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Confirmation Modal -->
+      <div class="modal-overlay" id="confirmModal" hidden>
+        <div class="modal">
+          <div class="modal-header">
+            <span class="modal-icon">⚠️</span>
+            <h3>Confirmation Required</h3>
+          </div>
+          <div class="modal-body" id="confirmBody"></div>
+          <div class="modal-actions">
+            <button class="btn btn-danger-outline" id="confirmReject">❌ Cancel</button>
+            <button class="btn btn-success" id="confirmAccept">✅ Confirm</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <div class="input-area">
+        <div class="image-preview" id="imagePreview" hidden></div>
+        <div class="input-container">
+          <label class="attach-btn" title="Attach image">
+            <input type="file" id="imageInput" accept="image/*" multiple hidden>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+          </label>
+          <textarea
+            id="messageInput"
+            placeholder="Send a message..."
+            rows="1"
+            autofocus
+          ></textarea>
+          <button class="send-btn" id="sendBtn" disabled>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+          </button>
+        </div>
+        <div class="input-footer">
+          <span class="input-hint">Shift+Enter for newline · Powered by local LLM</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
