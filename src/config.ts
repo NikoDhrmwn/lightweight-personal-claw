@@ -26,10 +26,12 @@ export interface LiteClawConfig {
     };
   };
   agent?: {
+    name?: string;
     systemPromptFile?: string;
     workspace?: string;
     contextTokens?: number;
     maxTurns?: number;
+    historyMessageLimit?: number;
     contextBudgetPct?: number;
     toolLoading?: 'lazy' | 'all';
     thinkingDefault?: string;
@@ -158,9 +160,11 @@ export function getDefaultConfig(): LiteClawConfig {
       },
     },
     agent: {
+      name: 'Molty Bot',
       systemPromptFile: 'system_prompt.md',
       contextTokens: 64000,
       maxTurns: 20,
+      historyMessageLimit: 20,
       contextBudgetPct: 80,
       toolLoading: 'lazy',
       thinkingDefault: 'medium',

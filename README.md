@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Changed
 
+- **Privacy-First Personality**: Personalized files in `config/personality/` are now git-ignored. Added `*.template.md` files for repo consistency—copy them to `.md` to customize your bot's soul without leaking it to GitHub.
+- **Dynamic Name Logic**: Added `agent.name` to `config.yaml`. Use this to set your bot's callsign (e.g., "Molty Bot") for reliable @mention detection across all channels.
+- **WhatsApp Group Context**: Messages in group chats are now saved to memory silently even when you don't tag the bot, so it has context when you finally address it.
+- **Configurable History**: Added `agent.historyMessageLimit` to `config.yaml` to control how many previous messages are sent to the LLM (default: 20).
+- **Response Formatting**: Added strict constraints to `system_prompt.md` to prevent "internal monologue" or action-narration spam (no more `(Thinking...)` text).
 - Replaced noisy JSON metadata blocks in Discord and WhatsApp with a compact, minimal-token context header.
 - Streamlined agent tagging logic to only tag when contextually relevant instead of blanket-tagging every reply.
 - Agent identity now gracefully extracts Discord/WhatsApp sender handles for WebUI display instead of defaulting to generic 'You'.

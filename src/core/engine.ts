@@ -94,6 +94,20 @@ export class AgentEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Save a user message to memory without triggering processing.
+   * Useful for keeping group chat context when the bot isn't addressed.
+   */
+  saveMessageSilent(request: AgentRequest): void {
+    this.memory.saveMessage({
+      sessionKey: request.sessionKey,
+      role: 'user',
+      content: request.message,
+      timestamp: Date.now(),
+      metadata: request.userIdentifier ? JSON.stringify({ userIdentifier: request.userIdentifier }) : undefined
+    });
+  }
+
   private async *_processRequest(request: AgentRequest): AsyncGenerator<AgentStreamEvent> {
     const config = getConfig();
     const maxIterations = config.agent?.maxTurns ?? 20;
@@ -109,7 +123,8 @@ export class AgentEngine extends EventEmitter {
     const userMessage = this.buildUserMessage(request);
 
     // 3. Load conversation history from memory
-    const rawHistory = this.memory.getHistory(request.sessionKey, 30);
+    const historyLimit = config.agent?.historyMessageLimit ?? 30;
+    const rawHistory = this.memory.getHistory(request.sessionKey, historyLimit);
     let history: LLMMessage[] = rawHistory.map(entry => ({
       role: entry.role as 'user' | 'assistant',
       content: entry.content,
