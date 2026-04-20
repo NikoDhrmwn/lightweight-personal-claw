@@ -32,4 +32,4 @@ temp/
 Thumbs.db
 .vscode/
 .idea/
-
+.gitignore
