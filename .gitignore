@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Local runtime state
+*.log
+liteclaw.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+whatsapp-session/
+sessions/
+credentials/
+memory/
+
+# Scratch and temp data
+.tmp/
+tmp/
+temp/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
