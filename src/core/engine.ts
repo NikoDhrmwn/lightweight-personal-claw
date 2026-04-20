@@ -152,6 +152,7 @@ export class AgentEngine extends EventEmitter {
       : allTools;
 
     const toolDefs = toolRegistry.toLLMToolDefs(selectedTools);
+    const toolGuidance = toolRegistry.buildToolGuidance(selectedTools, request.message);
 
     // 7. Trim history to fit context window
     const systemTokens = estimateTokens(systemPrompt);
@@ -166,7 +167,11 @@ export class AgentEngine extends EventEmitter {
     if (toolDefs.length > 0) {
       finalSystemPrompt += `\n\n# Available Tools\nYou have access to the following tools:\n<tools>\n`;
       finalSystemPrompt += JSON.stringify(toolDefs, null, 2);
-      finalSystemPrompt += `\n</tools>\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nIf a tool is needed, do NOT narrate a plan or say what you will do next. Emit exactly one tool call immediately. After a tool call, wait for the system to provide a <tool_result> message before continuing. Use only ONE tool at a time.`;
+      finalSystemPrompt += `\n</tools>`;
+      if (toolGuidance) {
+        finalSystemPrompt += `\n\n${toolGuidance}`;
+      }
+      finalSystemPrompt += `\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nIf a tool is needed, do NOT narrate a plan or say what you will do next. Emit exactly one tool call immediately. After a tool call, wait for the system to provide a <tool_result> message before continuing. Use only ONE tool at a time.`;
     }
 
     // 9. Build message array

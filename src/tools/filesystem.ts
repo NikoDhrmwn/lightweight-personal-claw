@@ -20,6 +20,16 @@ toolRegistry.register({
     { name: 'startLine', type: 'number', description: 'Start line (1-indexed, optional)' },
     { name: 'endLine', type: 'number', description: 'End line (1-indexed, inclusive, optional)' },
   ],
+  usageNotes: [
+    'Use this when you already know the file path or filename you need to inspect.',
+    'Prefer this over list_dir when the user mentions a specific file like SOUL.md, package.json, or app.py.',
+    'If the file may be large, include startLine/endLine instead of reading the whole thing.',
+    'Do not call list_dir first unless the path is genuinely unknown.'
+  ],
+  examples: [
+    { userIntent: 'read package.json', arguments: { path: 'package.json' } },
+    { userIntent: 'inspect SOUL.md', arguments: { path: 'SOUL.md' } },
+  ],
   keywords: ['read', 'file', 'open', 'show', 'content', 'view', 'cat', 'type', 'display', 'look', 'check'],
   handler: async (args, context): Promise<ToolResult> => {
     const filePath = resolve(context.workingDir, args.path);
@@ -74,7 +84,15 @@ toolRegistry.register({
     { name: 'path', type: 'string', description: 'Path to the file to write', required: true },
     { name: 'content', type: 'string', description: 'Content to write to the file', required: true },
   ],
-  keywords: ['write', 'create', 'save', 'file', 'make', 'output', 'generate', 'put'],
+  usageNotes: [
+    'Use this only after you have already determined the exact file path and full content to save.',
+    'For edits, read the target file first when needed so you do not overwrite the wrong content.',
+    'This overwrites the entire file content.'
+  ],
+  examples: [
+    { userIntent: 'create a notes file', arguments: { path: 'notes.txt', content: 'Hello' } },
+  ],
+  keywords: ['write', 'create', 'save', 'file', 'output', 'generate', 'put'],
   handler: async (args, context): Promise<ToolResult> => {
     const filePath = resolve(context.workingDir, args.path);
 
@@ -103,6 +121,10 @@ toolRegistry.register({
   parameters: [
     { name: 'path', type: 'string', description: 'Path to the file to delete', required: true },
   ],
+  usageNotes: [
+    'Use this only when the user clearly asked to remove a file.',
+    'This requires confirmation and should not be used for ordinary editing.',
+  ],
   keywords: ['delete', 'remove', 'rm', 'del', 'erase', 'destroy', 'clean'],
   requiresConfirmation: true,
   handler: async (args, context): Promise<ToolResult> => {
@@ -129,6 +151,14 @@ toolRegistry.register({
   category: 'filesystem',
   parameters: [
     { name: 'path', type: 'string', description: 'Path to the directory to list', required: true },
+  ],
+  usageNotes: [
+    'Use this when the user asks what files exist, asks to browse a directory, or the target path is unknown.',
+    'Do not use this if the user already named a specific file; read_file is better then.',
+    'If you only need a single file, avoid directory listings because they add noise for small models.'
+  ],
+  examples: [
+    { userIntent: 'what files are here', arguments: { path: '.' } },
   ],
   keywords: ['list', 'directory', 'folder', 'dir', 'ls', 'tree', 'files', 'contents', 'what'],
   handler: async (args, context): Promise<ToolResult> => {
@@ -180,6 +210,10 @@ toolRegistry.register({
   parameters: [
     { name: 'path', type: 'string', description: 'Path to the file to send', required: true },
     { name: 'fileName', type: 'string', description: 'Display name for the file (optional)' },
+  ],
+  usageNotes: [
+    'Use this only when the user wants the actual file delivered back into the chat.',
+    'Do not use this just to confirm a file exists.'
   ],
   keywords: ['send', 'share', 'attach', 'upload', 'deliver', 'transfer', 'give'],
   handler: async (args, context): Promise<ToolResult> => {
