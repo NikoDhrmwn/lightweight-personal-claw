@@ -23,6 +23,7 @@ import { ConfirmationManager } from '../core/confirmation.js';
 import { getConfig, getStateDir } from '../config.js';
 import { createLogger, createSilentLogger } from '../logger.js';
 import { printStepDone, printStepWarn } from '../logger.js';
+import { preprocessImage } from '../tools/vision.js';
 
 const log = createLogger('whatsapp');
 const baileysLog = createSilentLogger('baileys');
@@ -144,19 +145,7 @@ export class WhatsAppChannel {
     const mentionTargets = this.extractMentionTargets(msg, messageContent);
     const replyContext = this.extractReplyContext(messageContent);
 
-    // Handle image messages (native multimodal)
-    const images: string[] = [];
-    if (messageContent?.imageMessage) {
-      try {
-        const stream = await this.downloadMedia(msg);
-        if (stream) {
-          const base64 = stream.toString('base64');
-          images.push(`data:image/jpeg;base64,${base64}`);
-        }
-      } catch (err: any) {
-        log.warn({ error: err.message }, 'Failed to download WhatsApp image');
-      }
-    }
+    const images = await this.collectIncomingImages(msg, messageContent);
 
     if (!content && images.length === 0) return;
 
@@ -413,6 +402,56 @@ export class WhatsAppChannel {
     }
 
     log.info({ file: name, jid }, 'Sent file via WhatsApp');
+  }
+
+  private async collectIncomingImages(msg: any, messageContent: any): Promise<string[]> {
+    const images: string[] = [];
+
+    if (messageContent?.imageMessage) {
+      const current = await this.downloadMessageImage(msg, 'message');
+      if (current) images.push(current);
+    }
+
+    const quotedImage = await this.downloadQuotedReplyImage(messageContent);
+    if (quotedImage) images.push(quotedImage);
+
+    return images;
+  }
+
+  private async downloadMessageImage(msg: any, reason: string): Promise<string | null> {
+    try {
+      const stream = await this.downloadMedia(msg);
+      if (!stream) return null;
+      return await preprocessImage(stream);
+    } catch (err: any) {
+      log.warn({ error: err.message, reason }, 'Failed to download WhatsApp image');
+      return null;
+    }
+  }
+
+  private async downloadQuotedReplyImage(messageContent: any): Promise<string | null> {
+    const contextInfo =
+      messageContent?.extendedTextMessage?.contextInfo ??
+      messageContent?.imageMessage?.contextInfo ??
+      messageContent?.videoMessage?.contextInfo ??
+      messageContent?.documentMessage?.contextInfo;
+
+    const quotedImage = contextInfo?.quotedMessage?.imageMessage;
+    if (!quotedImage) return null;
+
+    try {
+      const { downloadContentFromMessage } = await import('@whiskeysockets/baileys');
+      const stream = await downloadContentFromMessage(quotedImage, 'image');
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      if (chunks.length === 0) return null;
+      return await preprocessImage(Buffer.concat(chunks));
+    } catch (err: any) {
+      log.warn({ error: err.message }, 'Failed to download quoted WhatsApp image');
+      return null;
+    }
   }
 
   private async downloadMedia(msg: any): Promise<Buffer | null> {

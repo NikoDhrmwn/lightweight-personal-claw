@@ -437,14 +437,22 @@ export class DiscordChannel {
   private async registerSlashCommands(clientId: string): Promise<void> {
     try {
       const token = this.config.token ?? process.env.DISCORD_TOKEN;
+      const guildId = this.config.guildId ?? process.env.DISCORD_GUILD_ID;
       const rest = new REST({ version: '10' }).setToken(token);
 
       const commandData = SLASH_COMMANDS.map(cmd => cmd.toJSON());
 
-      await rest.put(Routes.applicationCommands(clientId), { body: commandData });
-
-      log.info({ count: commandData.length }, 'Registered slash commands');
-      console.log(`  ✓ Registered ${commandData.length} slash commands: ${SLASH_COMMANDS.map(c => '/' + c.name).join(', ')}`);
+      if (guildId) {
+        // Instant registration for a specific guild (faster for dev)
+        await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commandData });
+        log.info({ guildId, count: commandData.length }, 'Registered guild slash commands');
+        console.log(`  ✓ Registered ${commandData.length} guild slash commands for ${guildId}`);
+      } else {
+        // Global registration (can take up to 1h to propagate)
+        await rest.put(Routes.applicationCommands(clientId), { body: commandData });
+        log.info({ count: commandData.length }, 'Registered global slash commands');
+        console.log(`  ✓ Registered ${commandData.length} global slash commands (may take up to 1h to show up)`);
+      }
     } catch (err: any) {
       log.error({ error: err.message }, 'Failed to register slash commands');
       console.log(`  ⚠ Failed to register slash commands: ${err.message}`);
@@ -640,25 +648,15 @@ export class DiscordChannel {
   private async handleTokensCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const sessionKey = `discord:${interaction.channelId}`;
     const { MemoryStore } = await import('../core/memory.js');
-    const { ContextManager, estimateMessageTokens } = await import('../core/context.js');
-    
     const memory = new MemoryStore();
-    const history = memory.getHistory(sessionKey, 100);
+    const metrics = memory.getSessionMetrics(sessionKey);
     memory.close();
 
     const config = getConfig();
     const maxTokens = config.agent?.contextTokens ?? 64000;
     const threshold = config.agent?.compaction?.softThresholdTokens ?? 48000;
     
-    // Estimate tokens for current history
-    let currentTokens = 0;
-    for (const msg of history) {
-      // Fake a minimal LLMMessage since MemoryEntry has what we need
-      currentTokens += estimateMessageTokens({
-        role: msg.role as any,
-        content: msg.content
-      });
-    }
+    const currentTokens = metrics.estimatedTokens;
 
     const percentage = Math.round((currentTokens / threshold) * 100);
     let statusEmoji = '🟢';
@@ -670,6 +668,8 @@ export class DiscordChannel {
       .setDescription(`Current session in this channel.`)
       .addFields(
         { name: 'Estimated Usage', value: `${currentTokens.toLocaleString()} tokens`, inline: true },
+        { name: 'Messages', value: `${metrics.messageCount}`, inline: true },
+        { name: 'Images', value: `${metrics.imageCount}`, inline: true },
         { name: 'Compaction Threshold', value: `${threshold.toLocaleString()} tokens`, inline: true },
         { name: 'System Max', value: `${maxTokens.toLocaleString()} tokens`, inline: true },
         { name: 'Status', value: `${statusEmoji} **${percentage}%** to compaction`, inline: false }
@@ -786,33 +786,7 @@ export class DiscordChannel {
     await this.react(message, REACTIONS.RECEIVED);
     this.beginRequest('thinking');
 
-    // Handle image attachments (native multimodal)
-    const images: string[] = [];
-    for (const [, attachment] of message.attachments) {
-      const contentType = attachment.contentType ?? '';
-      const imageByType = contentType.startsWith('image/');
-      const imageByExtension = /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif)$/i.test(
-        attachment.name ?? extname(attachment.url)
-      );
-
-      if (imageByType || imageByExtension) {
-        try {
-          const response = await fetch(attachment.url);
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status} when fetching attachment`);
-          }
-          const buffer = Buffer.from(await response.arrayBuffer());
-          images.push(await preprocessImage(buffer));
-        } catch (err: any) {
-          log.warn({
-            error: err.message,
-            attachmentName: attachment.name,
-            contentType: attachment.contentType,
-            url: attachment.url,
-          }, 'Failed to fetch Discord image attachment');
-        }
-      }
-    }
+    const images = await this.collectMessageImages(message);
 
     // ── Continuous typing indicator ──
     // Discord typing indicator lasts ~10s. We send every 7s to keep it alive.
@@ -971,6 +945,62 @@ export class DiscordChannel {
   }
 
   // ─── Response Sending ────────────────────────────────────────────
+
+  private async collectMessageImages(message: Message): Promise<string[]> {
+    const images: string[] = [];
+
+    for (const [, attachment] of message.attachments) {
+      const image = await this.fetchAttachmentAsImageData(attachment, 'message');
+      if (image) images.push(image);
+    }
+
+    if (!message.reference?.messageId) return images;
+
+    try {
+      const referenced = typeof message.fetchReference === 'function'
+        ? await message.fetchReference()
+        : null;
+
+      if (!referenced) return images;
+
+      for (const [, attachment] of referenced.attachments) {
+        const image = await this.fetchAttachmentAsImageData(attachment, 'quoted_reply');
+        if (image) images.push(image);
+      }
+    } catch (err: any) {
+      log.debug({ error: err.message, messageId: message.id }, 'Failed to fetch replied-to Discord images');
+    }
+
+    return images;
+  }
+
+  private async fetchAttachmentAsImageData(attachment: any, reason: string): Promise<string | null> {
+    const contentType = attachment.contentType ?? '';
+    const imageByType = contentType.startsWith('image/');
+    const imageByExtension = /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif)$/i.test(
+      attachment.name ?? extname(attachment.url)
+    );
+
+    if (!imageByType && !imageByExtension) return null;
+
+    try {
+      const response = await fetch(attachment.url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} when fetching attachment`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return await preprocessImage(buffer);
+    } catch (err: any) {
+      log.warn({
+        error: err.message,
+        reason,
+        attachmentName: attachment.name,
+        contentType: attachment.contentType,
+        url: attachment.url,
+      }, 'Failed to fetch Discord image attachment');
+      return null;
+    }
+  }
 
   private async sendResponse(
     message: Message,
