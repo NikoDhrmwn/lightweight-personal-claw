@@ -9,6 +9,7 @@
   let currentConfig = {};
   let healthData = {};
   let sessions = [];
+  let currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
   let pendingConfirmationId = null;
   let workspacePath = ".";
   let selectedWorkspaceFile = "";
@@ -56,6 +57,7 @@
     healthPill: $("#healthPill"),
     healthDot: $("#healthDot"),
     healthLabel: $("#healthLabel"),
+    tokenLabel: $("#tokenLabel"),
     chWebui: $("#ch-webui"),
     chDiscord: $("#ch-discord"),
     chWhatsapp: $("#ch-whatsapp"),
@@ -169,6 +171,7 @@
       const data = await fetchJson("/api/sessions");
       sessions = data.sessions || [];
       renderSessionList();
+      fetchSessionMetrics(currentSessionKey);
     } catch {
       sessions = [];
       renderSessionList();
@@ -199,7 +202,7 @@
       const label = formatSessionName(session);
       el.innerHTML = `
         <button class="session-label" type="button" title="${escapeHtml(session.sessionKey)}">${escapeHtml(label)}</button>
-        <span class="session-count">${Number(session.messageCount || 0)}</span>
+        <span class="session-count" title="${Number(session.estimatedTokens || 0).toLocaleString()} tokens">${Number(session.estimatedTokens || 0).toLocaleString()}</span>
         <button class="session-delete" type="button" title="Delete session">×</button>
       `;
 
@@ -233,6 +236,7 @@
   function updateHeader() {
     refs.chatTitle.textContent = formatSessionName(currentSessionKey);
     refs.chatSubtitle.textContent = currentSessionKey;
+    renderSessionMetrics();
   }
 
   function switchSession(sessionKey) {
@@ -244,8 +248,30 @@
     updateHeader();
     loadSessionHistory(sessionKey);
     loadSessions();
+    fetchSessionMetrics(sessionKey);
     sendSessionInit();
     setSidebarOpen(false);
+  }
+
+  async function fetchSessionMetrics(sessionKey) {
+    try {
+      const data = await fetchJson(`/api/sessions/${encodeURIComponent(sessionKey)}/metrics`);
+      if (sessionKey !== currentSessionKey) return;
+      currentSessionMetrics = data || currentSessionMetrics;
+      renderSessionMetrics();
+    } catch {
+      if (sessionKey !== currentSessionKey) return;
+      currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
+      renderSessionMetrics();
+    }
+  }
+
+  function renderSessionMetrics() {
+    if (!refs.tokenLabel) return;
+    const tokens = Number(currentSessionMetrics.estimatedTokens || 0).toLocaleString();
+    const messages = Number(currentSessionMetrics.messageCount || 0);
+    const images = Number(currentSessionMetrics.imageCount || 0);
+    refs.tokenLabel.textContent = `Tokens ${tokens} / msg ${messages} / img ${images}`;
   }
 
   async function loadSessionHistory(sessionKey) {
@@ -586,13 +612,31 @@
   function appendThinking(text) {
     ensureAssistantMessage();
     const body = currentAssistantEl.querySelector(".message-body");
-    let block = body.querySelector(".thinking-block:last-of-type");
-    if (!block || block.dataset.closed === "true") {
-      block = document.createElement("div");
-      block.className = "thinking-block";
-      body.insertBefore(block, body.querySelector(".message-content"));
+    const wrappers = body.querySelectorAll(".thinking-wrapper");
+    let wrapper = wrappers[wrappers.length - 1];
+    
+    if (!wrapper || wrapper.dataset.closed === "true") {
+      wrapper = document.createElement("div");
+      wrapper.className = "thinking-wrapper";
+      
+      const header = document.createElement("button");
+      header.className = "thinking-header";
+      header.type = "button";
+      header.innerHTML = `
+        <span class="thinking-toggle-icon"></span>
+        <span class="thinking-label pulsing">Thinking...</span>
+      `;
+      
+      const content = document.createElement("div");
+      content.className = "thinking-content";
+      
+      wrapper.appendChild(header);
+      wrapper.appendChild(content);
+      body.insertBefore(wrapper, body.querySelector(".message-content"));
     }
-    block.textContent += text || "";
+
+    const contentEl = wrapper.querySelector(".thinking-content");
+    contentEl.textContent += text || "";
     scrollToBottom();
   }
 
@@ -625,11 +669,33 @@
     currentAssistantEl.querySelector(".message-body").insertBefore(err, currentAssistantEl.querySelector(".message-content"));
   }
 
-  function finishStreaming() {
+  function finishStreaming(metrics) {
     isStreaming = false;
     renderAssistantContent();
-    currentAssistantEl?.querySelectorAll(".thinking-block").forEach((el) => {
+
+    if (metrics && currentAssistantEl) {
+      const body = currentAssistantEl.querySelector(".message-body");
+      const metricsEl = document.createElement("div");
+      metricsEl.className = "message-metrics";
+      const totalSec = (metrics.durationMs / 1000).toFixed(1);
+      const tps = metrics.tokPerSec.toFixed(1);
+      metricsEl.innerHTML = `
+        <span>${metrics.tokens} tokens</span>
+        <span class="metric-sep"></span>
+        <span>${totalSec}s</span>
+        <span class="metric-sep"></span>
+        <span>${tps} tok/s</span>
+      `;
+      body.appendChild(metricsEl);
+    }
+
+    currentAssistantEl?.querySelectorAll(".thinking-wrapper").forEach((el) => {
       el.dataset.closed = "true";
+      const label = el.querySelector(".thinking-label");
+      if (label) {
+        label.classList.remove("pulsing");
+        label.textContent = "Thoughts";
+      }
     });
     currentAssistantEl = null;
     currentContent = "";
@@ -666,8 +732,9 @@
         showConfirmation(msg);
         break;
       case "done":
-        finishStreaming();
+        finishStreaming(msg.metrics);
         loadSessions();
+        fetchSessionMetrics(currentSessionKey);
         break;
       case "error":
         appendError(msg.content || "An unknown error occurred.");
@@ -684,6 +751,13 @@
           renderHealth();
         }
         showNotice("Config reloaded from disk.", "info", 2400);
+        break;
+      case "session_metrics":
+        if (msg.sessionKey === currentSessionKey && msg.metrics) {
+          currentSessionMetrics = msg.metrics;
+          renderSessionMetrics();
+        }
+        loadSessions();
         break;
       case "pong":
         break;
@@ -741,7 +815,23 @@
 
   function renderMarkdown(text) {
     const codeBlocks = [];
+    const thinkBlocks = [];
     let working = String(text || "");
+
+    // Handle thinking tags
+    working = working.replace(/<think>([\s\S]*?)<\/think>/g, (_, content) => {
+      const token = `@@THINK${thinkBlocks.length}@@`;
+      thinkBlocks.push(`
+        <div class="thinking-wrapper">
+          <button class="thinking-header" type="button">
+            <span class="thinking-toggle-icon"></span>
+            <span class="thinking-label">Thoughts</span>
+          </button>
+          <div class="thinking-content">${escapeHtml(content.trim())}</div>
+        </div>
+      `);
+      return token;
+    });
 
     working = working.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
       const token = `@@CODE${codeBlocks.length}@@`;
@@ -776,8 +866,12 @@
       return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
     }).join("");
 
-    codeBlocks.forEach((block, index) => {
-      html = html.replace(`@@CODE${index}@@`, block);
+    // Restore tokens
+    codeBlocks.forEach((block, i) => {
+      html = html.replace(`@@CODE${i}@@`, block);
+    });
+    thinkBlocks.forEach((block, i) => {
+      html = html.replace(`@@THINK${i}@@`, block);
     });
 
     return html;
@@ -1001,7 +1095,18 @@
     sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
   }
 
-  // ─── Init ─────────────────────────────────────────────────────────
+  // ─── Initialization ───────────────────────────────────────────────
+
+  // Event delegation for thinking accordions
+  messagesEl.addEventListener("click", (e) => {
+    const header = e.target.closest(".thinking-header");
+    if (header) {
+      const wrapper = header.closest(".thinking-wrapper");
+      if (wrapper) {
+        wrapper.classList.toggle("expanded");
+      }
+    }
+  });
 
   updateHeader();
   bindWelcomeChips();
