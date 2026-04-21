@@ -43,7 +43,9 @@ export async function startGateway(portOverride?: number): Promise<void> {
   printSection('Core Services');
 
   const llm = new LLMClient();
-  printStepDone('LLM client initialized');
+  // Auto-detect models from running servers (non-blocking — falls back to config if offline)
+  await llm.refreshProvidersAsync();
+  printStepDone(`LLM client initialized (model: ${llm.getModelId()})`);
 
   const memory = new MemoryStore();
   printStepDone('Memory store loaded');

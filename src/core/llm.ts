@@ -71,11 +71,111 @@ export function buildProviders(): LLMProvider[] {
 
   for (const [provId, prov] of Object.entries(config.llm?.providers ?? {})) {
     const p = prov as any;
+    let baseUrl = p.baseUrl ?? '';
+    if (!baseUrl && provId === 'google') baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+
     for (const model of p.models ?? []) {
+      // Skip auto-detect placeholders during sync build — they get resolved async
+      if (model === 'auto' || model?.id === 'auto') continue;
       providers.push({
         id: `${provId}/${model.id}`,
-        baseUrl: p.baseUrl ?? '',
+        baseUrl,
         apiKey: p.apiKey ?? 'sk-no-key',
+        model: model.id,
+        contextWindow: model.contextWindow ?? 65536,
+        maxTokens: model.maxTokens ?? 8192,
+        supportsVision: model.vision ?? (model.input?.includes('image') ?? false),
+        supportsTools: true,
+      });
+    }
+  }
+
+  return providers;
+}
+
+/**
+ * Query a local OpenAI-compatible server's /v1/models endpoint
+ * and return a dynamically detected LLMProvider.
+ */
+async function autoDetectLocalModel(provId: string, baseUrl: string, apiKey: string): Promise<LLMProvider | null> {
+  try {
+    const url = `${baseUrl.replace(/\/v1\/?$/, '')}/v1/models`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) return null;
+
+    const body = await res.json() as any;
+    // OpenAI format: body.data[0]
+    const modelInfo = body.data?.[0];
+    if (!modelInfo?.id) return null;
+
+    // Extract capabilities from both Ollama-style and llama.cpp-style responses
+    const meta = modelInfo.meta ?? {};
+    const capabilities: string[] = body.models?.[0]?.capabilities ?? [];
+    const hasVision = capabilities.includes('multimodal') || capabilities.includes('vision');
+    const contextWindow = meta.n_ctx_train ?? 65536;
+
+    log.info({ provider: provId, model: modelInfo.id, contextWindow, vision: hasVision }, 'Auto-detected model from server');
+
+    return {
+      id: `${provId}/${modelInfo.id}`,
+      baseUrl,
+      apiKey,
+      model: modelInfo.id,
+      contextWindow,
+      maxTokens: Math.min(contextWindow, 8192),
+      supportsVision: hasVision,
+      supportsTools: true,
+    };
+  } catch (err: any) {
+    log.debug({ provider: provId, error: err.message }, 'Auto-detect failed (server may be offline)');
+    return null;
+  }
+}
+
+/**
+ * Build providers with async auto-detection for local servers.
+ * Falls back to static config if the server is unreachable.
+ */
+export async function buildProvidersAsync(): Promise<LLMProvider[]> {
+  const config = getConfig();
+  const providers: LLMProvider[] = [];
+
+  for (const [provId, prov] of Object.entries(config.llm?.providers ?? {})) {
+    const p = prov as any;
+    let baseUrl = p.baseUrl ?? '';
+    if (!baseUrl && provId === 'google') baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+    
+    const apiKey = p.apiKey ?? 'sk-no-key';
+    const models = p.models ?? [];
+
+    // Check if this provider wants auto-detection
+    const wantsAuto = p.autoDetect === true ||
+      models.length === 0 ||
+      models.some((m: any) => m === 'auto' || m?.id === 'auto');
+
+    if (wantsAuto && baseUrl) {
+      const detected = await autoDetectLocalModel(provId, baseUrl, apiKey);
+      if (detected) {
+        providers.push(detected);
+        continue; // Skip static models for this provider
+      }
+      // Fall through to static models if auto-detect fails
+    }
+
+    for (const model of models) {
+      if (model === 'auto' || model?.id === 'auto') continue;
+      providers.push({
+        id: `${provId}/${model.id}`,
+        baseUrl,
+        apiKey,
         model: model.id,
         contextWindow: model.contextWindow ?? 65536,
         maxTokens: model.maxTokens ?? 8192,
@@ -125,17 +225,73 @@ export function getFallbackProviders(): LLMProvider[] {
 
 export class LLMClient extends EventEmitter {
   private providers: LLMProvider[];
+  private allProviders: LLMProvider[];
+  private initialized = false;
 
   constructor() {
     super();
     this.providers = [];
-    this.refreshProviders();
+    this.allProviders = [];
+    this.refreshProviders(); // Sync fallback on startup
   }
 
   refreshProviders(): void {
+    if (this.initialized) return; // Do not overwrite async auto-detected models
     const primary = getPrimaryProvider();
     const fallbacks = getFallbackProviders();
     this.providers = [primary, ...fallbacks];
+  }
+
+  getProviders(): LLMProvider[] {
+    return this.providers;
+  }
+
+  getAllProviders(): LLMProvider[] {
+    return this.allProviders;
+  }
+
+  /**
+   * Async refresh that auto-detects models from running servers.
+   * Call this once during startup to enable dynamic model detection.
+   */
+  async refreshProvidersAsync(): Promise<void> {
+    const config = getConfig();
+    const allProviders = await buildProvidersAsync();
+    this.allProviders = allProviders;
+
+    const primaryId = config.llm?.defaults?.primary ?? '';
+    const fallbackIds = config.llm?.defaults?.fallbacks ?? [];
+
+    // Try to find the configured primary exactly
+    let primary = allProviders.find(p => p.id === primaryId);
+    
+    // If primary is 'auto', find the provider that originated from auto-detection
+    if (!primary && (primaryId === 'auto' || primaryId.endsWith('/auto'))) {
+      const autoProvId = Object.entries(config.llm?.providers ?? {}).find(([id, prov]: any) => 
+         prov.autoDetect === true || (prov.models ?? []).some((m: any) => m.id === 'auto' || m === 'auto')
+      )?.[0];
+      
+      if (autoProvId) {
+         primary = allProviders.find(p => p.id.startsWith(`${autoProvId}/`));
+      }
+    }
+
+    // Fallback to the first available if still not found
+    if (!primary && allProviders.length > 0) {
+      primary = allProviders[0];
+    }
+    if (!primary) {
+      primary = getPrimaryProvider(); // Sync fallback
+    }
+
+    const fallbacks = fallbackIds
+      .map((id: string) => allProviders.find(p => p.id === id))
+      .filter(Boolean) as LLMProvider[];
+
+    this.providers = [primary, ...fallbacks];
+    this.initialized = true;
+
+    log.info({ primary: primary.id, model: primary.model, fallbacks: fallbacks.length }, 'Providers initialized (async)');
   }
 
   private createOpenAIClient(provider: LLMProvider): OpenAI {
@@ -193,7 +349,7 @@ export class LLMClient extends EventEmitter {
           const delta = chunk.choices?.[0]?.delta;
           const finishReason = chunk.choices?.[0]?.finish_reason;
 
-          if (!delta && finishReason) {
+          if ((!delta || Object.keys(delta).length === 0) && finishReason) {
             // Flush any pending tool calls
             for (const [, tc] of pendingToolCalls) {
               yield {
@@ -327,6 +483,21 @@ export class LLMClient extends EventEmitter {
               if (tc.function?.arguments) pending.arguments += tc.function.arguments;
             }
           }
+        }
+
+        // Flush any remaining tool calls
+        for (const [, tc] of pendingToolCalls) {
+          yield {
+            type: 'tool_call',
+            toolCall: {
+              id: tc.id,
+              type: 'function',
+              function: { name: tc.name, arguments: tc.arguments },
+            },
+          };
+        }
+        if (tagBuffer.length > 0) {
+          yield { type: isThinking ? 'thinking' : 'content', content: tagBuffer };
         }
 
         // If stream ended without explicit finish_reason
