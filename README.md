@@ -11,6 +11,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.3.0] - 2026-04-21
+
+#### Added
+
+- Added Discord `/tokens` slash command to view real-time session context usage and compaction threshold remaining.
+- Added dynamic LLM inference capability discovery: `autoDetect` queries `/v1/models` against your local OpenAI-compatible server at boot.
+- The Discord `/model` command now actively pulls the live pool of available models across all configured servers, displaying context window sizes and vision flags natively evaluated.
+
+#### Changed
+
+- Hardened the ReAct loop engine by adding three strict circuit breakers (consecutive failures, redundant calls, and pre-emptive substantial answers) forcing tool shedding to preserve inference stability.
+
+#### Fixed
+
+- Fixed WhatsApp group chat tagging bug failing due to unrecognized device JID suffixes (`user:10@s.whatsapp.net`). Mention regex normalizer added.
+- Fixed Discord mention stripping logic where `message.content` was deleting `<@123>` tags instead of replacing them intelligently with actual `@user` handles before feeding the LLM.
+- Fixed an inference edge-case where `auto` detection timeouts led to a fallback dropping the Google endpoint to the standard OpenAI URL resulting in 401 API Key Errors.
+
 ### [0.2.0] - 2026-04-20
 
 #### Added
