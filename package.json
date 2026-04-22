@@ -1,6 +1,6 @@
 {
   "name": "liteclaw",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Lightweight agent runtime for local LLMs — WebUI, Discord, WhatsApp",
   "type": "module",
   "main": "dist/index.js",
@@ -9,8 +9,8 @@
   },
   "scripts": {
     "build": "tsc && node -e \"const fs=require('fs'); fs.cpSync('src/channels/webui', 'dist/channels/webui', {recursive:true, force:true});\"",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "npm run build && tsx src/index.ts",
+    "start": "npm run build && node dist/index.js",
     "cli": "tsx src/cli.ts",
     "lint": "tsc --noEmit"
   },

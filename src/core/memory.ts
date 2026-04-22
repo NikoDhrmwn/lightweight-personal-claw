@@ -9,6 +9,8 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '../logger.js';
+import { estimateTokens } from './context.js';
+import type { TaskPlan } from './tasks.js';
 
 const log = createLogger('memory');
 
@@ -29,6 +31,25 @@ export interface SessionInfo {
   lastActivity: number;
   firstActivity: number;
   userIdentifier?: string;
+  estimatedTokens?: number;
+}
+
+export interface SessionMetrics {
+  sessionKey: string;
+  messageCount: number;
+  estimatedTokens: number;
+  imageCount: number;
+  lastActivity: number | null;
+}
+
+export interface StoredTaskPlan {
+  id: string;
+  sessionKey: string;
+  goal: string;
+  status: string;
+  plan: TaskPlan;
+  createdAt: number;
+  updatedAt: number;
 }
 
 // ─── Memory Store ────────────────────────────────────────────────────
@@ -82,6 +103,20 @@ export class MemoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_summaries_session
         ON summaries(session_key, timestamp);
+
+      CREATE TABLE IF NOT EXISTS task_plans (
+        id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        status TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_plans_session
+        ON task_plans(session_key, updated_at_ms DESC);
     `);
   }
 
@@ -156,6 +191,66 @@ export class MemoryStore {
     return row?.summary ?? null;
   }
 
+  saveTaskPlan(sessionKey: string, plan: TaskPlan): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO task_plans (id, session_key, goal, status, plan_json, created_at_ms, updated_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        session_key = excluded.session_key,
+        goal = excluded.goal,
+        status = excluded.status,
+        plan_json = excluded.plan_json,
+        created_at_ms = excluded.created_at_ms,
+        updated_at_ms = excluded.updated_at_ms
+    `);
+
+    stmt.run(
+      plan.id,
+      sessionKey,
+      plan.goal,
+      plan.status,
+      JSON.stringify(plan),
+      plan.createdAt,
+      plan.updatedAt,
+    );
+  }
+
+  getLatestTaskPlan(sessionKey: string): StoredTaskPlan | null {
+    const stmt = this.db.prepare(`
+      SELECT id, session_key as sessionKey, goal, status, plan_json as planJson, created_at_ms as createdAt, updated_at_ms as updatedAt
+      FROM task_plans
+      WHERE session_key = ?
+      ORDER BY updated_at_ms DESC
+      LIMIT 1
+    `);
+
+    const row = stmt.get(sessionKey) as {
+      id: string;
+      sessionKey: string;
+      goal: string;
+      status: string;
+      planJson: string;
+      createdAt: number;
+      updatedAt: number;
+    } | undefined;
+
+    if (!row) return null;
+
+    try {
+      return {
+        id: row.id,
+        sessionKey: row.sessionKey,
+        goal: row.goal,
+        status: row.status,
+        plan: JSON.parse(row.planJson) as TaskPlan,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * List all sessions.
    */
@@ -185,9 +280,56 @@ export class MemoryStore {
         messageCount: r.messageCount,
         lastActivity: r.lastActivity,
         firstActivity: r.firstActivity,
-        userIdentifier: identifier
+        userIdentifier: identifier,
+        estimatedTokens: this.getSessionMetrics(r.sessionKey).estimatedTokens
       };
     });
+  }
+
+  getSessionMetrics(sessionKey: string): SessionMetrics {
+    const stmt = this.db.prepare(`
+      SELECT
+        session_key as sessionKey,
+        COUNT(*) as messageCount,
+        MAX(timestamp) as lastActivity
+      FROM messages
+      WHERE session_key = ?
+      GROUP BY session_key
+    `);
+    const summary = stmt.get(sessionKey) as {
+      sessionKey: string;
+      messageCount: number;
+      lastActivity: number | null;
+    } | undefined;
+
+    const messages = this.getHistory(sessionKey, 1000);
+    let estimatedTokens = 0;
+    let imageCount = 0;
+
+    for (const message of messages) {
+      estimatedTokens += 4;
+      estimatedTokens += estimateTokens(message.content ?? '');
+
+      if (!message.metadata) continue;
+      try {
+        const meta = JSON.parse(message.metadata);
+        const count = Number(meta.imageCount || 0);
+        if (count > 0) {
+          imageCount += count;
+          estimatedTokens += count * 300;
+        }
+      } catch {
+        // Ignore invalid metadata.
+      }
+    }
+
+    return {
+      sessionKey,
+      messageCount: summary?.messageCount ?? 0,
+      estimatedTokens,
+      imageCount,
+      lastActivity: summary?.lastActivity ?? null,
+    };
   }
 
   /**
@@ -211,6 +353,7 @@ export class MemoryStore {
   clearSession(sessionKey: string): void {
     this.db.prepare('DELETE FROM messages WHERE session_key = ?').run(sessionKey);
     this.db.prepare('DELETE FROM summaries WHERE session_key = ?').run(sessionKey);
+    this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
   }
 
   close(): void {

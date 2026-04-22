@@ -124,6 +124,28 @@ export class GatewayServer {
       }
     });
 
+    this.app.get('/api/sessions/:sessionKey/metrics', (req, res) => {
+      try {
+        const memory = new MemoryStore();
+        const metrics = memory.getSessionMetrics(req.params.sessionKey);
+        memory.close();
+        res.json(metrics);
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    this.app.get('/api/sessions/:sessionKey/task-plan', (req, res) => {
+      try {
+        const memory = new MemoryStore();
+        const taskPlan = memory.getLatestTaskPlan(req.params.sessionKey);
+        memory.close();
+        res.json({ taskPlan });
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
     // Delete session (clear history)
     this.app.delete('/api/sessions/:sessionKey', (req, res) => {
       try {
@@ -353,6 +375,11 @@ export class GatewayServer {
         thinkingDefault: config.agent?.thinkingDefault ?? 'medium',
         contextTokens: config.agent?.contextTokens ?? 64000,
         contextBudgetPct: config.agent?.contextBudgetPct ?? 80,
+        planner: {
+          enabled: config.agent?.planner?.enabled ?? true,
+          mode: config.agent?.planner?.mode ?? 'auto',
+          maxReplans: config.agent?.planner?.maxReplans ?? 2,
+        },
         skills: {
           enabled: config.agent?.skills?.enabled ?? true,
           maxInjected: config.agent?.skills?.maxInjected ?? 2,
@@ -440,6 +467,9 @@ export class GatewayServer {
             case 'session_init':
               // Client telling us which session they're viewing — acknowledge
               log.debug({ sessionKey: msg.sessionKey }, 'WebUI session init');
+              if (msg.sessionKey && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(this.buildSessionMetricsPayload(msg.sessionKey)));
+              }
               break;
 
             case 'confirmation_response':
@@ -508,6 +538,18 @@ export class GatewayServer {
           case 'content':
             payload.content = event.content;
             break;
+          case 'plan':
+            payload.plan = event.plan;
+            break;
+          case 'task_update':
+            payload.plan = event.plan;
+            payload.taskId = event.taskId;
+            payload.taskTitle = event.taskTitle;
+            payload.taskStatus = event.taskStatus;
+            payload.taskIndex = event.taskIndex;
+            payload.taskTotal = event.taskTotal;
+            payload.taskSummary = event.taskSummary;
+            break;
           case 'tool_start':
             payload.tool = event.toolName;
             payload.args = event.toolArgs;
@@ -520,6 +562,7 @@ export class GatewayServer {
             payload.content = event.error;
             break;
           case 'done':
+            payload.metrics = event.metrics;
             break;
         }
 
@@ -527,6 +570,8 @@ export class GatewayServer {
           ws.send(JSON.stringify(payload));
         }
       }
+
+      this.broadcast(this.buildSessionMetricsPayload(sessionKey));
     } catch (err: any) {
       log.error({ error: err.message }, 'Agent process failed');
       if (ws.readyState === WebSocket.OPEN) {
@@ -624,6 +669,17 @@ export class GatewayServer {
       }
     }
   }
+
+  private buildSessionMetricsPayload(sessionKey: string): Record<string, any> {
+    const memory = new MemoryStore();
+    const metrics = memory.getSessionMetrics(sessionKey);
+    memory.close();
+    return {
+      type: 'session_metrics',
+      sessionKey,
+      metrics,
+    };
+  }
 }
 
 function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): LiteClawConfig {
@@ -642,6 +698,18 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
     if (patch.agent.thinkingDefault !== undefined) next.agent.thinkingDefault = String(patch.agent.thinkingDefault);
     if (patch.agent.contextTokens !== undefined) next.agent.contextTokens = Number(patch.agent.contextTokens);
     if (patch.agent.contextBudgetPct !== undefined) next.agent.contextBudgetPct = Number(patch.agent.contextBudgetPct);
+    if (patch.agent.planner) {
+      next.agent.planner ??= {};
+      if (patch.agent.planner.enabled !== undefined) next.agent.planner.enabled = !!patch.agent.planner.enabled;
+      if (patch.agent.planner.mode !== undefined) {
+        next.agent.planner.mode = patch.agent.planner.mode === 'always'
+          ? 'always'
+          : patch.agent.planner.mode === 'off'
+            ? 'off'
+            : 'auto';
+      }
+      if (patch.agent.planner.maxReplans !== undefined) next.agent.planner.maxReplans = Number(patch.agent.planner.maxReplans);
+    }
     if (patch.agent.skills) {
       next.agent.skills ??= {};
       if (patch.agent.skills.enabled !== undefined) next.agent.skills.enabled = !!patch.agent.skills.enabled;

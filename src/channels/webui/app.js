@@ -9,6 +9,7 @@
   let currentConfig = {};
   let healthData = {};
   let sessions = [];
+  let currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
   let pendingConfirmationId = null;
   let workspacePath = ".";
   let selectedWorkspaceFile = "";
@@ -56,6 +57,7 @@
     healthPill: $("#healthPill"),
     healthDot: $("#healthDot"),
     healthLabel: $("#healthLabel"),
+    tokenLabel: $("#tokenLabel"),
     chWebui: $("#ch-webui"),
     chDiscord: $("#ch-discord"),
     chWhatsapp: $("#ch-whatsapp"),
@@ -66,6 +68,8 @@
     settingThinking: $("#settingThinking"),
     settingWorkspace: $("#settingWorkspace"),
     settingMaxTurns: $("#settingMaxTurns"),
+    settingPlannerMode: $("#settingPlannerMode"),
+    settingPlannerMaxReplans: $("#settingPlannerMaxReplans"),
     settingContextTokens: $("#settingContextTokens"),
     settingContextBudgetPct: $("#settingContextBudgetPct"),
     settingSkillsMaxInjected: $("#settingSkillsMaxInjected"),
@@ -169,6 +173,7 @@
       const data = await fetchJson("/api/sessions");
       sessions = data.sessions || [];
       renderSessionList();
+      fetchSessionMetrics(currentSessionKey);
     } catch {
       sessions = [];
       renderSessionList();
@@ -199,7 +204,7 @@
       const label = formatSessionName(session);
       el.innerHTML = `
         <button class="session-label" type="button" title="${escapeHtml(session.sessionKey)}">${escapeHtml(label)}</button>
-        <span class="session-count">${Number(session.messageCount || 0)}</span>
+        <span class="session-count" title="${Number(session.estimatedTokens || 0).toLocaleString()} tokens">${Number(session.estimatedTokens || 0).toLocaleString()}</span>
         <button class="session-delete" type="button" title="Delete session">×</button>
       `;
 
@@ -233,6 +238,7 @@
   function updateHeader() {
     refs.chatTitle.textContent = formatSessionName(currentSessionKey);
     refs.chatSubtitle.textContent = currentSessionKey;
+    renderSessionMetrics();
   }
 
   function switchSession(sessionKey) {
@@ -243,9 +249,32 @@
     messagesEl.innerHTML = "";
     updateHeader();
     loadSessionHistory(sessionKey);
+    loadSessionTaskPlan(sessionKey);
     loadSessions();
+    fetchSessionMetrics(sessionKey);
     sendSessionInit();
     setSidebarOpen(false);
+  }
+
+  async function fetchSessionMetrics(sessionKey) {
+    try {
+      const data = await fetchJson(`/api/sessions/${encodeURIComponent(sessionKey)}/metrics`);
+      if (sessionKey !== currentSessionKey) return;
+      currentSessionMetrics = data || currentSessionMetrics;
+      renderSessionMetrics();
+    } catch {
+      if (sessionKey !== currentSessionKey) return;
+      currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
+      renderSessionMetrics();
+    }
+  }
+
+  function renderSessionMetrics() {
+    if (!refs.tokenLabel) return;
+    const tokens = Number(currentSessionMetrics.estimatedTokens || 0).toLocaleString();
+    const messages = Number(currentSessionMetrics.messageCount || 0);
+    const images = Number(currentSessionMetrics.imageCount || 0);
+    refs.tokenLabel.textContent = `Tokens ${tokens} / msg ${messages} / img ${images}`;
   }
 
   async function loadSessionHistory(sessionKey) {
@@ -271,6 +300,37 @@
     } catch {
       showWelcome();
     }
+  }
+
+  async function loadSessionTaskPlan(sessionKey) {
+    try {
+      const data = await fetchJson(`/api/sessions/${encodeURIComponent(sessionKey)}/task-plan`);
+      if (sessionKey !== currentSessionKey) return;
+      const taskPlan = data.taskPlan?.plan;
+      if (!taskPlan || !Array.isArray(taskPlan.tasks) || taskPlan.tasks.length === 0) return;
+      addRestoredTaskPlan(taskPlan);
+    } catch {
+      // Ignore missing task-plan state.
+    }
+  }
+
+  function addRestoredTaskPlan(plan) {
+    hideWelcome();
+    const el = document.createElement("div");
+    el.className = "message assistant restored-plan";
+    el.innerHTML = `
+      <div class="message-avatar">LC</div>
+      <div class="message-body">
+        <div class="message-sender">LiteClaw</div>
+        <div class="message-content"></div>
+      </div>
+    `;
+    messagesEl.appendChild(el);
+
+    const previousAssistant = currentAssistantEl;
+    currentAssistantEl = el;
+    appendPlan(plan);
+    currentAssistantEl = previousAssistant;
   }
 
   // ─── Health Rendering ─────────────────────────────────────────────
@@ -307,6 +367,8 @@
     refs.settingThinking.value = config.agent?.thinkingDefault || "medium";
     refs.settingWorkspace.value = config.agent?.workspace || "";
     refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
+    refs.settingPlannerMode.value = config.agent?.planner?.mode || "auto";
+    refs.settingPlannerMaxReplans.value = config.agent?.planner?.maxReplans ?? 2;
     refs.settingContextTokens.value = config.agent?.contextTokens || 64000;
     refs.settingContextBudgetPct.value = config.agent?.contextBudgetPct || 80;
     refs.settingSkillsMaxInjected.value = config.agent?.skills?.maxInjected || 2;
@@ -347,6 +409,10 @@
       agent: {
         workspace: refs.settingWorkspace.value.trim(),
         maxTurns: Number(refs.settingMaxTurns.value || 20),
+        planner: {
+          mode: refs.settingPlannerMode.value || "auto",
+          maxReplans: Number(refs.settingPlannerMaxReplans.value || 2),
+        },
         toolLoading,
         thinkingDefault: refs.settingThinking.value,
         contextTokens: Number(refs.settingContextTokens.value || 64000),
@@ -586,13 +652,31 @@
   function appendThinking(text) {
     ensureAssistantMessage();
     const body = currentAssistantEl.querySelector(".message-body");
-    let block = body.querySelector(".thinking-block:last-of-type");
-    if (!block || block.dataset.closed === "true") {
-      block = document.createElement("div");
-      block.className = "thinking-block";
-      body.insertBefore(block, body.querySelector(".message-content"));
+    const wrappers = body.querySelectorAll(".thinking-wrapper");
+    let wrapper = wrappers[wrappers.length - 1];
+    
+    if (!wrapper || wrapper.dataset.closed === "true") {
+      wrapper = document.createElement("div");
+      wrapper.className = "thinking-wrapper";
+      
+      const header = document.createElement("button");
+      header.className = "thinking-header";
+      header.type = "button";
+      header.innerHTML = `
+        <span class="thinking-toggle-icon"></span>
+        <span class="thinking-label pulsing">Thinking...</span>
+      `;
+      
+      const content = document.createElement("div");
+      content.className = "thinking-content";
+      
+      wrapper.appendChild(header);
+      wrapper.appendChild(content);
+      body.insertBefore(wrapper, body.querySelector(".message-content"));
     }
-    block.textContent += text || "";
+
+    const contentEl = wrapper.querySelector(".thinking-content");
+    contentEl.textContent += text || "";
     scrollToBottom();
   }
 
@@ -617,6 +701,61 @@
     scrollToBottom();
   }
 
+  function appendPlan(plan) {
+    if (!plan || !Array.isArray(plan.tasks)) return;
+    ensureAssistantMessage();
+
+    let block = currentAssistantEl.querySelector(".task-plan");
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "task-plan";
+      currentAssistantEl.querySelector(".message-body").insertBefore(block, currentAssistantEl.querySelector(".message-content"));
+    }
+
+    const items = plan.tasks.map((task, index) => {
+      const status = escapeHtml(task.status || "pending");
+      const title = escapeHtml(task.title || `Task ${index + 1}`);
+      return `<li data-task-id="${escapeHtml(task.id || `task_${index + 1}`)}"><span class="task-status ${status}">${status}</span><span class="task-title">${title}</span></li>`;
+    }).join("");
+
+    block.innerHTML = `
+      <div class="task-plan-header">Task Plan</div>
+      <div class="task-plan-summary">${escapeHtml(plan.summary || "Working through the request step by step.")}</div>
+      <ol class="task-plan-list">${items}</ol>
+    `;
+    scrollToBottom();
+  }
+
+  function appendTaskUpdate(msg) {
+    ensureAssistantMessage();
+    if (msg.plan) appendPlan(msg.plan);
+
+    const planEl = currentAssistantEl?.querySelector(".task-plan");
+    if (!planEl) return;
+
+    const taskId = msg.taskId || "";
+    const taskStatus = msg.taskStatus || "pending";
+    const taskTitle = msg.taskTitle || "Task";
+    const taskIndex = msg.taskIndex || 0;
+    const taskTotal = msg.taskTotal || 0;
+    const taskSummary = msg.taskSummary || "";
+
+    let item = taskId ? planEl.querySelector(`[data-task-id="${CSS.escape(taskId)}"]`) : null;
+    if (!item) {
+      const list = planEl.querySelector(".task-plan-list");
+      item = document.createElement("li");
+      item.dataset.taskId = taskId;
+      list?.appendChild(item);
+    }
+
+    item.innerHTML = `
+      <span class="task-status ${escapeHtml(taskStatus)}">${escapeHtml(taskStatus)}</span>
+      <span class="task-title">[${escapeHtml(String(taskIndex))}/${escapeHtml(String(taskTotal))}] ${escapeHtml(taskTitle)}</span>
+      ${taskSummary ? `<span class="task-summary">${escapeHtml(taskSummary)}</span>` : ""}
+    `;
+    scrollToBottom();
+  }
+
   function appendError(text) {
     ensureAssistantMessage();
     const err = document.createElement("div");
@@ -625,11 +764,33 @@
     currentAssistantEl.querySelector(".message-body").insertBefore(err, currentAssistantEl.querySelector(".message-content"));
   }
 
-  function finishStreaming() {
+  function finishStreaming(metrics) {
     isStreaming = false;
     renderAssistantContent();
-    currentAssistantEl?.querySelectorAll(".thinking-block").forEach((el) => {
+
+    if (metrics && currentAssistantEl) {
+      const body = currentAssistantEl.querySelector(".message-body");
+      const metricsEl = document.createElement("div");
+      metricsEl.className = "message-metrics";
+      const totalSec = (metrics.durationMs / 1000).toFixed(1);
+      const tps = metrics.tokPerSec.toFixed(1);
+      metricsEl.innerHTML = `
+        <span>${metrics.tokens} tokens</span>
+        <span class="metric-sep"></span>
+        <span>${totalSec}s</span>
+        <span class="metric-sep"></span>
+        <span>${tps} tok/s</span>
+      `;
+      body.appendChild(metricsEl);
+    }
+
+    currentAssistantEl?.querySelectorAll(".thinking-wrapper").forEach((el) => {
       el.dataset.closed = "true";
+      const label = el.querySelector(".thinking-label");
+      if (label) {
+        label.classList.remove("pulsing");
+        label.textContent = "Thoughts";
+      }
     });
     currentAssistantEl = null;
     currentContent = "";
@@ -656,6 +817,12 @@
         currentContent += msg.content || "";
         renderAssistantContent();
         break;
+      case "plan":
+        appendPlan(msg.plan || null);
+        break;
+      case "task_update":
+        appendTaskUpdate(msg);
+        break;
       case "tool_start":
         appendToolBadge(msg.tool || "tool");
         break;
@@ -666,8 +833,9 @@
         showConfirmation(msg);
         break;
       case "done":
-        finishStreaming();
+        finishStreaming(msg.metrics);
         loadSessions();
+        fetchSessionMetrics(currentSessionKey);
         break;
       case "error":
         appendError(msg.content || "An unknown error occurred.");
@@ -684,6 +852,13 @@
           renderHealth();
         }
         showNotice("Config reloaded from disk.", "info", 2400);
+        break;
+      case "session_metrics":
+        if (msg.sessionKey === currentSessionKey && msg.metrics) {
+          currentSessionMetrics = msg.metrics;
+          renderSessionMetrics();
+        }
+        loadSessions();
         break;
       case "pong":
         break;
@@ -741,7 +916,23 @@
 
   function renderMarkdown(text) {
     const codeBlocks = [];
+    const thinkBlocks = [];
     let working = String(text || "");
+
+    // Handle thinking tags
+    working = working.replace(/<think>([\s\S]*?)<\/think>/g, (_, content) => {
+      const token = `@@THINK${thinkBlocks.length}@@`;
+      thinkBlocks.push(`
+        <div class="thinking-wrapper">
+          <button class="thinking-header" type="button">
+            <span class="thinking-toggle-icon"></span>
+            <span class="thinking-label">Thoughts</span>
+          </button>
+          <div class="thinking-content">${escapeHtml(content.trim())}</div>
+        </div>
+      `);
+      return token;
+    });
 
     working = working.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
       const token = `@@CODE${codeBlocks.length}@@`;
@@ -776,8 +967,12 @@
       return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
     }).join("");
 
-    codeBlocks.forEach((block, index) => {
-      html = html.replace(`@@CODE${index}@@`, block);
+    // Restore tokens
+    codeBlocks.forEach((block, i) => {
+      html = html.replace(`@@CODE${i}@@`, block);
+    });
+    thinkBlocks.forEach((block, i) => {
+      html = html.replace(`@@THINK${i}@@`, block);
     });
 
     return html;
@@ -1001,7 +1196,18 @@
     sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
   }
 
-  // ─── Init ─────────────────────────────────────────────────────────
+  // ─── Initialization ───────────────────────────────────────────────
+
+  // Event delegation for thinking accordions
+  messagesEl.addEventListener("click", (e) => {
+    const header = e.target.closest(".thinking-header");
+    if (header) {
+      const wrapper = header.closest(".thinking-wrapper");
+      if (wrapper) {
+        wrapper.classList.toggle("expanded");
+      }
+    }
+  });
 
   updateHeader();
   bindWelcomeChips();

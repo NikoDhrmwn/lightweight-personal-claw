@@ -18,7 +18,7 @@ import { loadConfig, getConfig, getStateDir, saveConfig, getDefaultConfig } from
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 
 const program = new Command();
 

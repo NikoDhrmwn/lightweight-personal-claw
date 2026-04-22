@@ -39,6 +39,11 @@ export interface LiteClawConfig {
       mode?: string;
       softThresholdTokens?: number;
     };
+    planner?: {
+      enabled?: boolean;
+      mode?: 'auto' | 'always' | 'off';
+      maxReplans?: number;
+    };
     skills?: {
       enabled?: boolean;
       maxInjected?: number;
@@ -171,6 +176,11 @@ export function getDefaultConfig(): LiteClawConfig {
       compaction: {
         mode: 'safeguard',
         softThresholdTokens: 48000,
+      },
+      planner: {
+        enabled: true,
+        mode: 'auto',
+        maxReplans: 2,
       },
       skills: {
         enabled: true,

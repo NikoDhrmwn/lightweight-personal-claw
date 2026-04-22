@@ -77,6 +77,9 @@
           <span class="chat-header-subtitle" id="chatSubtitle">webui:default</span>
         </div>
         <div class="chat-header-right">
+          <span class="token-pill" id="tokenPill">
+            <span id="tokenLabel">Tokens --</span>
+          </span>
           <span class="health-pill" id="healthPill">
             <span class="health-dot" id="healthDot"></span>
             <span id="healthLabel">Health</span>
@@ -184,6 +187,18 @@
             <label class="field">
               <span>Max turns</span>
               <input id="settingMaxTurns" type="number" min="1" max="100">
+            </label>
+            <label class="field">
+              <span>Planner mode</span>
+              <select id="settingPlannerMode">
+                <option value="auto">Auto</option>
+                <option value="always">Always</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Max replans</span>
+              <input id="settingPlannerMaxReplans" type="number" min="0" max="10">
             </label>
             <label class="field">
               <span>Context tokens</span>
