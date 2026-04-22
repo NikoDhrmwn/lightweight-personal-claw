@@ -37,3 +37,6 @@ Thumbs.db
 .vscode/
 .idea/
 .gitignore
+
+# Research
+liteclaw_research/
