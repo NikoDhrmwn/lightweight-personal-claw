@@ -396,25 +396,62 @@ export class LLMClient extends EventEmitter {
                 }
               } else if (isToolCall) {
                 const endIdx = tagBuffer.indexOf('</tool_call>');
-                if (endIdx !== -1) {
-                  toolCallBuffer += tagBuffer.slice(0, endIdx);
+                const endAltIdx = tagBuffer.indexOf('<tool_call|>');
+                
+                let foundEndIdx = -1;
+                let endTagLen = 0;
+                
+                if (endIdx !== -1 && (endAltIdx === -1 || endIdx < endAltIdx)) {
+                  foundEndIdx = endIdx;
+                  endTagLen = 12;
+                } else if (endAltIdx !== -1) {
+                  foundEndIdx = endAltIdx;
+                  endTagLen = 12;
+                }
+
+                if (foundEndIdx !== -1) {
+                  toolCallBuffer += tagBuffer.slice(0, foundEndIdx);
                   try {
-                    const parsed = JSON.parse(toolCallBuffer.trim());
-                    // Create pending tool call format to yield
-                    const tcId = `call_${Date.now()}_${Math.floor(Math.random()*1000)}`;
-                    yield {
-                      type: 'tool_call',
-                      toolCall: {
-                        id: tcId,
-                        type: 'function',
-                        function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments) }
+                    let parsed: any;
+                    if (toolCallBuffer.includes('call:')) {
+                      // Extract name and args from format: call:name{args}
+                      const parts = toolCallBuffer.split('call:')[1].trim();
+                      const nameMatch = parts.match(/^([a-z0-9_-]+)/i);
+                      const name = nameMatch?.[1];
+                      const rawArgs = parts.slice(name?.length ?? 0).trim();
+                      
+                      if (name) {
+                        parsed = {
+                          name,
+                          arguments: rawArgs
+                        };
                       }
-                    };
+                    } else {
+                      parsed = JSON.parse(toolCallBuffer.trim());
+                    }
+
+                    if (parsed) {
+                      const tcId = `call_${Date.now()}_${Math.floor(Math.random()*1000)}`;
+                      // Handle both standard JSON and extracted name/args
+                      const args = typeof parsed.arguments === 'string' ? parsed.arguments : JSON.stringify(parsed.arguments ?? {});
+                      
+                      yield {
+                        type: 'tool_call',
+                        toolCall: {
+                          id: tcId,
+                          type: 'function',
+                          function: { 
+                            name: parsed.name, 
+                            arguments: args 
+                          }
+                        }
+                      };
+                    }
                   } catch (e: any) {
-                    log.warn({ text: toolCallBuffer }, 'Failed to parse XML tool call JSON');
+                    log.warn({ text: toolCallBuffer }, 'Failed to parse XML tool call');
                     yield { type: 'content', content: `\n\n[Warning: Failed to parse tool call: ${e.message}]\n` };
                   }
-                  tagBuffer = tagBuffer.slice(endIdx + 13); // '</tool_call>'.length
+                  tagBuffer = tagBuffer.slice(foundEndIdx + endTagLen);
                   isToolCall = false;
                   toolCallBuffer = '';
                 } else if (tagBuffer.length > 20 && !tagBuffer.includes('<')) {
@@ -427,17 +464,27 @@ export class LLMClient extends EventEmitter {
                 // Looking for start tags
                 const startThinkIdx = tagBuffer.indexOf('<think>');
                 const startToolIdx = tagBuffer.indexOf('<tool_call>');
+                const startAltToolIdx = tagBuffer.indexOf('<|tool_call|>');
+                const startAltToolIdx2 = tagBuffer.indexOf('<|tool_call>');
                 
                 // Which one comes first?
                 let startIdx = -1;
                 let isNextThink = false;
+                let tagLength = 0;
                 
-                if (startThinkIdx !== -1 && (startToolIdx === -1 || startThinkIdx < startToolIdx)) {
-                  startIdx = startThinkIdx;
-                  isNextThink = true;
-                } else if (startToolIdx !== -1 && (startThinkIdx === -1 || startToolIdx < startThinkIdx)) {
-                  startIdx = startToolIdx;
-                  isNextThink = false;
+                const foundTags: { idx: number; len: number; isThink: boolean }[] = [];
+                if (startThinkIdx !== -1) foundTags.push({ idx: startThinkIdx, len: 7, isThink: true });
+                if (startToolIdx !== -1) foundTags.push({ idx: startToolIdx, len: 11, isThink: false });
+                if (startAltToolIdx !== -1) foundTags.push({ idx: startAltToolIdx, len: 13, isThink: false });
+                if (startAltToolIdx2 !== -1) foundTags.push({ idx: startAltToolIdx2, len: 12, isThink: false });
+
+                foundTags.sort((a, b) => a.idx - b.idx);
+                
+                if (foundTags.length > 0) {
+                  const first = foundTags[0];
+                  startIdx = first.idx;
+                  tagLength = first.len;
+                  isNextThink = first.isThink;
                 }
                 
                 if (startIdx !== -1) {
@@ -448,14 +495,14 @@ export class LLMClient extends EventEmitter {
                   }
                   
                   if (isNextThink) {
-                    tagBuffer = tagBuffer.slice(startIdx + 7);
+                    tagBuffer = tagBuffer.slice(startIdx + tagLength);
                     isThinking = true;
                   } else {
-                    tagBuffer = tagBuffer.slice(startIdx + 11);
+                    tagBuffer = tagBuffer.slice(startIdx + tagLength);
                     isToolCall = true;
                     toolCallBuffer = '';
                   }
-                } else if (tagBuffer.endsWith('<') || tagBuffer.match(/<[a-z_]*$/i)) {
+                } else if (tagBuffer.endsWith('<') || tagBuffer.match(/<\|?[a-z_]*$/i)) {
                   // Might be start of a tag, wait for more data
                   break;
                 } else {

@@ -10,6 +10,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '../logger.js';
 import { estimateTokens } from './context.js';
+import type { TaskPlan } from './tasks.js';
 
 const log = createLogger('memory');
 
@@ -39,6 +40,16 @@ export interface SessionMetrics {
   estimatedTokens: number;
   imageCount: number;
   lastActivity: number | null;
+}
+
+export interface StoredTaskPlan {
+  id: string;
+  sessionKey: string;
+  goal: string;
+  status: string;
+  plan: TaskPlan;
+  createdAt: number;
+  updatedAt: number;
 }
 
 // ─── Memory Store ────────────────────────────────────────────────────
@@ -92,6 +103,20 @@ export class MemoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_summaries_session
         ON summaries(session_key, timestamp);
+
+      CREATE TABLE IF NOT EXISTS task_plans (
+        id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        status TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_plans_session
+        ON task_plans(session_key, updated_at_ms DESC);
     `);
   }
 
@@ -164,6 +189,66 @@ export class MemoryStore {
     `);
     const row = stmt.get(sessionKey) as { summary: string } | undefined;
     return row?.summary ?? null;
+  }
+
+  saveTaskPlan(sessionKey: string, plan: TaskPlan): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO task_plans (id, session_key, goal, status, plan_json, created_at_ms, updated_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        session_key = excluded.session_key,
+        goal = excluded.goal,
+        status = excluded.status,
+        plan_json = excluded.plan_json,
+        created_at_ms = excluded.created_at_ms,
+        updated_at_ms = excluded.updated_at_ms
+    `);
+
+    stmt.run(
+      plan.id,
+      sessionKey,
+      plan.goal,
+      plan.status,
+      JSON.stringify(plan),
+      plan.createdAt,
+      plan.updatedAt,
+    );
+  }
+
+  getLatestTaskPlan(sessionKey: string): StoredTaskPlan | null {
+    const stmt = this.db.prepare(`
+      SELECT id, session_key as sessionKey, goal, status, plan_json as planJson, created_at_ms as createdAt, updated_at_ms as updatedAt
+      FROM task_plans
+      WHERE session_key = ?
+      ORDER BY updated_at_ms DESC
+      LIMIT 1
+    `);
+
+    const row = stmt.get(sessionKey) as {
+      id: string;
+      sessionKey: string;
+      goal: string;
+      status: string;
+      planJson: string;
+      createdAt: number;
+      updatedAt: number;
+    } | undefined;
+
+    if (!row) return null;
+
+    try {
+      return {
+        id: row.id,
+        sessionKey: row.sessionKey,
+        goal: row.goal,
+        status: row.status,
+        plan: JSON.parse(row.planJson) as TaskPlan,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -268,6 +353,7 @@ export class MemoryStore {
   clearSession(sessionKey: string): void {
     this.db.prepare('DELETE FROM messages WHERE session_key = ?').run(sessionKey);
     this.db.prepare('DELETE FROM summaries WHERE session_key = ?').run(sessionKey);
+    this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
   }
 
   close(): void {
