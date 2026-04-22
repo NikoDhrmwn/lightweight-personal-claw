@@ -1,18 +1,29 @@
 /**
  * LiteClaw — Web Tools
- * 
- * Google Grounding for search (same as OpenClaw) + web fetch.
- * Falls back to DuckDuckGo if Google API key not available.
+ *
+ * Free multi-backend web search with optional Google Grounding.
+ * Default path uses zero-cost public search endpoints / HTML results.
  */
 
+import { createHash } from 'crypto';
 import { toolRegistry, ToolResult } from '../core/tools.js';
 import { getConfig } from '../config.js';
+
+const SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_SEARCH_TIMEOUT_MS = 12_000;
+const searchCache = new Map<string, { expiresAt: number; output: string }>();
+
+const DEFAULT_SEARXNG_INSTANCES = [
+  'https://search.inetol.net',
+  'https://priv.au',
+  'https://northboot.xyz',
+];
 
 // ─── web_search (Google Grounding) ───────────────────────────────────
 
 toolRegistry.register({
   name: 'web_search',
-  description: 'Search the web using Google Grounding. Returns summarized results with sources.',
+  description: 'Search the web and return source-rich results. Uses free backends by default, with optional Google Grounding.',
   category: 'web',
   parameters: [
     { name: 'query', type: 'string', description: 'The search query', required: true },
@@ -30,27 +41,39 @@ toolRegistry.register({
   handler: async (args): Promise<ToolResult> => {
     const config = getConfig();
     const apiKey = config.tools?.web?.search?.apiKey ?? process.env.GOOGLE_API_KEY;
-    const query = args.query;
+    const provider = String(config.tools?.web?.search?.provider ?? 'free-metasearch').toLowerCase();
+    const query = String(args.query ?? '').trim();
+    const maxResults = normalizeMaxResults(args.maxResults);
 
     if (!query) {
       return { success: false, output: 'No search query specified' };
     }
 
-    // Try Google Grounding first
-    if (apiKey) {
-      try {
-        const result = await googleGroundingSearch(query, apiKey, args.maxResults ?? 5);
-        return { success: true, output: result };
-      } catch (err: any) {
-        // Fall through to DuckDuckGo
-        console.warn('Google Grounding failed, falling back to DuckDuckGo:', err.message);
-      }
+    const cacheKey = buildSearchCacheKey(provider, query, maxResults);
+    const cached = searchCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { success: true, output: cached.output };
     }
 
-    // Fallback: DuckDuckGo instant answers
     try {
-      const result = await duckDuckGoSearch(query);
-      return { success: true, output: result };
+      let output = '';
+
+      if (provider === 'google-grounding' && apiKey) {
+        try {
+          output = await googleGroundingSearch(query, apiKey, maxResults);
+        } catch (err: any) {
+          console.warn('Google Grounding failed, falling back to free search:', err.message);
+          output = await freeWebSearch(query, maxResults, config.tools?.web?.search?.instances);
+        }
+      } else {
+        output = await freeWebSearch(query, maxResults, config.tools?.web?.search?.instances);
+      }
+
+      searchCache.set(cacheKey, {
+        expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
+        output,
+      });
+      return { success: true, output };
     } catch (err: any) {
       return { success: false, output: `Search failed: ${err.message}` };
     }
@@ -114,44 +137,269 @@ async function googleGroundingSearch(query: string, apiKey: string, maxResults: 
   return resultText || 'No results found.';
 }
 
-/**
- * DuckDuckGo Instant Answer API fallback
- */
-async function duckDuckGoSearch(query: string): Promise<string> {
-  const params = new URLSearchParams({
-    q: query,
-    format: 'json',
-    no_redirect: '1',
-    no_html: '1',
-  });
+async function freeWebSearch(query: string, maxResults: number, configuredInstances: unknown): Promise<string> {
+  const errors: string[] = [];
+  const instances = normalizeSearxngInstances(configuredInstances);
 
-  const response = await fetch(`https://api.duckduckgo.com/?${params}`, {
-    headers: { 'User-Agent': 'LiteClaw/0.1' },
-  });
-
-  if (!response.ok) {
-    throw new Error(`DuckDuckGo API error: ${response.status}`);
-  }
-
-  const data = await response.json() as any;
-
-  const results: string[] = [];
-
-  if (data.Abstract) {
-    results.push(`${data.Abstract}\nSource: ${data.AbstractURL ?? ''}`);
-  }
-
-  if (data.RelatedTopics) {
-    for (const topic of data.RelatedTopics.slice(0, 5)) {
-      if (topic.Text) {
-        results.push(`• ${topic.Text}`);
+  for (const instance of instances) {
+    try {
+      const results = await searxngSearch(instance, query, maxResults);
+      if (results.length > 0) {
+        return formatSearchResults('SearXNG', query, results);
       }
+      errors.push(`${instance}: empty results`);
+    } catch (err: any) {
+      errors.push(`${instance}: ${err.message}`);
     }
   }
 
-  return results.length > 0
-    ? results.join('\n\n')
-    : `No instant results for "${query}". Try a more specific query.`;
+  try {
+    const liteResults = await duckDuckGoLiteSearch(query, maxResults);
+    if (liteResults.length > 0) {
+      return formatSearchResults('DuckDuckGo Lite', query, liteResults);
+    }
+    errors.push('DuckDuckGo Lite: empty results');
+  } catch (err: any) {
+    errors.push(`DuckDuckGo Lite: ${err.message}`);
+  }
+
+  try {
+    const htmlResults = await duckDuckGoHtmlSearch(query, maxResults);
+    if (htmlResults.length > 0) {
+      return formatSearchResults('DuckDuckGo HTML', query, htmlResults);
+    }
+    errors.push('DuckDuckGo HTML: empty results');
+  } catch (err: any) {
+    errors.push(`DuckDuckGo HTML: ${err.message}`);
+  }
+
+  throw new Error(errors.length > 0 ? errors.join(' | ') : 'No free search backend returned results.');
+}
+
+type SearchHit = {
+  title: string;
+  url: string;
+  snippet?: string;
+  source?: string;
+};
+
+async function searxngSearch(instance: string, query: string, maxResults: number): Promise<SearchHit[]> {
+  const base = instance.replace(/\/+$/, '');
+  const url = new URL('/search', `${base}/`);
+  url.searchParams.set('q', query);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('categories', 'general');
+  url.searchParams.set('language', 'auto');
+  url.searchParams.set('safesearch', '0');
+
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'LiteClaw/0.1' },
+    signal: AbortSignal.timeout(DEFAULT_SEARCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const data = await response.json() as any;
+  const results = Array.isArray(data.results) ? data.results : [];
+
+  return dedupeSearchHits(results
+    .slice(0, maxResults * 2)
+    .map((row: any) => ({
+      title: String(row.title ?? '').trim(),
+      url: String(row.url ?? '').trim(),
+      snippet: String(row.content ?? row.description ?? '').trim(),
+      source: String(row.engine ?? row.parsed_url?.[1] ?? '').trim(),
+    }))
+    .filter((row: SearchHit) => row.title && row.url))
+    .slice(0, maxResults);
+}
+
+async function duckDuckGoLiteSearch(query: string, maxResults: number): Promise<SearchHit[]> {
+  const response = await fetch('https://lite.duckduckgo.com/lite/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'LiteClaw/0.1',
+    },
+    body: new URLSearchParams({ q: query }).toString(),
+    signal: AbortSignal.timeout(DEFAULT_SEARCH_TIMEOUT_MS),
+    redirect: 'follow',
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const hits = parseDuckDuckGoLiteResults(html);
+  return dedupeSearchHits(hits).slice(0, maxResults);
+}
+
+async function duckDuckGoHtmlSearch(query: string, maxResults: number): Promise<SearchHit[]> {
+  const response = await fetch('https://html.duckduckgo.com/html/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'LiteClaw/0.1',
+    },
+    body: new URLSearchParams({ q: query }).toString(),
+    signal: AbortSignal.timeout(DEFAULT_SEARCH_TIMEOUT_MS),
+    redirect: 'follow',
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const hits = parseDuckDuckGoHtmlResults(html);
+  return dedupeSearchHits(hits).slice(0, maxResults);
+}
+
+function parseDuckDuckGoLiteResults(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const rowRegex = /<a[^>]*href="([^"]+)"[^>]*class=['"][^'"]*result-link[^'"]*['"][^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=<a[^>]*class=['"][^'"]*result-link|<\/table>|$)/gi;
+
+  let match: RegExpExecArray | null;
+  while ((match = rowRegex.exec(html)) !== null) {
+    const rawUrl = decodeHtmlEntities(match[1]);
+    if (isDuckDuckGoAdUrl(rawUrl)) continue;
+    const url = normalizeSearchResultUrl(rawUrl);
+    const title = decodeHtmlEntities(stripHtml(match[2]));
+    if (/^more info$/i.test(title)) continue;
+    const tail = decodeHtmlEntities(stripHtml(match[3])).replace(/\s+/g, ' ').trim();
+    const snippet = tail || undefined;
+
+    if (title && url) {
+      hits.push({ title, url, snippet, source: 'duckduckgo-lite' });
+    }
+  }
+
+  return hits;
+}
+
+function parseDuckDuckGoHtmlResults(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const blockRegex = /<div class="result(?:__body)?">([\s\S]*?)<\/div>\s*<\/div>/gi;
+
+  let block: RegExpExecArray | null;
+  while ((block = blockRegex.exec(html)) !== null) {
+    const body = block[1];
+    const linkMatch = body.match(/<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!linkMatch) continue;
+
+    if (isDuckDuckGoAdUrl(linkMatch[1])) continue;
+    const title = decodeHtmlEntities(stripHtml(linkMatch[2])).trim();
+    if (/^more info$/i.test(title)) continue;
+    const url = normalizeSearchResultUrl(decodeHtmlEntities(linkMatch[1]));
+    const snippetMatch = body.match(/<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    const snippetRaw = snippetMatch?.[1] ?? snippetMatch?.[2] ?? '';
+    const snippet = decodeHtmlEntities(stripHtml(snippetRaw)).replace(/\s+/g, ' ').trim() || undefined;
+
+    if (title && url) {
+      hits.push({ title, url, snippet, source: 'duckduckgo-html' });
+    }
+  }
+
+  return hits;
+}
+
+function normalizeSearchResultUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  try {
+    const url = new URL(rawUrl, 'https://duckduckgo.com');
+    const u3 = url.searchParams.get('u3');
+    if (u3) return decodeURIComponent(u3);
+    const wrapped = url.searchParams.get('uddg');
+    if (wrapped) return decodeURIComponent(wrapped);
+    if (url.protocol === 'http:' || url.protocol === 'https:') return url.toString();
+  } catch {
+    // ignore parse failure
+  }
+  return rawUrl.startsWith('//') ? `https:${rawUrl}` : rawUrl;
+}
+
+function formatSearchResults(backend: string, query: string, hits: SearchHit[]): string {
+  if (hits.length === 0) {
+    return `No search results found for "${query}".`;
+  }
+
+  const lines = [
+    `Search backend: ${backend}`,
+    `Query: ${query}`,
+    '',
+    'Top results:',
+  ];
+
+  hits.forEach((hit, index) => {
+    lines.push(`[${index + 1}] ${hit.title}`);
+    lines.push(`URL: ${hit.url}`);
+    if (hit.snippet) lines.push(`Snippet: ${hit.snippet}`);
+    if (hit.source) lines.push(`Source: ${hit.source}`);
+    lines.push('');
+  });
+
+  return lines.join('\n').trim();
+}
+
+function dedupeSearchHits(hits: SearchHit[]): SearchHit[] {
+  const seen = new Set<string>();
+  const deduped: SearchHit[] = [];
+
+  for (const hit of hits) {
+    if (!isUsefulSearchHit(hit)) continue;
+    const key = createHash('sha1').update(hit.url.trim().toLowerCase()).digest('hex');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(hit);
+  }
+
+  return deduped;
+}
+
+function normalizeSearxngInstances(input: unknown): string[] {
+  const configured = Array.isArray(input)
+    ? input.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : [];
+  return [...new Set([...configured, ...DEFAULT_SEARXNG_INSTANCES])];
+}
+
+function normalizeMaxResults(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 5;
+  return Math.max(1, Math.min(10, Math.floor(parsed)));
+}
+
+function buildSearchCacheKey(provider: string, query: string, maxResults: number): string {
+  return `${provider}::${maxResults}::${query.trim().toLowerCase()}`;
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#x2F;/gi, '/')
+    .replace(/&nbsp;/g, ' ');
+}
+
+function isUsefulSearchHit(hit: SearchHit): boolean {
+  const url = hit.url.trim().toLowerCase();
+  if (!url) return false;
+  if (url.includes('duckduckgo.com/duckduckgo-help-pages/')) return false;
+  if (url.includes('bing.com/aclick')) return false;
+  if ((hit.snippet ?? '').toLowerCase().includes('sponsored link')) return false;
+  return /^https?:\/\//.test(url);
+}
+
+function isDuckDuckGoAdUrl(rawUrl: string): boolean {
+  const lowered = decodeHtmlEntities(rawUrl).toLowerCase();
+  return lowered.includes('duckduckgo.com/y.js?') || lowered.includes('ad_provider=');
 }
 
 // ─── web_fetch ───────────────────────────────────────────────────────
