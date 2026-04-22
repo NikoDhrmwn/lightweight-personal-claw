@@ -24,6 +24,7 @@ import { getConfig, getStateDir } from '../config.js';
 import { createLogger, createSilentLogger } from '../logger.js';
 import { printStepDone, printStepWarn } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
+import { sanitizeChannelContent, splitMessage } from './utils.js';
 
 const log = createLogger('whatsapp');
 const baileysLog = createSilentLogger('baileys');
@@ -532,20 +533,7 @@ export class WhatsAppChannel {
 
 // ─── Utilities ───────────────────────────────────────────────────────
 
-function chunkText(text: string, maxLen: number): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt < maxLen / 2) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
-  }
-
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
-}
+// chunkText is replaced by splitMessage from utils.js
 
 function buildStructuredIncomingMessage(
   meta: {
@@ -712,16 +700,10 @@ function buildOutgoingMessages(
     return splitRapidMessages(fullText, maxLen);
   }
 
-  return chunkText(fullText, maxLen);
+  return splitMessage(fullText, maxLen);
 }
 
-function sanitizeChannelContent(text: string): string {
-  return text
-    .replace(/<tool_result>\s*[\s\S]*?<\/tool_result>/gi, '')
-    .replace(/<\/?tool_result>/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
+// sanitizeChannelContent is imported from utils.js
 
 function splitRapidMessages(text: string, maxLen: number): string[] {
   const paragraphs = text
@@ -748,7 +730,7 @@ function splitRapidMessages(text: string, maxLen: number): string[] {
       if (candidate.length > Math.min(maxLen, 500)) {
         if (current) bursts.push(current);
         if (piece.length > Math.min(maxLen, 500)) {
-          bursts.push(...chunkText(piece, Math.min(maxLen, 500)));
+          bursts.push(...splitMessage(piece, Math.min(maxLen, 500)));
           current = '';
         } else {
           current = piece;

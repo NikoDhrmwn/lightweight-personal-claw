@@ -19,6 +19,7 @@ toolRegistry.register({
     { name: 'path', type: 'string', description: 'Absolute or relative path to the file', required: true },
     { name: 'startLine', type: 'number', description: 'Start line (1-indexed, optional)' },
     { name: 'endLine', type: 'number', description: 'End line (1-indexed, inclusive, optional)' },
+    { name: 'lineNumbers', type: 'boolean', description: 'Include line numbers in output (optional, default: false)' },
   ],
   usageNotes: [
     'Use this when you already know the file path or filename you need to inspect.',
@@ -49,24 +50,44 @@ toolRegistry.register({
         return { success: false, output: `File is too large (${(stat.size / 1024).toFixed(0)} KB). Use startLine/endLine for partial reads.` };
       }
 
-      let content = readFileSync(filePath, 'utf-8');
-
-      // Apply line range if specified
-      if (args.startLine || args.endLine) {
-        const lines = content.split('\n');
-        const start = Math.max(1, args.startLine ?? 1) - 1;
-        const end = Math.min(lines.length, args.endLine ?? lines.length);
-        content = lines.slice(start, end).join('\n');
-        return {
-          success: true,
-          output: `File: ${filePath} (lines ${start + 1}-${end} of ${lines.length})\n\n${content}`,
-        };
+      // Extension check for common binary formats
+      const binaryExtensions = ['.exe', '.dll', '.so', '.dylib', '.bin', '.pdf', '.docx', '.xlsx', '.pptx', '.zip', '.gz', '.tar', '.7z', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.mp3', '.mp4', '.mov'];
+      const ext = filePath.toLowerCase().substring(filePath.lastIndexOf('.'));
+      if (binaryExtensions.includes(ext)) {
+        return { success: false, output: `File '${args.path}' appears to be a binary file. LiteClaw can only read text files. Use 'send_file' if you need to share it.` };
       }
 
-      const lineCount = content.split('\n').length;
+      let content = readFileSync(filePath, 'utf-8');
+
+      // Basic binary content detection (look for null bytes or weird control chars)
+      if (content.includes('\u0000')) {
+        return { success: false, output: `File '${args.path}' contains binary data and cannot be read as text.` };
+      }
+
+      const allLines = content.split('\n');
+
+      // Apply line range if specified
+      let start = 0;
+      let end = allLines.length;
+      if (args.startLine || args.endLine) {
+        start = Math.max(1, args.startLine ?? 1) - 1;
+        end = Math.min(allLines.length, args.endLine ?? allLines.length);
+      }
+
+      const slice = allLines.slice(start, end);
+      
+      if (args.lineNumbers) {
+        content = slice.map((line, idx) => {
+          const lineNum = start + idx + 1;
+          return `${lineNum.toString().padStart(4, ' ')} | ${line}`;
+        }).join('\n');
+      } else {
+        content = slice.join('\n');
+      }
+
       return {
         success: true,
-        output: `File: ${filePath} (${lineCount} lines, ${stat.size} bytes)\n\n${content}`,
+        output: `File: ${filePath} (lines ${start + 1}-${end} of ${allLines.length})\n\n${content}`,
       };
     } catch (err: any) {
       return { success: false, output: `Error reading file: ${err.message}` };
@@ -108,6 +129,79 @@ toolRegistry.register({
       };
     } catch (err: any) {
       return { success: false, output: `Error writing file: ${err.message}` };
+    }
+  },
+});
+
+// ─── edit_file ───────────────────────────────────────────────────────
+
+toolRegistry.register({
+  name: 'edit_file',
+  description: 'Edit an existing file using search and replace blocks. Much safer than overwriting the whole file.',
+  category: 'filesystem',
+  parameters: [
+    { name: 'path', type: 'string', description: 'Path to the file to edit', required: true },
+    { 
+      name: 'edits', 
+      type: 'array', 
+      description: 'List of edits to apply', 
+      required: true,
+      items: {
+        type: 'object',
+        properties: {
+          search: { type: 'string', description: 'The exact string to find in the file' },
+          replace: { type: 'string', description: 'The string to replace it with' }
+        },
+        required: ['search', 'replace']
+      }
+    },
+  ],
+  usageNotes: [
+    'Use this for modifying existing code. It prevents accidental truncation.',
+    'The "search" string MUST match exactly, including indentation and whitespace.',
+    'If the search string matches multiple times, the tool will fail to ensure precision.',
+    'If you need to replace multiple different parts, include them in the same call as separate edits.'
+  ],
+  keywords: ['edit', 'modify', 'replace', 'fix', 'update', 'change', 'patch'],
+  handler: async (args, context): Promise<ToolResult> => {
+    const filePath = resolve(context.workingDir, args.path);
+
+    if (!existsSync(filePath)) {
+      return { success: false, output: `File not found: ${filePath}` };
+    }
+
+    try {
+      let content = readFileSync(filePath, 'utf-8');
+      const edits = args.edits as { search: string, replace: string }[];
+
+      for (const edit of edits) {
+        const parts = content.split(edit.search);
+        
+        if (parts.length === 1) {
+          return { 
+            success: false, 
+            output: `Search block not found in ${args.path}. Ensure whitespace and indentation match exactly.\n\nSearch attempt:\n${edit.search}` 
+          };
+        }
+        
+        if (parts.length > 2) {
+          return { 
+            success: false, 
+            output: `Search block matches multiple times (${parts.length - 1}) in ${args.path}. Provide more context in the search string to make it unique.` 
+          };
+        }
+
+        content = parts.join(edit.replace);
+      }
+
+      writeFileSync(filePath, content, 'utf-8');
+      return {
+        success: true,
+        output: `Successfully applied ${edits.length} edits to ${filePath}`,
+        filePath,
+      };
+    } catch (err: any) {
+      return { success: false, output: `Error editing file: ${err.message}` };
     }
   },
 });

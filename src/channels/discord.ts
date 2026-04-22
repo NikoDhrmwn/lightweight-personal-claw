@@ -26,16 +26,18 @@ import {
   type Message,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type InteractionEditReplyOptions,
   Partials,
 } from 'discord.js';
 import { existsSync } from 'fs';
 import { basename, extname } from 'path';
-import { AgentEngine, AgentRequest } from '../core/engine.js';
+import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager } from '../core/confirmation.js';
 import { getConfig, getStateDir } from '../config.js';
 import { createLogger } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
 import type { InteractiveChoiceRequest } from '../core/tools.js';
+import { sanitizeChannelContent, splitMessage } from './utils.js';
 
 const log = createLogger('discord');
 
@@ -43,6 +45,21 @@ interface MentionTarget {
   id: string;
   label: string;
   aliases: string[];
+}
+
+interface DiscordProgressState {
+  startedAt: number;
+  status: 'starting' | 'thinking' | 'planning' | 'working' | 'done' | 'error';
+  planSummary: string;
+  tasks: Array<{
+    id: string;
+    title: string;
+    status: string;
+    summary?: string;
+  }>;
+  currentTaskLabel?: string;
+  recentTools: string[];
+  error?: string;
 }
 
 // ─── Reaction Emojis (progress indicators) ──────────────────────────
@@ -529,11 +546,37 @@ export class DiscordChannel {
 
     let fullContent = '';
     const toolUpdates: string[] = [];
+    const progress = createDiscordProgressState();
+    let lastProgressFlush = 0;
+
+    const flushProgress = async (force = false, finalContent?: string): Promise<void> => {
+      const now = Date.now();
+      if (!force && now - lastProgressFlush < 1500) return;
+      lastProgressFlush = now;
+
+      const hasPlan = progress.tasks.length > 0;
+      const payload: InteractionEditReplyOptions = {
+        embeds: hasPlan ? [buildDiscordProgressEmbed(progress)] : [],
+      };
+
+      if (finalContent !== undefined) {
+        payload.content = finalContent || null;
+      } else if (!hasPlan) {
+        payload.content = `_${progressStatusLabel(progress.status)}..._`;
+      } else {
+        payload.content = null;
+      }
+
+      await interaction.editReply(payload);
+    };
 
     try {
       this.beginRequest('thinking');
+      await flushProgress(true);
       for await (const event of this.engine.processRequest(request)) {
         this.updateStatusForEvent(event.type, event.toolName);
+        applyEventToDiscordProgress(progress, event);
+        applyEventToDiscordProgress(progress, event);
 
         switch (event.type) {
           case 'content':
@@ -565,6 +608,8 @@ export class DiscordChannel {
             fullContent += `\n⚠ Error: ${event.error}`;
             break;
         }
+
+        await flushProgress();
       }
 
       const messages = buildOutgoingMessages(
@@ -577,13 +622,16 @@ export class DiscordChannel {
         1900
       );
 
-      await interaction.editReply(messages[0] ?? '(No response)');
+      progress.status = progress.error ? 'error' : 'done';
+      await flushProgress(true, messages[0] ?? '(No response)');
       for (let i = 1; i < messages.length; i++) {
         await interaction.followUp(messages[i]);
       }
     } catch (err: any) {
       log.error({ error: err.message }, 'Slash command /ask error');
-      await interaction.editReply(`⚠ Error: ${err.message}`);
+      progress.status = 'error';
+      progress.error = err.message;
+      await flushProgress(true, `⚠ Error: ${err.message}`);
     } finally {
       this.endRequest();
     }
@@ -804,6 +852,31 @@ export class DiscordChannel {
     const toolUpdates: string[] = [];
     let hasThought = false;
     const addedReactions = new Set<string>();
+    const progress = createDiscordProgressState();
+    let progressMessage: Message | null = null;
+    let lastProgressFlush = 0;
+
+    const flushProgress = async (force = false, finalContent?: string): Promise<void> => {
+      if (!progressMessage) return;
+      const now = Date.now();
+      if (!force && now - lastProgressFlush < 1500) return;
+      lastProgressFlush = now;
+
+      const hasPlan = progress.tasks.length > 0;
+      const payload: any = {
+        embeds: hasPlan ? [buildDiscordProgressEmbed(progress)] : [],
+      };
+
+      if (finalContent !== undefined) {
+        payload.content = finalContent || null;
+      } else if (!hasPlan) {
+        payload.content = `_${progressStatusLabel(progress.status)}..._`;
+      } else {
+        payload.content = null;
+      }
+
+      await progressMessage.edit(payload);
+    };
 
     const typingInterval = setInterval(async () => {
       try {
@@ -815,6 +888,10 @@ export class DiscordChannel {
       // ── Step 1: React with 👀 (received) ──
       await this.react(message, REACTIONS.RECEIVED);
       this.beginRequest('thinking');
+      progressMessage = await message.reply({
+        content: `_${progressStatusLabel(progress.status)}..._`,
+        allowedMentions: { repliedUser: false },
+      });
 
       const images = await this.collectMessageImages(message);
 
@@ -840,6 +917,8 @@ export class DiscordChannel {
 
       for await (const event of this.engine.processRequest(request)) {
         this.updateStatusForEvent(event.type, event.toolName);
+        applyEventToDiscordProgress(progress, event);
+        await flushProgress();
 
         // Remove the looking emoji once the agent starts doing ANY work (thinking, content, tools)
         if (['thinking', 'content', 'tool_start', 'plan', 'task_update'].includes(event.type) && addedReactions.has(REACTIONS.RECEIVED)) {
@@ -912,6 +991,8 @@ export class DiscordChannel {
       }
 
       // ── Final: remove intermediate reactions, add ✅ ──
+      await flushProgress(true);
+
       for (const emoji of addedReactions) {
         await this.unreact(message, emoji);
       }
@@ -923,7 +1004,40 @@ export class DiscordChannel {
       }, 10_000);
 
       // Format and send response
-      await this.sendResponse(message, fullContent, toolUpdates, mentionTargets);
+      const messages = buildOutgoingMessages(
+        fullContent,
+        toolUpdates,
+        {
+          replyStyle: this.config.replyStyle ?? 'single',
+          showToolProgress: this.config.showToolProgress ?? false,
+        },
+        1900
+      );
+
+      progress.status = progress.error ? 'error' : 'done';
+      const first = messages[0] ?? '(No response)';
+      const resolvedFirst = resolveDiscordMentions(first, mentionTargets);
+
+      if (progressMessage) {
+        await progressMessage.edit({
+          content: resolvedFirst.content,
+          embeds: progress.tasks.length > 0 ? [buildDiscordProgressEmbed(progress)] : [],
+          allowedMentions: {
+            users: resolvedFirst.userIds,
+            repliedUser: false,
+          },
+        });
+      }
+
+      for (let i = 1; i < messages.length; i++) {
+        const resolved = resolveDiscordMentions(messages[i], mentionTargets);
+        await (message.channel as any).send({
+          content: resolved.content,
+          allowedMentions: {
+            users: resolved.userIds,
+          },
+        });
+      }
 
       log.info({
         user: message.author.tag,
@@ -1261,20 +1375,7 @@ export class DiscordChannel {
 
 // ─── Utilities ───────────────────────────────────────────────────────
 
-function splitMessage(text: string, maxLen: number): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
 
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt < maxLen / 2) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
-  }
-
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
-}
 
 function buildEffectiveIncomingMessage(replyContext: string | null, content: string): string {
   return replyContext ? `${replyContext}\n\nUser reply: ${content}` : content;
@@ -1463,13 +1564,181 @@ function buildOutgoingMessages(
   return splitMessage(fullText, maxLen);
 }
 
-function sanitizeChannelContent(text: string): string {
-  return text
-    .replace(/<tool_result>\s*[\s\S]*?<\/tool_result>/gi, '')
-    .replace(/<\/?tool_result>/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+function createDiscordProgressState(): DiscordProgressState {
+  return {
+    startedAt: Date.now(),
+    status: 'starting',
+    planSummary: '',
+    tasks: [],
+    recentTools: [],
+  };
 }
+
+function applyEventToDiscordProgress(progress: DiscordProgressState, event: AgentStreamEvent): void {
+  switch (event.type) {
+    case 'thinking':
+      if (progress.status === 'starting') progress.status = 'thinking';
+      break;
+    case 'plan':
+      progress.status = 'planning';
+      progress.planSummary = event.plan?.summary ?? progress.planSummary;
+      progress.tasks = (event.plan?.tasks ?? []).map((task, index) => ({
+        id: task.id || `task_${index + 1}`,
+        title: task.title || `Task ${index + 1}`,
+        status: task.status || 'pending',
+        summary: task.summary,
+      }));
+      break;
+    case 'task_update': {
+      progress.status = event.taskStatus === 'in_progress' ? 'working' : progress.status;
+      if (event.plan?.summary) progress.planSummary = event.plan.summary;
+
+      const taskId = event.taskId || event.taskTitle || `task_${event.taskIndex ?? progress.tasks.length + 1}`;
+      const title = event.taskTitle || 'Task';
+      const existing = progress.tasks.find((task) => task.id === taskId);
+      if (existing) {
+        existing.title = title;
+        existing.status = event.taskStatus || existing.status;
+        existing.summary = event.taskSummary || existing.summary;
+      } else {
+        progress.tasks.push({
+          id: taskId,
+          title,
+          status: event.taskStatus || 'pending',
+          summary: event.taskSummary,
+        });
+      }
+
+      if (event.taskIndex && event.taskTotal) {
+        progress.currentTaskLabel = `[${event.taskIndex}/${event.taskTotal}] ${title}`;
+      } else {
+        progress.currentTaskLabel = title;
+      }
+      break;
+    }
+    case 'tool_start':
+      progress.status = 'working';
+      pushRecentToolUpdate(progress, `Running ${event.toolName ?? 'tool'}...`);
+      break;
+    case 'tool_result':
+      pushRecentToolUpdate(
+        progress,
+        `${event.toolResult?.success ? 'Done' : 'Failed'} ${event.toolName ?? 'tool'}`
+      );
+      break;
+    case 'error':
+      progress.status = 'error';
+      progress.error = event.error;
+      break;
+    case 'done':
+      if (progress.status !== 'error') progress.status = 'done';
+      break;
+  }
+}
+
+function pushRecentToolUpdate(progress: DiscordProgressState, text: string): void {
+  progress.recentTools.push(text);
+  if (progress.recentTools.length > 5) {
+    progress.recentTools = progress.recentTools.slice(-5);
+  }
+}
+
+function buildDiscordProgressEmbed(progress: DiscordProgressState): EmbedBuilder {
+  const elapsedMs = Date.now() - progress.startedAt;
+  const completed = progress.tasks.filter((task) => task.status === 'completed').length;
+  const failed = progress.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
+  const total = progress.tasks.length;
+
+  const embed = new EmbedBuilder()
+    .setTitle('LiteClaw Progress')
+    .setColor(progress.status === 'error' ? 0xff5f6d : progress.status === 'done' ? 0x7eff37 : 0xffa928)
+    .addFields(
+      {
+        name: 'Status',
+        value: `${progressStatusLabel(progress.status)}\nElapsed: ${formatDurationShort(elapsedMs)}`,
+        inline: true,
+      },
+      {
+        name: 'Tasks',
+        value: total > 0 ? `${completed}/${total} completed${failed ? `\n${failed} blocked/failed` : ''}` : 'No plan yet',
+        inline: true,
+      }
+    )
+    .setFooter({ text: 'Live progress updates' })
+    .setTimestamp();
+
+  if (progress.planSummary) {
+    embed.addFields({
+      name: 'Plan',
+      value: truncateEmbedField(progress.planSummary, 1024),
+      inline: false,
+    });
+  }
+
+  if (progress.tasks.length > 0) {
+    const taskLines = progress.tasks
+      .slice(0, 8)
+      .map((task, index) => `${index + 1}. ${taskStatusIcon(task.status)} ${task.title}${task.summary ? ` — ${task.summary}` : ''}`);
+    embed.addFields({
+      name: 'Task Progress',
+      value: truncateEmbedField(taskLines.join('\n'), 1024),
+      inline: false,
+    });
+  }
+
+  if (progress.currentTaskLabel || progress.recentTools.length > 0) {
+    const activityLines = [
+      progress.currentTaskLabel ? `Current: ${progress.currentTaskLabel}` : '',
+      ...progress.recentTools.map((line) => `• ${line}`),
+      progress.error ? `Error: ${progress.error}` : '',
+    ].filter(Boolean);
+
+    embed.addFields({
+      name: 'Activity',
+      value: truncateEmbedField(activityLines.join('\n'), 1024),
+      inline: false,
+    });
+  }
+
+  return embed;
+}
+
+function progressStatusLabel(status: DiscordProgressState['status']): string {
+  switch (status) {
+    case 'thinking': return '🧠 Thinking';
+    case 'planning': return '🗺️ Planning';
+    case 'working': return '⚙️ Working';
+    case 'done': return '✅ Complete';
+    case 'error': return '❌ Error';
+    case 'starting':
+    default:
+      return '👀 Starting';
+  }
+}
+
+function taskStatusIcon(status: string): string {
+  switch (status) {
+    case 'completed': return '✅';
+    case 'in_progress': return '🟡';
+    case 'failed': return '❌';
+    case 'blocked': return '⚠️';
+    default: return '⏳';
+  }
+}
+
+function formatDurationShort(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function truncateEmbedField(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+// sanitizeChannelContent is imported from utils.js
 
 function splitRapidMessages(text: string, maxLen: number): string[] {
   const paragraphs = text

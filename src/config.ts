@@ -204,7 +204,7 @@ export function getDefaultConfig(): LiteClawConfig {
         ],
       },
       web: {
-        search: { provider: 'google-grounding', browserFallback: true },
+        search: { provider: 'free-metasearch', browserFallback: true },
         fetch: { enabled: true },
       },
       filesystem: { enabled: true, confirmDelete: true },

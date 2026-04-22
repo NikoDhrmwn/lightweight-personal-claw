@@ -356,6 +356,24 @@ export class MemoryStore {
     this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
   }
 
+  /**
+   * Delete the last N messages for a session.
+   */
+  deleteLastMessages(sessionKey: string, count: number = 1): number {
+    const stmt = this.db.prepare(`
+      DELETE FROM messages 
+      WHERE id IN (
+        SELECT id FROM messages 
+        WHERE session_key = ? 
+        ORDER BY timestamp DESC 
+        LIMIT ?
+      )
+    `);
+    const result = stmt.run(sessionKey, count);
+    this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
+    return result.changes;
+  }
+
   close(): void {
     this.db.close();
   }
