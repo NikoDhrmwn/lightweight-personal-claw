@@ -813,23 +813,25 @@ button {
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 8px 12px;
-  background: none;
+  padding: 10px 14px;
+  background: rgba(181, 151, 255, 0.04);
   border: none;
+  border-bottom: 1px solid var(--line);
   color: var(--violet);
   font-family: var(--mono);
   font-size: 0.72rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
   cursor: pointer;
   text-align: left;
   user-select: none;
-  transition: background 0.2s;
+  transition: all 0.2s ease;
 }
 
 .thinking-header:hover {
-  background: rgba(181, 151, 255, 0.05);
+  background: rgba(181, 151, 255, 0.1);
+  color: var(--text);
 }
 
 .thinking-toggle-icon {
@@ -961,20 +963,121 @@ button {
 
 .copy-btn {
   position: absolute;
-  top: 8px;
-  right: 8px;
+  top: 6px;
+  right: 6px;
   border: 1px solid var(--line);
   background: var(--panel-2);
   color: var(--muted);
-  padding: 4px 8px;
-  font-size: 0.7rem;
+  padding: 3px 8px;
+  font-size: 0.65rem;
   font-family: var(--mono);
   cursor: pointer;
-  transition: color 120ms ease, background 120ms ease;
+  transition: all 180ms ease;
+  opacity: 0;
+  transform: translateY(-2px);
+}
+
+.message-content pre:hover .copy-btn {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .copy-btn:hover {
   color: var(--text);
+  background: var(--panel-3);
+  border-color: var(--line-strong);
+}
+
+.copy-btn.success {
+  color: var(--green);
+  border-color: rgba(126, 255, 55, 0.3);
+}
+
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  opacity: 0.6;
+  transition: opacity 200ms ease;
+}
+
+.message-body:hover .message-actions {
+  opacity: 1;
+}
+
+.action-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.action-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--line);
+}
+
+.action-btn.success {
+  color: var(--green);
+}
+
+.message.fade-out {
+  animation: messageFadeOut 300ms var(--ease-out) forwards;
+  pointer-events: none;
+}
+
+@keyframes messageFadeOut {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(-12px);
+    margin-bottom: -40px; /* Collapse space */
+  }
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  transition: all 180ms ease;
+}
+
+.file-chip .icon {
+  font-size: 1rem;
+  color: var(--cyan);
+}
+
+.file-chip button {
+  border: none;
+  background: transparent;
+  color: var(--danger);
+  padding: 0 4px;
+  cursor: pointer;
+  font-size: 1.1rem;
+}
+
+.file-chip:hover {
+  border-color: var(--line-strong);
   background: var(--panel-3);
 }
 

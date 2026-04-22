@@ -61,6 +61,7 @@ export interface LLMProvider {
   maxTokens: number;
   supportsVision: boolean;
   supportsTools: boolean;
+  supportsReasoning: boolean;
 }
 
 // ─── Provider Registry ───────────────────────────────────────────────
@@ -86,6 +87,7 @@ export function buildProviders(): LLMProvider[] {
         maxTokens: model.maxTokens ?? 8192,
         supportsVision: model.vision ?? (model.input?.includes('image') ?? false),
         supportsTools: true,
+        supportsReasoning: model.reasoning ?? false,
       });
     }
   }
@@ -133,6 +135,7 @@ async function autoDetectLocalModel(provId: string, baseUrl: string, apiKey: str
       maxTokens: Math.min(contextWindow, 8192),
       supportsVision: hasVision,
       supportsTools: true,
+      supportsReasoning: true,
     };
   } catch (err: any) {
     log.debug({ provider: provId, error: err.message }, 'Auto-detect failed (server may be offline)');
@@ -181,6 +184,7 @@ export async function buildProvidersAsync(): Promise<LLMProvider[]> {
         maxTokens: model.maxTokens ?? 8192,
         supportsVision: model.vision ?? (model.input?.includes('image') ?? false),
         supportsTools: true,
+        supportsReasoning: model.reasoning ?? false,
       });
     }
   }
@@ -209,6 +213,7 @@ export function getPrimaryProvider(): LLMProvider {
     maxTokens: 8192,
     supportsVision: true,
     supportsTools: true,
+    supportsReasoning: true,
   };
 }
 
@@ -329,6 +334,17 @@ export class LLMClient extends EventEmitter {
           max_tokens: options?.maxTokens ?? provider.maxTokens,
         };
 
+        if (provider.supportsReasoning) {
+          const reasoningConfig = getReasoningConfig();
+          requestBody.reasoning = reasoningConfig.enabled ? 'on' : 'off';
+          requestBody.reasoning_format = 'deepseek';
+          requestBody.reasoning_budget = reasoningConfig.budget;
+          requestBody.chat_template_kwargs = {
+            ...(requestBody.chat_template_kwargs ?? {}),
+            enable_thinking: reasoningConfig.enabled,
+          };
+        }
+
         if (tools && tools.length > 0) {
           requestBody.tools = tools;
           requestBody.tool_choice = 'auto';
@@ -369,8 +385,11 @@ export class LLMClient extends EventEmitter {
             return; // Success — don't try fallback
           }
 
-          if (delta?.reasoning_content) {
-            yield { type: 'thinking', content: delta.reasoning_content };
+          if (delta) {
+            // log.debug({ deltaKeys: Object.keys(delta) }, 'LLM Delta received');
+            if (delta.reasoning_content) {
+              yield { type: 'thinking', content: delta.reasoning_content };
+            }
           }
 
           if (delta?.content) {
@@ -388,11 +407,20 @@ export class LLMClient extends EventEmitter {
                   }
                   tagBuffer = tagBuffer.slice(endIdx + 8);
                   isThinking = false;
-                } else if (tagBuffer.length > 20 && !tagBuffer.includes('<')) {
-                  yield { type: 'thinking', content: tagBuffer };
-                  tagBuffer = '';
                 } else {
-                  break;
+                  // Yield everything except a potential partial tag at the end
+                  const lastOpenBracket = tagBuffer.lastIndexOf('<');
+                  if (lastOpenBracket !== -1 && lastOpenBracket > tagBuffer.length - 10) {
+                    // Possible partial </think> at the end, yield up to the bracket
+                    const part = tagBuffer.slice(0, lastOpenBracket);
+                    if (part.length > 0) yield { type: 'thinking', content: part };
+                    tagBuffer = tagBuffer.slice(lastOpenBracket);
+                    break;
+                  } else {
+                    // No tag near end, flush all
+                    yield { type: 'thinking', content: tagBuffer };
+                    tagBuffer = '';
+                  }
                 }
               } else if (isToolCall) {
                 const endIdx = tagBuffer.indexOf('</tool_call>');
@@ -426,6 +454,8 @@ export class LLMClient extends EventEmitter {
                           arguments: rawArgs
                         };
                       }
+                    } else if (/<function=/i.test(toolCallBuffer)) {
+                      parsed = parseFunctionStyleToolCall(toolCallBuffer);
                     } else {
                       parsed = JSON.parse(toolCallBuffer.trim());
                     }
@@ -449,16 +479,22 @@ export class LLMClient extends EventEmitter {
                     }
                   } catch (e: any) {
                     log.warn({ text: toolCallBuffer }, 'Failed to parse XML tool call');
-                    yield { type: 'content', content: `\n\n[Warning: Failed to parse tool call: ${e.message}]\n` };
                   }
                   tagBuffer = tagBuffer.slice(foundEndIdx + endTagLen);
                   isToolCall = false;
                   toolCallBuffer = '';
-                } else if (tagBuffer.length > 20 && !tagBuffer.includes('<')) {
-                  toolCallBuffer += tagBuffer;
-                  tagBuffer = '';
                 } else {
-                  break;
+                  // Buffer up to the last potential start of a tag
+                  const lastOpenBracket = tagBuffer.lastIndexOf('<');
+                  if (lastOpenBracket !== -1 && lastOpenBracket > tagBuffer.length - 15) {
+                    const part = tagBuffer.slice(0, lastOpenBracket);
+                    if (part.length > 0) toolCallBuffer += part;
+                    tagBuffer = tagBuffer.slice(lastOpenBracket);
+                    break;
+                  } else {
+                    toolCallBuffer += tagBuffer;
+                    tagBuffer = '';
+                  }
                 }
               } else {
                 // Looking for start tags
@@ -597,4 +633,48 @@ export class LLMClient extends EventEmitter {
     this.refreshProviders();
     return this.providers[0]?.id ?? 'unknown';
   }
+}
+
+function getReasoningConfig(): { enabled: boolean; budget: number } {
+  const level = String(getConfig().agent?.thinkingDefault ?? 'medium').toLowerCase();
+  switch (level) {
+    case 'off':
+      return { enabled: false, budget: 0 };
+    case 'low':
+      return { enabled: true, budget: 1024 };
+    case 'high':
+      return { enabled: true, budget: 4096 };
+    case 'medium':
+    default:
+      return { enabled: true, budget: 2048 };
+  }
+}
+
+function parseFunctionStyleToolCall(raw: string): { name: string; arguments: Record<string, unknown> } | null {
+  const functionMatch = raw.match(/<function=([a-z0-9_-]+)>\s*([\s\S]*?)<\/function>/i);
+  if (!functionMatch) return null;
+
+  const name = functionMatch[1];
+  const body = functionMatch[2] ?? '';
+  const args: Record<string, unknown> = {};
+  const paramRegex = /<parameter=([a-z0-9_-]+)>\s*([\s\S]*?)\s*<\/parameter>/gi;
+
+  let match: RegExpExecArray | null;
+  while ((match = paramRegex.exec(body)) !== null) {
+    const key = match[1];
+    const rawValue = (match[2] ?? '').trim();
+
+    if (!rawValue) {
+      args[key] = '';
+      continue;
+    }
+
+    try {
+      args[key] = JSON.parse(rawValue);
+    } catch {
+      args[key] = rawValue;
+    }
+  }
+
+  return { name, arguments: args };
 }

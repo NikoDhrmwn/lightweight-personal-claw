@@ -11,9 +11,11 @@
   let sessions = [];
   let currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
   let pendingConfirmationId = null;
+  let pendingRegeneration = null;
+  let isRegenerating = false;
   let workspacePath = ".";
   let selectedWorkspaceFile = "";
-  const attachedImages = [];
+  const attachments = [];
 
   const $ = (selector) => document.querySelector(selector);
   const messagesEl = $("#messages");
@@ -290,7 +292,14 @@
       history.forEach((msg) => {
         if (msg.role === "user") {
           const cleaned = cleanMessageContent(msg.content || "");
-          addUserMessage(cleaned.text, [], false, cleaned.sender);
+          let attachmentsList = [];
+          if (msg.metadata) {
+            try {
+              const meta = JSON.parse(msg.metadata);
+              attachmentsList = meta.attachments || [];
+            } catch {}
+          }
+          addUserMessage(cleaned.text, attachmentsList, false, cleaned.sender);
         }
         if (msg.role === "assistant") {
           addRestoredAssistantMessage(msg.content || "");
@@ -318,6 +327,7 @@
     hideWelcome();
     const el = document.createElement("div");
     el.className = "message assistant restored-plan";
+    el.dataset.messageRole = "plan";
     el.innerHTML = `
       <div class="message-avatar">LC</div>
       <div class="message-body">
@@ -587,33 +597,59 @@
       cleaned = cleaned.replace(/^Use only these handles[^\n]*\n?/gm, "");
     }
 
+    // Strip backend-injected file contents
+    cleaned = cleaned.replace(/\n\nAttached files content:[\s\S]*$/m, "");
+
     return { text: cleaned.trim(), sender };
   }
 
-  function addUserMessage(text, images, animate = true, sender = "You") {
+  function addUserMessage(text, attachmentsList, animate = true, sender = "You") {
     hideWelcome();
     const el = document.createElement("div");
-    el.className = "message user";
-    if (!animate) el.style.animation = "none";
-    
-    // Generate an initial for the avatar
-    const avatarInitial = sender === "You" ? "U" : sender.charAt(0).toUpperCase();
+    el.className = "message user" + (animate ? " animate-in" : "");
+    el.dataset.messageRole = "user";
+    el._rawText = text;
+    const avatarInitial = sender.charAt(0).toUpperCase();
+
+    let attachmentsHtml = "";
+    if (attachmentsList && attachmentsList.length > 0) {
+      attachmentsHtml = `<div class="message-attachments" style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px;">`;
+      attachmentsList.forEach(att => {
+        const dataUrl = typeof att === 'string' ? att : att.dataUrl;
+        const name = typeof att === 'string' ? 'image' : att.name;
+        const isImage = dataUrl.startsWith("data:image/");
+
+        if (isImage) {
+          attachmentsHtml += `<img src="${dataUrl}" alt="attachment" style="max-width:140px; border:1px solid var(--line); border-radius: 4px;">`;
+        } else {
+          const icon = name.endsWith(".pdf") ? "📄" : (name.endsWith(".xlsx") || name.endsWith(".csv")) ? "📊" : "📝";
+          attachmentsHtml += `
+            <div class="file-chip" style="opacity: 1; pointer-events: none;">
+              <span class="icon">${icon}</span>
+              <span>${escapeHtml(name)}</span>
+            </div>`;
+        }
+      });
+      attachmentsHtml += `</div>`;
+    }
 
     el.innerHTML = `
       <div class="message-body">
         <div class="message-sender">${escapeHtml(sender)}</div>
         <div class="message-content">${escapeHtml(text)}</div>
-        ${images.length ? `<div class="image-preview">${images.map((src) => `<img src="${src}" alt="attachment" style="max-width:140px;border:1px solid var(--line);margin-top:8px;">`).join("")}</div>` : ""}
+        ${attachmentsHtml}
       </div>
       <div class="message-avatar">${escapeHtml(avatarInitial)}</div>
     `;
     messagesEl.appendChild(el);
+    el._attachments = attachmentsList;
     scrollToBottom();
   }
 
   function addRestoredAssistantMessage(content) {
     const el = document.createElement("div");
     el.className = "message assistant";
+    el.dataset.messageRole = "assistant";
     el.innerHTML = `
       <div class="message-avatar">LC</div>
       <div class="message-body">
@@ -622,7 +658,9 @@
       </div>
     `;
     messagesEl.appendChild(el);
-    addCopyButtons(el.querySelector(".message-content"));
+    const contentEl = el.querySelector(".message-content");
+    addCopyButtons(contentEl);
+    addMessageActions(el.querySelector(".message-body"), content);
   }
 
   function ensureAssistantMessage() {
@@ -630,6 +668,7 @@
     hideWelcome();
     currentAssistantEl = document.createElement("div");
     currentAssistantEl.className = "message assistant";
+    currentAssistantEl.dataset.messageRole = "assistant";
     currentAssistantEl.innerHTML = `
       <div class="message-avatar">LC</div>
       <div class="message-body">
@@ -657,7 +696,7 @@
     
     if (!wrapper || wrapper.dataset.closed === "true") {
       wrapper = document.createElement("div");
-      wrapper.className = "thinking-wrapper";
+      wrapper.className = "thinking-wrapper"; // Collapsed by default
       
       const header = document.createElement("button");
       header.className = "thinking-header";
@@ -784,8 +823,11 @@
       body.appendChild(metricsEl);
     }
 
+    addMessageActions(currentAssistantEl.querySelector(".message-body"), currentContent);
+
     currentAssistantEl?.querySelectorAll(".thinking-wrapper").forEach((el) => {
       el.dataset.closed = "true";
+      el.classList.remove("expanded"); // Collapse after finishing
       const label = el.querySelector(".thinking-label");
       if (label) {
         label.classList.remove("pulsing");
@@ -886,30 +928,35 @@
     confirmModal.hidden = true;
   }
 
+  function cancelPendingModalAction() {
+    pendingRegeneration = null;
+    pendingConfirmationId = null;
+    confirmModal.hidden = true;
+  }
+
   // ─── Send Message ─────────────────────────────────────────────────
 
-  function sendMessage() {
-    const text = inputEl.value.trim();
-    if ((!text && attachedImages.length === 0) || !ws || ws.readyState !== WebSocket.OPEN) return;
+  function sendMessage(manualText = null) {
+    const text = manualText !== null ? manualText : inputEl.value.trim();
+    if ((!text && attachments.length === 0) || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-    addUserMessage(text || "(image attached)", [...attachedImages]);
+    addUserMessage(text || "(attachments)", [...attachments]);
     ws.send(JSON.stringify({
       type: "message",
       content: text,
       sessionKey: currentSessionKey,
       workingDir: refs.settingWorkspace.value.trim() || currentConfig.agent?.workspace,
-      images: attachedImages.length ? [...attachedImages] : undefined,
+      attachments: attachments.length ? [...attachments] : undefined,
     }));
 
-    inputEl.value = "";
-    inputEl.style.height = "auto";
-    attachedImages.length = 0;
-    imagePreview.hidden = true;
-    imagePreview.innerHTML = "";
-    sendBtn.disabled = true;
-    inputEl.disabled = true;
-    currentAssistantEl = null;
-    currentContent = "";
+    if (manualText === null) {
+      inputEl.value = "";
+      inputEl.style.height = "auto";
+      attachments.length = 0;
+      imagePreview.hidden = true;
+      imagePreview.innerHTML = "";
+      sendBtn.disabled = true;
+    }
   }
 
   // ─── Markdown Renderer ────────────────────────────────────────────
@@ -919,8 +966,8 @@
     const thinkBlocks = [];
     let working = String(text || "");
 
-    // Handle thinking tags
-    working = working.replace(/<think>([\s\S]*?)<\/think>/g, (_, content) => {
+    // Isolate thinking blocks so they don't get wrapped inside <p> tags.
+    working = working.replace(/<think>([\s\S]*?)(?:<\/think>|$)/g, (_, content) => {
       const token = `@@THINK${thinkBlocks.length}@@`;
       thinkBlocks.push(`
         <div class="thinking-wrapper">
@@ -931,7 +978,7 @@
           <div class="thinking-content">${escapeHtml(content.trim())}</div>
         </div>
       `);
-      return token;
+      return `\n\n${token}\n\n`;
     });
 
     working = working.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
@@ -952,7 +999,7 @@
     html = html.split(/\n{2,}/).map((chunk) => {
       const trimmed = chunk.trim();
       if (!trimmed) return "";
-      if (/^@@CODE\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
+      if (/^@@CODE\d+@@$/.test(trimmed) || /^@@THINK\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
       if (/^[-*] /m.test(trimmed)) {
         const items = trimmed.split("\n").filter(Boolean).map((line) => {
           if (/^[-*] /.test(line)) return `<li>${line.slice(2)}</li>`;
@@ -990,16 +1037,137 @@
       if (pre.querySelector(".copy-btn")) return;
       const btn = document.createElement("button");
       btn.className = "copy-btn";
-      btn.textContent = "Copy";
+      btn.innerHTML = "Copy";
       btn.addEventListener("click", () => {
         navigator.clipboard.writeText(pre.querySelector("code")?.textContent || "");
-        btn.textContent = "Copied";
+        btn.innerHTML = "✓ Copied";
+        btn.classList.add("success");
         setTimeout(() => {
-          btn.textContent = "Copy";
-        }, 1200);
+          btn.innerHTML = "Copy";
+          btn.classList.remove("success");
+        }, 2000);
       });
       pre.appendChild(btn);
     });
+  }
+
+  function addMessageActions(body, content) {
+    if (!body || body.querySelector(".message-actions")) return;
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    const messageEl = body.closest(".message.assistant");
+
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "action-btn";
+    copyBtn.innerHTML = `<span>📋</span> Copy`;
+    copyBtn.title = "Copy full message content";
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(content);
+      copyBtn.innerHTML = `<span>✓</span> Copied`;
+      copyBtn.classList.add("success");
+      setTimeout(() => {
+        copyBtn.innerHTML = `<span>📋</span> Copy`;
+        copyBtn.classList.remove("success");
+      }, 2000);
+    });
+
+    const regenBtn = document.createElement("button");
+    regenBtn.className = "action-btn";
+    regenBtn.innerHTML = `<span>⟳</span> Regenerate`;
+    regenBtn.title = "Regenerate assistant response";
+    regenBtn.addEventListener("click", () => {
+      if (messageEl) requestRegeneration(messageEl);
+    });
+
+    actions.appendChild(copyBtn);
+    actions.appendChild(regenBtn);
+    body.appendChild(actions);
+  }
+
+  function requestRegeneration(assistantEl) {
+    if (isStreaming || isRegenerating) return;
+    const turn = findRegenerationTurn(assistantEl);
+    if (!turn) {
+      showNotice("Couldn’t locate the original prompt for that reply.", "error", 2800);
+      return;
+    }
+    pendingRegeneration = turn;
+    const turnsAffected = Math.max(1, Math.floor(turn.rollbackCount / 2));
+    const label = turnsAffected > 1 ? `This will remove this reply and ${turnsAffected - 1} later turn(s), then replay the selected prompt.` : `This will replace this reply and replay the same prompt.`;
+    confirmBody.innerHTML = `<p>${label}</p>`;
+    confirmModal.hidden = false;
+  }
+
+  function findRegenerationTurn(assistantEl) {
+    const conversation = Array.from(messagesEl.querySelectorAll('.message[data-message-role="user"], .message[data-message-role="assistant"]'));
+    const assistantIndex = conversation.indexOf(assistantEl);
+    if (assistantIndex === -1) return null;
+
+    let userIndex = -1;
+    for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+      if (conversation[index].dataset.messageRole === "user") {
+        userIndex = index;
+        break;
+      }
+    }
+
+    if (userIndex === -1) return null;
+
+    const userEl = conversation[userIndex];
+    const text = userEl._rawText || userEl.querySelector(".message-content")?.textContent || "";
+    const savedAttachments = Array.isArray(userEl._attachments) ? [...userEl._attachments] : [];
+    const rollbackCount = conversation.length - userIndex;
+
+    return {
+      assistantEl,
+      userEl,
+      text,
+      attachments: savedAttachments,
+      rollbackCount,
+    };
+  }
+
+  async function confirmRegeneration() {
+    if (!pendingRegeneration || isRegenerating) return;
+    const turn = pendingRegeneration;
+    pendingRegeneration = null;
+    pendingConfirmationId = null;
+    confirmModal.hidden = true;
+    isRegenerating = true;
+
+    try {
+      const response = await fetchJson(`/api/sessions/${encodeURIComponent(currentSessionKey)}/rollback?count=${encodeURIComponent(turn.rollbackCount)}`, { method: "POST" });
+      if (!response.success) {
+        throw new Error("Rollback request was rejected.");
+      }
+
+      removeConversationTail(turn.userEl);
+
+      currentAssistantEl = null;
+      currentContent = "";
+      isStreaming = false;
+
+      attachments.length = 0;
+      turn.attachments.forEach((item) => attachments.push(item));
+      sendMessage(turn.text);
+      showNotice("Regenerating response…", "info", 1800);
+      fetchSessionMetrics(currentSessionKey);
+      loadSessions();
+    } catch (error) {
+      showNotice(`Regenerate failed: ${error.message || error}`, "error", 3200);
+    } finally {
+      isRegenerating = false;
+    }
+  }
+
+  function removeConversationTail(startEl) {
+    let node = startEl;
+    while (node) {
+      const next = node.nextElementSibling;
+      node.remove();
+      node = next;
+    }
+    if (!messagesEl.children.length) showWelcome();
   }
 
   // ─── Utilities ────────────────────────────────────────────────────
@@ -1075,7 +1243,7 @@
   inputEl.addEventListener("input", () => {
     inputEl.style.height = "auto";
     inputEl.style.height = `${Math.min(inputEl.scrollHeight, 200)}px`;
-    sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+    sendBtn.disabled = inputEl.value.trim().length === 0 && attachments.length === 0;
   });
 
   inputEl.addEventListener("keydown", (event) => {
@@ -1085,31 +1253,64 @@
     }
   });
 
-  imageInput.addEventListener("change", () => {
-    const files = Array.from(imageInput.files || []).slice(0, 4);
-    attachedImages.length = 0;
-    imagePreview.innerHTML = "";
+  window.addEventListener("paste", (event) => {
+    const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+    const files = [];
+    for (const item of items) {
+      if (item.kind === "file") {
+        files.push(item.getAsFile());
+      }
+    }
+    if (files.length > 0) {
+      handleFiles(files);
+    }
+  });
 
-    files.forEach((file, index) => {
+  function handleFiles(files) {
+    const fileList = Array.from(files).slice(0, 8);
+    // Don't clear attachedImages, just append
+    fileList.forEach((file) => {
       const reader = new FileReader();
+      const isImage = file.type.startsWith("image/");
+      
       reader.onload = () => {
-        attachedImages.push(String(reader.result));
+        const dataUrl = String(reader.result);
+        const item = { name: file.name, dataUrl };
+        attachments.push(item);
+
         const chip = document.createElement("div");
-        chip.className = "image-chip";
-        chip.innerHTML = `<span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        if (isImage) {
+          chip.className = "image-chip";
+          chip.innerHTML = `<span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        } else {
+          chip.className = "file-chip";
+          const icon = file.name.endsWith(".pdf") ? "📄" : (file.name.endsWith(".xlsx") || file.name.endsWith(".csv")) ? "📊" : "📝";
+          chip.innerHTML = `<span class="icon">${icon}</span><span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        }
+
         chip.querySelector("button").addEventListener("click", () => {
-          attachedImages.splice(index, 1);
+          const idx = attachments.indexOf(item);
+          if (idx > -1) attachments.splice(idx, 1);
           chip.remove();
-          if (attachedImages.length === 0) imagePreview.hidden = true;
-          sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+          if (attachments.length === 0) imagePreview.hidden = true;
+          sendBtn.disabled = inputEl.value.trim().length === 0 && attachments.length === 0;
         });
+
         imagePreview.appendChild(chip);
         imagePreview.hidden = false;
-        sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+        sendBtn.disabled = inputEl.value.trim().length === 0 && attachments.length === 0;
       };
-      reader.readAsDataURL(file);
-    });
 
+      if (isImage || file.type === "application/pdf" || file.type.includes("word") || file.type.includes("sheet") || file.type.startsWith("text/")) {
+        reader.readAsDataURL(file);
+      } else {
+        showNotice(`File type ${file.type} not supported for direct reading.`, "warning");
+      }
+    });
+  }
+
+  imageInput.addEventListener("change", () => {
+    handleFiles(imageInput.files);
     imageInput.value = "";
   });
 
@@ -1176,10 +1377,27 @@
     });
   });
 
-  confirmAccept.addEventListener("click", () => respondToConfirmation(true));
-  confirmReject.addEventListener("click", () => respondToConfirmation(false));
+  confirmAccept.addEventListener("click", () => {
+    if (pendingRegeneration) {
+      confirmRegeneration();
+      return;
+    }
+    respondToConfirmation(true);
+  });
+  confirmReject.addEventListener("click", () => {
+    if (pendingRegeneration) {
+      cancelPendingModalAction();
+      return;
+    }
+    respondToConfirmation(false);
+  });
   confirmModal.addEventListener("click", (event) => {
-    if (event.target === confirmModal) respondToConfirmation(false);
+    if (event.target !== confirmModal) return;
+    if (pendingRegeneration) {
+      cancelPendingModalAction();
+      return;
+    }
+    respondToConfirmation(false);
   });
   settingsOverlay.addEventListener("click", (event) => {
     if (event.target === settingsOverlay) settingsOverlay.hidden = true;
