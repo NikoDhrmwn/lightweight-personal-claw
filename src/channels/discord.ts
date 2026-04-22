@@ -369,6 +369,8 @@ export class DiscordChannel {
   private updateStatusForEvent(eventType: string, toolName?: string): void {
     switch (eventType) {
       case 'thinking':
+      case 'plan':
+      case 'task_update':
         this.setStatus('thinking');
         break;
       case 'tool_start':
@@ -509,8 +511,6 @@ export class DiscordChannel {
     // Defer reply since processing may take a while
     await interaction.deferReply();
 
-    this.beginRequest('thinking');
-
     const sessionKey = `discord:${interaction.channelId}`;
     const request: AgentRequest = {
       message: effectiveMessage,
@@ -531,6 +531,7 @@ export class DiscordChannel {
     const toolUpdates: string[] = [];
 
     try {
+      this.beginRequest('thinking');
       for await (const event of this.engine.processRequest(request)) {
         this.updateStatusForEvent(event.type, event.toolName);
 
@@ -538,6 +539,21 @@ export class DiscordChannel {
           case 'content':
             fullContent += event.content ?? '';
             break;
+          case 'plan':
+            toolUpdates.push(`🗺️ Planned ${event.plan?.tasks?.length ?? 0} task${(event.plan?.tasks?.length ?? 0) === 1 ? '' : 's'}`);
+            break;
+          case 'task_update': {
+            const prefix = event.taskIndex && event.taskTotal
+              ? `[${event.taskIndex}/${event.taskTotal}] `
+              : '';
+            if (event.taskStatus === 'in_progress') {
+              toolUpdates.push(`→ ${prefix}${event.taskTitle}`);
+            } else if (event.taskStatus) {
+              const icon = event.taskStatus === 'completed' ? '✓' : event.taskStatus === 'blocked' ? '⚠' : '✗';
+              toolUpdates.push(`${icon} ${prefix}${event.taskTitle}${event.taskSummary ? ` — ${event.taskSummary}` : ''}`);
+            }
+            break;
+          }
           case 'tool_start':
             toolUpdates.push(`⚙ Running \`${event.toolName}\`...`);
             break;
@@ -782,59 +798,51 @@ export class DiscordChannel {
       contentLength: content.length,
     }, 'Discord message passed filters');
 
-    // ── Step 1: React with 👀 (received) ──
-    await this.react(message, REACTIONS.RECEIVED);
-    this.beginRequest('thinking');
+    const sessionKey = `discord:${message.channel.id}`;
 
-    const images = await this.collectMessageImages(message);
+    let fullContent = '';
+    const toolUpdates: string[] = [];
+    let hasThought = false;
+    const addedReactions = new Set<string>();
 
-    // ── Continuous typing indicator ──
-    // Discord typing indicator lasts ~10s. We send every 7s to keep it alive.
     const typingInterval = setInterval(async () => {
       try {
         await (message.channel as any).sendTyping();
       } catch { /* ignore */ }
     }, 7_000);
 
-    // Send initial typing
     try {
-      await (message.channel as any).sendTyping();
-    } catch { /* ignore */ }
+      // ── Step 1: React with 👀 (received) ──
+      await this.react(message, REACTIONS.RECEIVED);
+      this.beginRequest('thinking');
 
-    // Build session key
-    const sessionKey = `discord:${message.channel.id}`;
+      const images = await this.collectMessageImages(message);
 
-    const request: AgentRequest = {
-      message: effectiveMessage,
-      images: images.length > 0 ? images : undefined,
-      sessionKey,
-      channelType: 'discord',
-      channelTarget: message.channel.id,
-      userIdentifier: message.author.tag,
-      workingDir: this.config.workspace || getConfig().agent?.workspace || getStateDir(),
-      sendFile: async (filePath: string, fileName?: string) => {
-        await this.sendFile(message, filePath, fileName);
-      },
-      sendInteractiveChoice: async (choiceRequest) => {
-        return this.sendInteractiveChoice({
-          channelId: message.channel.id,
-          replyTo: async (payload) => message.reply(payload),
-        }, choiceRequest);
-      },
-    };
+      // ── Build Request ──
+      const request: AgentRequest = {
+        message: effectiveMessage,
+        images: images.length > 0 ? images : undefined,
+        sessionKey,
+        channelType: 'discord',
+        channelTarget: message.channel.id,
+        userIdentifier: message.author.tag,
+        workingDir: this.config.workspace || getConfig().agent?.workspace || getStateDir(),
+        sendFile: async (filePath: string, fileName?: string) => {
+          await this.sendFile(message, filePath, fileName);
+        },
+        sendInteractiveChoice: async (choiceRequest) => {
+          return this.sendInteractiveChoice({
+            channelId: message.channel.id,
+            replyTo: async (payload) => message.reply(payload),
+          }, choiceRequest);
+        },
+      };
 
-    // Process and accumulate response
-    let fullContent = '';
-    const toolUpdates: string[] = [];
-    let hasThought = false;
-    const addedReactions = new Set<string>();
-
-    try {
       for await (const event of this.engine.processRequest(request)) {
         this.updateStatusForEvent(event.type, event.toolName);
 
         // Remove the looking emoji once the agent starts doing ANY work (thinking, content, tools)
-        if (['thinking', 'content', 'tool_start'].includes(event.type) && addedReactions.has(REACTIONS.RECEIVED)) {
+        if (['thinking', 'content', 'tool_start', 'plan', 'task_update'].includes(event.type) && addedReactions.has(REACTIONS.RECEIVED)) {
           await this.unreact(message, REACTIONS.RECEIVED);
           addedReactions.delete(REACTIONS.RECEIVED);
         }
@@ -857,6 +865,23 @@ export class DiscordChannel {
               addedReactions.delete(REACTIONS.THINKING);
             }
             break;
+
+          case 'plan':
+            toolUpdates.push(`🗺️ Planned ${event.plan?.tasks?.length ?? 0} task${(event.plan?.tasks?.length ?? 0) === 1 ? '' : 's'}`);
+            break;
+
+          case 'task_update': {
+            const prefix = event.taskIndex && event.taskTotal
+              ? `[${event.taskIndex}/${event.taskTotal}] `
+              : '';
+            if (event.taskStatus === 'in_progress') {
+              toolUpdates.push(`→ ${prefix}${event.taskTitle}`);
+            } else if (event.taskStatus) {
+              const icon = event.taskStatus === 'completed' ? '✓' : event.taskStatus === 'blocked' ? '⚠' : '✗';
+              toolUpdates.push(`${icon} ${prefix}${event.taskTitle}${event.taskSummary ? ` — ${event.taskSummary}` : ''}`);
+            }
+            break;
+          }
 
           case 'tool_start':
             // React with tool-specific emoji
@@ -1425,7 +1450,7 @@ function buildOutgoingMessages(
   maxLen: number
 ): string[] {
   const cleanedContent = sanitizeChannelContent(content).trim();
-  const toolSummary = options.showToolProgress && toolUpdates.length > 0
+  const toolSummary = (options.showToolProgress || !cleanedContent) && toolUpdates.length > 0
     ? toolUpdates.join('\n').trim()
     : '';
 
