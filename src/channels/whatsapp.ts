@@ -243,6 +243,21 @@ export class WhatsAppChannel {
           case 'content':
             fullContent += event.content ?? '';
             break;
+          case 'plan':
+            toolUpdates.push(`🗺 planned ${event.plan?.tasks?.length ?? 0} tasks`);
+            break;
+          case 'task_update': {
+            const prefix = event.taskIndex && event.taskTotal
+              ? `[${event.taskIndex}/${event.taskTotal}] `
+              : '';
+            if (event.taskStatus === 'in_progress') {
+              toolUpdates.push(`→ ${prefix}${event.taskTitle}`);
+            } else if (event.taskStatus) {
+              const icon = event.taskStatus === 'completed' ? '✓' : event.taskStatus === 'blocked' ? '⚠' : '✗';
+              toolUpdates.push(`${icon} ${prefix}${event.taskTitle}${event.taskSummary ? ` - ${event.taskSummary}` : ''}`);
+            }
+            break;
+          }
           case 'tool_start':
             toolUpdates.push(`⚙ _${event.toolName}_`);
             break;
