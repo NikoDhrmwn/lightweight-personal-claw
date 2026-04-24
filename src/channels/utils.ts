@@ -16,6 +16,8 @@ export function sanitizeChannelContent(text: string): string {
     // 1. Strip thinking blocks completely
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<think>[\s\S]*/gi, '') // Handle unclosed think tags
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+    .replace(/<thinking>[\s\S]*/gi, '') // Handle unclosed thinking tags
     
     // 2. Strip task updates
     .replace(/<task_update>[\s\S]*?<\/task_update>/gi, '')
@@ -23,8 +25,12 @@ export function sanitizeChannelContent(text: string): string {
     
     // 3. Strip tool calls and results (internal XML)
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+    .replace(/<call_tool\b[\s\S]*?(?:\/>|<\/call_tool>)/gi, '')
+    .replace(/<function=[\s\S]*?<\/function>/gi, '')
     .replace(/<tool_result>[\s\S]*?<\/tool_result>/gi, '')
-    .replace(/<\/?(tool_call|tool_result|task_update|think)>/gi, '')
+    .replace(/<\/?(tool_call|tool_result|task_update|think|thinking)>/gi, '')
+    .replace(/^\s*<call_tool\b.*$/gim, '')
+    .replace(/^\s*<function=.*$/gim, '')
 
     // 4. Clean up whitespace
     .replace(/\n{3,}/g, '\n\n')

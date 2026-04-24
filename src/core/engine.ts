@@ -41,12 +41,16 @@ export interface AgentRequest {
   images?: string[];
   attachments?: AgentAttachment[];
   sessionKey: string;
+  disablePlanner?: boolean;
+  disableReasoning?: boolean;
   channelType: 'webui' | 'discord' | 'whatsapp' | 'cli';
   channelTarget?: string;
   userIdentifier?: string;
   workingDir?: string;
   sendFile?: (filePath: string, fileName?: string) => Promise<void>;
   sendInteractiveChoice?: (request: import('./tools.js').InteractiveChoiceRequest) => Promise<string>;
+  /** Override the system prompt entirely (e.g., for DnD GM mode) */
+  systemPromptOverride?: string;
 }
 
 export interface MessageMetrics {
@@ -143,6 +147,10 @@ export class AgentEngine extends EventEmitter {
     return this.llm;
   }
 
+  getMemory(): MemoryStore {
+    return this.memory;
+  }
+
   private async acquireLock(sessionKey: string): Promise<() => void> {
     const currentLock = this.sessionLocks.get(sessionKey) || Promise.resolve();
     let release!: () => void;
@@ -183,7 +191,7 @@ export class AgentEngine extends EventEmitter {
     const maxReplans = getConfig().agent?.planner?.maxReplans ?? 2;
 
     const prepared = await this.prepareRequestContext(request);
-    const usePlanner = plannerEnabled && (
+    const usePlanner = !request.disablePlanner && plannerEnabled && (
       plannerMode === 'always' ||
       (plannerMode !== 'off' && shouldUseTaskPlanner(request.message, prepared.selectedTools))
     );
@@ -194,7 +202,7 @@ export class AgentEngine extends EventEmitter {
         if (event.type === 'switch_to_plan') {
           switchedToPlan = true;
           log.info({ session: request.sessionKey }, 'Model requested plan autonomously');
-          break; 
+          break;
         }
         yield event;
       }
@@ -397,7 +405,7 @@ export class AgentEngine extends EventEmitter {
 
   private async prepareRequestContext(request: AgentRequest): Promise<PreparedRequestContext> {
     const config = getConfig();
-    const systemPrompt = loadSystemPrompt();
+    const systemPrompt = request.systemPromptOverride ?? loadSystemPrompt();
     const activeSkills = config.agent?.skills?.enabled === false
       ? []
       : selectRelevantSkills(request.message, config.agent?.skills?.maxInjected);
@@ -577,8 +585,14 @@ export class AgentEngine extends EventEmitter {
       let assistantContent = '';
       let thinkingContent = '';
       const toolCalls: LLMToolCall[] = [];
-
-      for await (const chunk of this.llm.streamChat(messages, toolDefs)) {
+ 
+      const llmDefaults = config.llm?.defaults;
+      for await (const chunk of this.llm.streamChat(messages, toolDefs, {
+        temperature: llmDefaults?.temperature,
+        topP: llmDefaults?.topP,
+        maxTokens: llmDefaults?.maxOutputTokens,
+        disableReasoning: request.disableReasoning
+      })) {
         if (chunk.type === 'thinking' && chunk.content) {
           thinkingContent += chunk.content;
           yield { type: 'thinking', content: chunk.content };
@@ -733,7 +747,7 @@ export class AgentEngine extends EventEmitter {
       }
 
       const historyPortion = messages.slice(1);
-        const trimmed = this.context.trimHistory(
+      const trimmed = this.context.trimHistory(
         historyPortion,
         estimateTokens(prepared.systemPrompt),
         estimateTokens(JSON.stringify(toolDefs)),
@@ -742,12 +756,10 @@ export class AgentEngine extends EventEmitter {
       messages.push(...trimmed);
     }
 
-    if (!fullResponse.trim()) {
-      if (toolCallHistory.size > 0) {
-        fullResponse = "I have completed the requested actions using tools, but I don't have a specific summary to provide. Please check the results above.";
-      } else {
-        fullResponse = "I'm not sure how to respond to that. Could you please provide more details?";
-      }
+    // Only emit a fallback message if no meaningful interaction occurred.
+    // If tool calls were executed, the user already saw the results — no need for a redundant summary.
+    if (!fullResponse.trim() && toolCallHistory.size === 0) {
+      fullResponse = "I'm not sure how to respond to that. Could you please provide more details?";
     }
 
     yield { type: 'final_result', content: fullResponse };
@@ -793,7 +805,12 @@ export class AgentEngine extends EventEmitter {
     let thinkingContent = '';
     let tokens = 0;
 
-    for await (const chunk of this.llm.streamChat(messages, undefined, { temperature: 0.2, maxTokens: 1200 })) {
+    const llmDefaults = getConfig().llm?.defaults;
+    for await (const chunk of this.llm.streamChat(messages, undefined, {
+      temperature: 0.2, // Planner remains low temp for structure
+      topP: llmDefaults?.topP,
+      maxTokens: 1200
+    })) {
       if (chunk.type === 'thinking' && chunk.content) {
         thinkingContent += chunk.content;
         tokens += estimateTokens(chunk.content);
@@ -899,14 +916,23 @@ Do not expose the internal plan outside tags.`;
     const artifacts = new Set<string>();
     const toolCallHistory = new Set<string>();
 
+    log.info({ taskId: task.id, title: task.title }, 'Starting task execution');
+
     while (iterations < maxIterations) {
       iterations++;
+      log.debug({ taskId: task.id, iteration: iterations }, 'Task iteration start');
 
       let assistantContent = '';
       let thinkingContent = '';
       const toolCalls: LLMToolCall[] = [];
-
-      for await (const chunk of this.llm.streamChat(messages, toolDefs)) {
+ 
+      const llmDefaults = getConfig().llm?.defaults;
+      for await (const chunk of this.llm.streamChat(messages, toolDefs, {
+        temperature: llmDefaults?.temperature,
+        topP: llmDefaults?.topP,
+        maxTokens: llmDefaults?.maxOutputTokens,
+        disableReasoning: request.disableReasoning
+      })) {
         if (chunk.type === 'thinking' && chunk.content) {
           thinkingContent += chunk.content;
           allThinking += chunk.content;
@@ -931,8 +957,8 @@ Do not expose the internal plan outside tags.`;
         }
       }
 
-      log.debug({ 
-        iteration: iterations, 
+      log.debug({
+        iteration: iterations,
         assistantLength: assistantContent.length,
         thinkingLength: thinkingContent.length,
         assistantTail: assistantContent.slice(-100),
@@ -1127,10 +1153,15 @@ Do not expose the internal plan outside tags.`;
     ].filter(Boolean).join('\n');
 
     let content = '';
+    const llmDefaults = getConfig().llm?.defaults;
     for await (const chunk of this.llm.streamChat([
       { role: 'system', content: prompt },
       { role: 'user', content: userMessage },
-    ], undefined, { temperature: 0.3, maxTokens: 800 })) {
+    ], undefined, {
+      temperature: llmDefaults?.temperature,
+      topP: llmDefaults?.topP,
+      maxTokens: llmDefaults?.maxOutputTokens ?? 800
+    })) {
       if (chunk.type === 'thinking' && chunk.content) {
         yield { type: 'thinking', content: chunk.content };
       } else if (chunk.type === 'content' && chunk.content) {
@@ -1196,12 +1227,17 @@ Do not expose the internal plan outside tags.`;
     let assistantContent = '';
     let thinkingContent = '';
     let tokens = 0;
-
+ 
+    const llmDefaults = getConfig().llm?.defaults;
     for await (const chunk of this.llm.streamChat([
       { role: 'system', content: prompt },
       ...prepared.history,
       { role: 'user', content: replanContext },
-    ], undefined, { temperature: 0.2, maxTokens: 1200 })) {
+    ], undefined, {
+      temperature: 0.2, // Replanner low temp
+      topP: llmDefaults?.topP,
+      maxTokens: 1200
+    })) {
       if (chunk.type === 'thinking' && chunk.content) {
         thinkingContent += chunk.content;
         tokens += estimateTokens(chunk.content);
@@ -1379,14 +1415,14 @@ function extractEmbeddedToolCalls(
           // If it fails as JSON, try to extract it as a name/args pair if it looks like one
           const nameMatch = rawJson.match(/^\s*["']?name["']?\s*:\s*["'](\w+)["']/);
           const argsMatch = rawJson.match(/["']?arguments["']?\s*:\s*({[\s\S]*?})\s*$/);
-          
+
           if (nameMatch?.[1] && argsMatch?.[1] && toolNames.has(nameMatch[1])) {
-             const args = safeParseToolArgs(argsMatch[1]);
-             calls.push({
-                id: `embedded_${Date.now()}_${calls.length}`,
-                type: 'function',
-                function: { name: nameMatch[1], arguments: JSON.stringify(args) },
-              });
+            const args = safeParseToolArgs(argsMatch[1]);
+            calls.push({
+              id: `embedded_${Date.now()}_${calls.length}`,
+              type: 'function',
+              function: { name: nameMatch[1], arguments: JSON.stringify(args) },
+            });
           }
         }
       }
@@ -1420,7 +1456,7 @@ function safeParseToolArgs(raw: string): Record<string, any> {
       const val = match[2] ?? (match[3] ? Number(match[3]) : match[4] === 'true' ? true : match[4] === 'false' ? false : null);
       args[key] = val;
     }
-    
+
     if (Object.keys(args).length === 0 && raw.trim()) {
       args['input'] = raw.trim().replace(/^["']|["']$/g, '');
     }
@@ -1487,8 +1523,8 @@ function inferSafeToolCall(
   if (available.has('list_dir') && /list_dir/i.test(combined)) {
     const pathMatch =
       combined.match(/current directory/i) ? '.' :
-      combined.match(/`([^`\r\n]+)`/)?.[1] ??
-      combined.match(/"([^"\r\n]+)"/)?.[1];
+        combined.match(/`([^`\r\n]+)`/)?.[1] ??
+        combined.match(/"([^"\r\n]+)"/)?.[1];
     return makeCall('list_dir', { path: pathMatch || '.' });
   }
 

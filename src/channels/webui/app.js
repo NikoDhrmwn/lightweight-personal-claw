@@ -68,6 +68,11 @@
     exportBtn: $("#exportBtn"),
     settingModel: $("#settingModel"),
     settingThinking: $("#settingThinking"),
+    settingTemperature: $("#settingTemperature"),
+    settingTopP: $("#settingTopP"),
+    settingTopK: $("#settingTopK"),
+    settingMaxOutputTokens: $("#settingMaxOutputTokens"),
+    llmParamsGroup: $("#llmParamsGroup"),
     settingWorkspace: $("#settingWorkspace"),
     settingMaxTurns: $("#settingMaxTurns"),
     settingPlannerMode: $("#settingPlannerMode"),
@@ -375,6 +380,12 @@
       : `<option value="${escapeHtml(currentPrimary)}">${escapeHtml(currentPrimary || "unknown")}</option>`;
 
     refs.settingThinking.value = config.agent?.thinkingDefault || "medium";
+    refs.settingTemperature.value = config.llm?.defaults?.temperature ?? 1.0;
+    refs.settingTopP.value = config.llm?.defaults?.topP ?? 1.0;
+    refs.settingTopK.value = config.llm?.defaults?.topK ?? 45;
+    refs.settingMaxOutputTokens.value = config.llm?.defaults?.maxOutputTokens ?? 8192;
+    updateLlmParamsVisibility();
+
     refs.settingWorkspace.value = config.agent?.workspace || "";
     refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
     refs.settingPlannerMode.value = config.agent?.planner?.mode || "auto";
@@ -410,11 +421,24 @@
       : "Auth: local WebUI endpoints open";
   }
 
+  function updateLlmParamsVisibility() {
+    const isLocal = refs.settingModel.value.startsWith("local/");
+    if (refs.llmParamsGroup) {
+      refs.llmParamsGroup.style.display = isLocal ? "none" : "grid";
+    }
+  }
+
+  refs.settingModel.addEventListener("change", updateLlmParamsVisibility);
+
   function gatherSettingsPayload() {
     const toolLoading = document.querySelector("#toolLoadingGroup .toggle-chip.active")?.dataset.value || "lazy";
     return {
       llm: {
         primary: refs.settingModel.value,
+        temperature: Number(refs.settingTemperature.value || 1.0),
+        topP: Number(refs.settingTopP.value || 1.0),
+        topK: Number(refs.settingTopK.value || 45),
+        maxOutputTokens: Number(refs.settingMaxOutputTokens.value || 8192),
       },
       agent: {
         workspace: refs.settingWorkspace.value.trim(),

@@ -96,13 +96,19 @@ async function googleGroundingSearch(query: string, apiKey: string, maxResults: 
         google_search: {},
       }],
     }),
+    signal: AbortSignal.timeout(15_000),
   });
 
   if (!response.ok) {
-    throw new Error(`Google API error: ${response.status} ${response.statusText}`);
+    const rawError = await response.text().catch(() => '');
+    throw new Error(`Google API error: ${response.status} ${response.statusText}${rawError.trim() ? ` - ${rawError.trim()}` : ''}`);
   }
 
-  const data = await response.json() as any;
+  const rawBody = await response.text();
+  if (!rawBody.trim()) {
+    throw new Error('Google API returned an empty body.');
+  }
+  const data = JSON.parse(rawBody) as any;
 
   // Extract grounded response
   const candidate = data.candidates?.[0];
