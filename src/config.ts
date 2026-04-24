@@ -23,6 +23,10 @@ export interface LiteClawConfig {
       primary?: string;
       fallbacks?: string[];
       imageModel?: string;
+      temperature?: number;
+      topP?: number;
+      topK?: number;
+      maxOutputTokens?: number;
     };
   };
   agent?: {
@@ -144,7 +148,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.1.0' },
+    meta: { version: '0.6.1' },
     llm: {
       providers: {
         local: {

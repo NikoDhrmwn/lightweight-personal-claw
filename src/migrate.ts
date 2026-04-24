@@ -70,7 +70,7 @@ export async function migrateFromOpenClaw(openclawDir: string): Promise<void> {
 
   // ─── 3. Build config.yaml ──────────────────────────────────────
   const config: LiteClawConfig = {
-    meta: { version: '0.1.0' },
+    meta: { version: '0.6.1' },
 
     llm: {
       providers: {},

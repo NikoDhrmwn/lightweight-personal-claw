@@ -321,7 +321,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.1.0',
+      version: '0.6.1',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
       uptime: process.uptime(),
@@ -376,7 +376,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.1.0',
+        version: config.meta?.version ?? '0.6.1',
       },
       paths: {
         stateDir: getStateDir(),
@@ -385,6 +385,9 @@ export class GatewayServer {
       },
       llm: {
         primary: config.llm?.defaults?.primary ?? '',
+        temperature: config.llm?.defaults?.temperature ?? 1.0,
+        topP: config.llm?.defaults?.topP ?? 1.0,
+        maxOutputTokens: config.llm?.defaults?.maxOutputTokens ?? 8192,
         availableModels,
       },
       agent: {
@@ -735,9 +738,14 @@ export class GatewayServer {
 function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): LiteClawConfig {
   const next: LiteClawConfig = structuredClone(config);
 
-  if (patch.llm?.primary !== undefined) {
-    (next.llm ??= {}).defaults ??= {};
-    next.llm.defaults!.primary = String(patch.llm.primary);
+  if (patch.llm) {
+    next.llm ??= {};
+    next.llm.defaults ??= {};
+    if (patch.llm.primary !== undefined) next.llm.defaults.primary = String(patch.llm.primary);
+    if (patch.llm.temperature !== undefined) next.llm.defaults.temperature = Number(patch.llm.temperature);
+    if (patch.llm.topP !== undefined) next.llm.defaults.topP = Number(patch.llm.topP);
+    if (patch.llm.topK !== undefined) next.llm.defaults.topK = Number(patch.llm.topK);
+    if (patch.llm.maxOutputTokens !== undefined) next.llm.defaults.maxOutputTokens = Number(patch.llm.maxOutputTokens);
   }
 
   if (patch.agent) {
