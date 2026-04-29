@@ -103,7 +103,7 @@ export function createFallbackTaskPlan(
       : 'Synthesize the gathered information into a final response for the user.',
     acceptance: 'The user has received a complete and accurate response.',
     status: 'pending',
-    suggestedTools: pickRelevantTools(availableTools, ['write_file', 'exec', 'read_file']),
+    suggestedTools: pickRelevantTools(availableTools, ['edit_file', 'write_file', 'exec', 'read_file']),
     relevantSkills: pickRelevantSkills(availableSkills, lowered),
     attempts: 0,
   });

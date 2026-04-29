@@ -21,6 +21,7 @@ export interface MemoryEntry {
   sessionKey: string;
   role: string;
   content: string;
+  reasoningContent?: string;
   timestamp: number;
   metadata?: string;
 }
@@ -118,6 +119,13 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_task_plans_session
         ON task_plans(session_key, updated_at_ms DESC);
     `);
+
+    // ─── Migrations ──────────────────────────────────────────────
+    try {
+      this.db.exec('ALTER TABLE messages ADD COLUMN reasoning_content TEXT;');
+    } catch (e) {
+      // Column already exists or table doesn't exist yet
+    }
   }
 
   /**
@@ -125,13 +133,14 @@ export class MemoryStore {
    */
   saveMessage(entry: MemoryEntry): void {
     const stmt = this.db.prepare(`
-      INSERT INTO messages (session_key, role, content, timestamp, metadata)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO messages (session_key, role, content, reasoning_content, timestamp, metadata)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       entry.sessionKey,
       entry.role,
       entry.content,
+      entry.reasoningContent ?? null,
       entry.timestamp,
       entry.metadata ?? null
     );
@@ -142,7 +151,7 @@ export class MemoryStore {
    */
   getHistory(sessionKey: string, limit: number = 20): MemoryEntry[] {
     const stmt = this.db.prepare(`
-      SELECT id, session_key as sessionKey, role, content, timestamp, metadata
+      SELECT id, session_key as sessionKey, role, content, reasoning_content as reasoningContent, timestamp, metadata
       FROM messages
       WHERE session_key = ?
       ORDER BY timestamp DESC
@@ -354,6 +363,24 @@ export class MemoryStore {
     this.db.prepare('DELETE FROM messages WHERE session_key = ?').run(sessionKey);
     this.db.prepare('DELETE FROM summaries WHERE session_key = ?').run(sessionKey);
     this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
+  }
+
+  /**
+   * Delete the last N messages for a session.
+   */
+  deleteLastMessages(sessionKey: string, count: number = 1): number {
+    const stmt = this.db.prepare(`
+      DELETE FROM messages 
+      WHERE id IN (
+        SELECT id FROM messages 
+        WHERE session_key = ? 
+        ORDER BY timestamp DESC 
+        LIMIT ?
+      )
+    `);
+    const result = stmt.run(sessionKey, count);
+    this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
+    return result.changes;
   }
 
   close(): void {

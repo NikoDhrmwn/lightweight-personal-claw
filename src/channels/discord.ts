@@ -26,16 +26,27 @@ import {
   type Message,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type InteractionEditReplyOptions,
+  type AnySelectMenuInteraction,
+  type ModalSubmitInteraction,
+  type TextChannel,
+  type ThreadChannel,
+  type DMChannel,
+  type User,
   Partials,
 } from 'discord.js';
 import { existsSync } from 'fs';
+import { lookup } from 'dns/promises';
 import { basename, extname } from 'path';
-import { AgentEngine, AgentRequest } from '../core/engine.js';
+import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager } from '../core/confirmation.js';
 import { getConfig, getStateDir } from '../config.js';
 import { createLogger } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
 import type { InteractiveChoiceRequest } from '../core/tools.js';
+import { sanitizeChannelContent, splitMessage } from './utils.js';
+import { DND_SLASH_COMMANDS, DndDiscordController } from '../dnd/discord.js';
+import type { DndSessionDetails } from '../dnd/types.js';
 
 const log = createLogger('discord');
 
@@ -43,6 +54,21 @@ interface MentionTarget {
   id: string;
   label: string;
   aliases: string[];
+}
+
+interface DiscordProgressState {
+  startedAt: number;
+  status: 'starting' | 'thinking' | 'planning' | 'working' | 'done' | 'error';
+  planSummary: string;
+  tasks: Array<{
+    id: string;
+    title: string;
+    status: string;
+    summary?: string;
+  }>;
+  currentTaskLabel?: string;
+  recentTools: string[];
+  error?: string;
 }
 
 // ─── Reaction Emojis (progress indicators) ──────────────────────────
@@ -96,7 +122,7 @@ const STATUS_MESSAGES = {
     'All systems nominal.',
     'Resting...',
     'On standby.',
-    'Powered by Gemma 4.',
+    'Powered by {{MODEL}}.',
     'Let me know if you need anything.',
     'Watching the world go by...',
     'Zen mode 🧘',
@@ -189,6 +215,31 @@ function pickRandom(arr: readonly string[]): string {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function redactDiscordDebug(message: string): string {
+  return String(message ?? '')
+    .replace(/(Provided token:\s*)(\S+)/gi, (_whole, prefix, token) => `${prefix}${maskToken(token)}`)
+    .replace(/([A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{20,})/g, token => maskToken(token));
+}
+
+function maskToken(token: string): string {
+  if (!token) return token;
+  if (token.length <= 10) return '*'.repeat(token.length);
+  return `${token.slice(0, 6)}${'*'.repeat(Math.max(4, token.length - 10))}${token.slice(-4)}`;
+}
+
+function isDiscordDnsFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /\bENOTFOUND\b/i.test(message) || /\bgetaddrinfo\b/i.test(message);
+}
+
+async function ensureDiscordGatewayReachable(): Promise<void> {
+  try {
+    await lookup('gateway.discord.gg');
+  } catch (error: any) {
+    throw new Error(`Could not resolve gateway.discord.gg (${error?.code ?? error?.message ?? 'lookup failed'})`);
+  }
+}
+
 // ─── Slash Command Definitions ───────────────────────────────────────
 
 const SLASH_COMMANDS = [
@@ -215,6 +266,22 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('tokens')
     .setDescription('Show current session token usage and compaction threshold'),
+  new SlashCommandBuilder()
+    .setName('question')
+    .setDescription('Ask the GM an out-of-band question about the current DnD session')
+    .addStringOption(opt =>
+      opt.setName('message')
+        .setDescription('Your question for the GM')
+        .setRequired(true))
+    .addStringOption(opt =>
+      opt.setName('mode')
+        .setDescription('Whether the GM answer should be private or visible to the table')
+        .setRequired(false)
+        .addChoices(
+          { name: 'private', value: 'private' },
+          { name: 'public', value: 'public' },
+        )),
+  ...DND_SLASH_COMMANDS,
 ];
 
 // ─── Discord Channel Class ───────────────────────────────────────────
@@ -223,6 +290,7 @@ export class DiscordChannel {
   private client: Client;
   private engine: AgentEngine;
   private confirmations: ConfirmationManager;
+  private dnd: DndDiscordController;
   private config: any;
   private statusTimer: ReturnType<typeof setInterval> | null = null;
   private currentState: keyof typeof STATUS_MESSAGES = 'idle';
@@ -259,9 +327,21 @@ export class DiscordChannel {
       ],
     });
 
-    this.client.on('debug', m => console.log('[DISCORD_DEBUG]', m));
+    this.client.on('debug', m => console.log('[DISCORD_DEBUG]', redactDiscordDebug(m)));
     this.client.on('warn', m => console.warn('[DISCORD_WARN]', m));
     this.client.on('error', m => console.error('[DISCORD_ERROR]', m));
+    this.client.on('shardError', (error, shardId) => {
+      log.warn({ shardId, error: error.message }, 'Discord shard websocket error');
+    });
+    this.client.on('shardDisconnect', (event, shardId) => {
+      log.warn({ shardId, code: event.code, reason: event.reason?.toString?.() ?? '' }, 'Discord shard disconnected');
+    });
+    this.client.on('shardReconnecting', shardId => {
+      log.info({ shardId }, 'Discord shard reconnecting');
+    });
+    this.client.on('invalidated', () => {
+      log.error('Discord session invalidated');
+    });
     this.client.on('raw', (p: any) => {
       // Workaround for discord.js dropping uncached DMs
       if (p.t === 'MESSAGE_CREATE' && !p.d.guild_id && p.d.channel_id) {
@@ -272,7 +352,7 @@ export class DiscordChannel {
             (this.client.channels as any)._add({
               id: p.d.channel_id,
               type: 1, // ChannelType.DM
-              recipients: [ p.d.author ]
+              recipients: [p.d.author]
             }, null, { cache: true });
           } catch (e) {
             console.error('[RAW/HYDRATE] Failed to inject channel', e);
@@ -281,6 +361,7 @@ export class DiscordChannel {
       }
     });
 
+    this.dnd = new DndDiscordController(this.client, this.engine.getMemory());
     this.setupEventHandlers();
     this.setupConfirmationHandler();
   }
@@ -294,6 +375,7 @@ export class DiscordChannel {
 
       // Register slash commands
       await this.registerSlashCommands(c.user.id);
+      this.dnd.scheduleOpenVotes();
 
       // Set initial idle status
       this.setStatus('idle');
@@ -313,11 +395,15 @@ export class DiscordChannel {
     });
 
     // Slash command interactions
-    this.client.on(Events.InteractionCreate, async (interaction) => {
+    this.client.on('interactionCreate', async (interaction) => {
       if (interaction.isChatInputCommand()) {
         await this.handleSlashCommand(interaction);
       } else if (interaction.isButton()) {
         await this.handleButtonInteraction(interaction as ButtonInteraction);
+      } else if (interaction.isAnySelectMenu()) {
+        await this.handleSelectMenuInteraction(interaction);
+      } else if (interaction.isModalSubmit()) {
+        await this.handleModalInteraction(interaction);
       }
     });
   }
@@ -326,7 +412,18 @@ export class DiscordChannel {
 
   private setStatus(state: keyof typeof STATUS_MESSAGES): void {
     this.currentState = state;
-    const statusText = pickRandom(STATUS_MESSAGES[state]);
+    let statusText = pickRandom(STATUS_MESSAGES[state]);
+
+    if (statusText.includes('{{MODEL}}')) {
+      const modelId = this.engine.getLLMClient().getModelId();
+      const modelName = modelId.split('/').pop() || modelId;
+      // Format: deepseek-v4 -> Deepseek V4, gemma-4-e4b -> Gemma 4 E4b
+      const formatted = modelName
+        .split(/[-_]/)
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+      statusText = statusText.replace('{{MODEL}}', formatted);
+    }
 
     const statusMap: Record<string, 'online' | 'idle' | 'dnd' | 'invisible'> = {
       idle: 'online',
@@ -439,18 +536,30 @@ export class DiscordChannel {
   private async registerSlashCommands(clientId: string): Promise<void> {
     try {
       const token = this.config.token ?? process.env.DISCORD_TOKEN;
-      const guildId = this.config.guildId ?? process.env.DISCORD_GUILD_ID;
       const rest = new REST({ version: '10' }).setToken(token);
-
       const commandData = SLASH_COMMANDS.map(cmd => cmd.toJSON());
+      const configuredGuildId = this.config.guildId ?? process.env.DISCORD_GUILD_ID;
+      const connectedGuildIds = this.client.guilds.cache.map(guild => guild.id);
+      const guildIds = configuredGuildId
+        ? [configuredGuildId]
+        : connectedGuildIds;
 
-      if (guildId) {
-        // Instant registration for a specific guild (faster for dev)
-        await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commandData });
-        log.info({ guildId, count: commandData.length }, 'Registered guild slash commands');
-        console.log(`  ✓ Registered ${commandData.length} guild slash commands for ${guildId}`);
+      if (guildIds.length > 0) {
+        // Clear stale global commands so Discord does not show duplicate
+        // entries when this bot has previously registered globally.
+        await rest.put(Routes.applicationCommands(clientId), { body: commandData });
+        log.info({ count: commandData.length }, 'Registered global slash commands');
+
+        for (const guildId of guildIds) {
+          await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commandData });
+          log.info({ guildId, count: commandData.length }, 'Registered guild slash commands');
+          console.log(`  ✓ Registered ${commandData.length} guild slash commands for ${guildId}`);
+        }
+        if (!configuredGuildId && guildIds.length > 1) {
+          console.log(`  ✓ Registered commands across ${guildIds.length} connected guilds for faster Discord propagation`);
+        }
       } else {
-        // Global registration (can take up to 1h to propagate)
+        // Fallback when the bot is not yet aware of any guilds.
         await rest.put(Routes.applicationCommands(clientId), { body: commandData });
         log.info({ count: commandData.length }, 'Registered global slash commands');
         console.log(`  ✓ Registered ${commandData.length} global slash commands (may take up to 1h to show up)`);
@@ -462,6 +571,38 @@ export class DiscordChannel {
   }
 
   private async handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const dndResult = await this.dnd.handleCommand(interaction);
+    if (dndResult === true) {
+      return;
+    }
+    if (typeof dndResult === 'string') {
+      // It's a roll result! Trigger the engine so the GM reacts.
+      await this.processDndActionChoice(interaction, dndResult);
+      return;
+    }
+
+    const dndSession = this.dnd.getSessionForThread(interaction.channelId);
+    const inProtectedDndThread = Boolean(dndSession);
+    const isDndPlayer = dndSession
+      ? this.dnd.isPlayerInThread(interaction.channelId, interaction.user.id)
+      : false;
+
+    if (interaction.commandName === 'clear' && inProtectedDndThread) {
+      await interaction.reply({
+        content: 'This thread is protected as an active DnD session. `/clear` is disabled here.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (inProtectedDndThread && !isDndPlayer) {
+      await interaction.reply({
+        content: 'Only enrolled DnD session players can use LiteClaw commands in this thread. Use `/dnd join` to join midway.',
+        ephemeral: true,
+      });
+      return;
+    }
+
     switch (interaction.commandName) {
       case 'ask':
         await this.handleAskCommand(interaction);
@@ -481,6 +622,9 @@ export class DiscordChannel {
       case 'tokens':
         await this.handleTokensCommand(interaction);
         break;
+      case 'question':
+        await this.handleQuestionCommand(interaction);
+        break;
       default:
         await interaction.reply({ content: 'Unknown command.', ephemeral: true });
     }
@@ -489,6 +633,18 @@ export class DiscordChannel {
   private async handleAskCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const message = interaction.options.getString('message', true);
     const mentionTargets = buildDiscordMentionTargetsFromInteraction(interaction);
+    const dndSession = this.dnd.getSessionForThread(interaction.channelId);
+    let dndRagContext = 'No relevant RAG context found for this session yet.';
+    if (dndSession) {
+      try {
+        dndRagContext = await this.dnd.buildNarrativeRagContext(interaction.channelId, message);
+      } catch (error: any) {
+        log.warn({ error: error.message, channelId: interaction.channelId }, 'Failed to build DnD narrative RAG context');
+      }
+    }
+    const rawMessage = dndSession
+      ? this.dnd.buildTableTalkPrompt(interaction.channelId, interaction.user.id, message, dndRagContext)
+      : message;
     const effectiveMessage = buildStructuredIncomingMessage(
       {
         platform: 'discord',
@@ -505,7 +661,7 @@ export class DiscordChannel {
         wasMentioned: false,
         mentionTargets,
       },
-      message
+      rawMessage
     );
 
     // Defer reply since processing may take a while
@@ -515,6 +671,7 @@ export class DiscordChannel {
     const request: AgentRequest = {
       message: effectiveMessage,
       sessionKey,
+      disablePlanner: Boolean(dndSession),
       channelType: 'discord',
       channelTarget: interaction.channelId,
       userIdentifier: interaction.user.tag,
@@ -527,13 +684,48 @@ export class DiscordChannel {
       },
     };
 
+    // For DnD sessions, use the dedicated GM system prompt and keep reasoning enabled
+    if (dndSession) {
+      const { readFileSync } = await import('fs');
+      const { resolve } = await import('path');
+      const gmPromptPath = resolve(process.cwd(), 'config/dnd_gm_prompt.md');
+      if (existsSync(gmPromptPath)) {
+        request.systemPromptOverride = readFileSync(gmPromptPath, 'utf-8');
+      }
+    }
+
     let fullContent = '';
     const toolUpdates: string[] = [];
+    const progress = createDiscordProgressState();
+    let lastProgressFlush = 0;
+
+    const flushProgress = async (force = false, finalContent?: string): Promise<void> => {
+      const now = Date.now();
+      if (!force && now - lastProgressFlush < 1500) return;
+      lastProgressFlush = now;
+
+      const hasPlan = progress.tasks.length > 0;
+      const payload: InteractionEditReplyOptions = {
+        embeds: hasPlan ? [buildDiscordProgressEmbed(progress, finalContent)] : [],
+      };
+
+      if (finalContent !== undefined) {
+        payload.content = finalContent || null;
+      } else if (!hasPlan) {
+        payload.content = `_${discordProgressStatusLabel(progress.status)}..._`;
+      } else {
+        payload.content = null;
+      }
+
+      await interaction.editReply(payload);
+    };
 
     try {
       this.beginRequest('thinking');
+      await flushProgress(true);
       for await (const event of this.engine.processRequest(request)) {
         this.updateStatusForEvent(event.type, event.toolName);
+        applyEventToDiscordProgress(progress, event);
 
         switch (event.type) {
           case 'content':
@@ -565,25 +757,67 @@ export class DiscordChannel {
             fullContent += `\n⚠ Error: ${event.error}`;
             break;
         }
+
+        await flushProgress();
       }
 
-      const messages = buildOutgoingMessages(
-        fullContent,
-        toolUpdates,
-        {
-          replyStyle: this.config.replyStyle ?? 'single',
-          showToolProgress: this.config.showToolProgress ?? false,
-        },
-        1900
-      );
+      const structuredNarrative = dndSession
+        ? await this.dnd.processStructuredNarrativeResponse(interaction.channelId, fullContent)
+        : { content: fullContent, shopEmbeds: [], combatEmbeds: [], combatComponents: null, actionComponents: null, rollComponents: null };
 
-      await interaction.editReply(messages[0] ?? '(No response)');
-      for (let i = 1; i < messages.length; i++) {
-        await interaction.followUp(messages[i]);
+      progress.status = progress.error ? 'error' : 'done';
+
+      if (dndSession) {
+        // For DnD: send narrative as a rich embed, clear progress embed
+        const narrativeEmbed = new EmbedBuilder()
+          .setColor(0x8e44ad)
+          .setDescription(structuredNarrative.content.slice(0, 4096));
+        const trackerEmbed = this.dnd.buildTurnTrackerEmbed(interaction.channelId);
+
+        await interaction.editReply({
+          content: null,
+          embeds: [
+            narrativeEmbed,
+            ...(trackerEmbed ? [trackerEmbed] : []),
+            ...structuredNarrative.shopEmbeds,
+            ...structuredNarrative.combatEmbeds,
+          ],
+          components: [
+            ...(structuredNarrative.combatComponents || []),
+            ...(structuredNarrative.actionComponents || []),
+            ...(structuredNarrative.rollComponents || []),
+          ].slice(0, 5),
+        });
+        const replyMessage = await interaction.fetchReply().catch(() => null);
+        await this.dnd.recordCanonicalSceneState({
+          threadId: interaction.channelId,
+          sessionId: dndSession.session.id,
+          source: 'narrative',
+          title: narrativeEmbed.data.title ?? null,
+          content: structuredNarrative.content,
+          messageId: (replyMessage as any)?.id ?? null,
+        });
+      } else {
+        // Non-DnD: standard text output
+        const messages = buildOutgoingMessages(
+          structuredNarrative.content,
+          toolUpdates,
+          {
+            replyStyle: this.config.replyStyle ?? 'single',
+            showToolProgress: this.config.showToolProgress ?? false,
+          },
+          1900
+        );
+        await flushProgress(true, messages[0] ?? '(No response)');
+        for (let i = 1; i < messages.length; i++) {
+          await interaction.followUp(messages[i]);
+        }
       }
     } catch (err: any) {
       log.error({ error: err.message }, 'Slash command /ask error');
-      await interaction.editReply(`⚠ Error: ${err.message}`);
+      progress.status = 'error';
+      progress.error = err.message;
+      await flushProgress(true, `⚠ Error: ${err.message}`);
     } finally {
       this.endRequest();
     }
@@ -635,26 +869,32 @@ export class DiscordChannel {
       .setTitle('🦎 LiteClaw Help')
       .setDescription('A lightweight AI agent running locally. Mention me or use slash commands.')
       .addFields(
-        { name: 'Slash Commands', value: [
-          '`/ask <message>` — Ask a question or give a task',
-          '`/status` — Show bot status and health',
-          '`/clear` — Clear conversation history',
-          '`/model` — Show current model info',
-          '`/help` — This help message',
-        ].join('\n') },
+        {
+          name: 'Slash Commands', value: [
+            '`/ask <message>` — Ask a question or give a task',
+            '`/status` — Show bot status and health',
+            '`/clear` — Clear conversation history',
+            '`/model` — Show current model info',
+            '`/help` — This help message',
+          ].join('\n')
+        },
         { name: 'Mention', value: 'You can also @mention me with your message in any channel.' },
-        { name: 'Tools', value: [
-          '📁 **File Operations** — read, write, delete, list, send files',
-          '💻 **Command Execution** — run shell commands',
-          '🔍 **Web Search** — Google Grounding + web fetch',
-          '👁️ **Vision** — attach an image and I will inspect it natively',
-        ].join('\n') },
-        { name: 'Reactions', value: [
-          '👀 Received your message',
-          '🧠 Thinking...',
-          '⚙️ Running a tool',
-          '✅ Done / ❌ Error',
-        ].join('\n') },
+        {
+          name: 'Tools', value: [
+            '📁 **File Operations** — read, write, delete, list, send files',
+            '💻 **Command Execution** — run shell commands',
+            '🔍 **Web Search** — Google Grounding + web fetch',
+            '👁️ **Vision** — attach an image and I will inspect it natively',
+          ].join('\n')
+        },
+        {
+          name: 'Reactions', value: [
+            '👀 Received your message',
+            '🧠 Thinking...',
+            '⚙️ Running a tool',
+            '✅ Done / ❌ Error',
+          ].join('\n')
+        },
       )
       .setColor(0x6c63ff);
 
@@ -670,8 +910,9 @@ export class DiscordChannel {
 
     const config = getConfig();
     const maxTokens = config.agent?.contextTokens ?? 64000;
-    const threshold = config.agent?.compaction?.softThresholdTokens ?? 48000;
-    
+    const budgetPct = (config.agent?.contextBudgetPct ?? 80) / 100;
+    const threshold = config.agent?.compaction?.softThresholdTokens ?? Math.floor(maxTokens * (budgetPct * 0.9));
+
     const currentTokens = metrics.estimatedTokens;
 
     const percentage = Math.round((currentTokens / threshold) * 100);
@@ -693,6 +934,148 @@ export class DiscordChannel {
       .setColor(0x6c63ff);
 
     await interaction.reply({ embeds: [embed] });
+  }
+
+  private async handleQuestionCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const dndDetails = this.dnd.getSessionForThread(interaction.channelId);
+    if (!dndDetails) {
+      await interaction.reply({
+        content: '`/question` is only available inside a protected DnD session thread.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!this.dnd.isPlayerInThread(interaction.channelId, interaction.user.id)) {
+      await interaction.reply({
+        content: 'Only enrolled DnD session players can ask private GM questions in this thread.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const message = interaction.options.getString('message', true);
+    const mode = interaction.options.getString('mode') === 'public' ? 'public' : 'private';
+    let ragContext = 'RAG session context is not available yet.';
+    try {
+      ragContext = await this.dnd.buildQuestionContext(interaction.channelId, message);
+    } catch (error: any) {
+      log.warn({ error: error.message, channelId: interaction.channelId }, 'Failed to build DnD RAG question context');
+    }
+
+    const mentionTargets = buildDiscordMentionTargetsFromInteraction(interaction);
+    const effectiveMessage = buildStructuredIncomingMessage(
+      {
+        platform: 'discord',
+        conversationLabel: `DnD Thread #${interaction.channel?.isTextBased() && 'name' in interaction.channel ? interaction.channel.name : interaction.channelId}`,
+        sender: {
+          id: interaction.user.id,
+          label: interaction.user.tag,
+          name: interaction.user.displayName ?? interaction.user.username,
+          username: interaction.user.username,
+        },
+        isGroupChat: true,
+        wasMentioned: false,
+        mentionTargets,
+      },
+      buildDndQuestionPrompt(dndDetails, interaction.user.id, message, mode, ragContext),
+    );
+
+    await interaction.deferReply({ ephemeral: mode === 'private' });
+
+    const request: AgentRequest = {
+      message: effectiveMessage,
+      sessionKey: `discord:dnd-question:${dndDetails.session.id}:${interaction.user.id}:${mode}`,
+      disablePlanner: true,
+      disableReasoning: true,
+      channelType: 'discord',
+      channelTarget: interaction.channelId,
+      userIdentifier: `${interaction.user.tag} [dnd-question:${mode}]`,
+      workingDir: this.config.workspace || getConfig().agent?.workspace || getStateDir(),
+    };
+
+    let fullContent = '';
+    const toolUpdates: string[] = [];
+    const progress = createDiscordProgressState();
+    let lastProgressFlush = 0;
+
+    const flushProgress = async (force = false, finalContent?: string): Promise<void> => {
+      const now = Date.now();
+      if (!force && now - lastProgressFlush < 1500) return;
+      lastProgressFlush = now;
+
+      const hasPlan = progress.tasks.length > 0;
+      const payload: InteractionEditReplyOptions = {
+        embeds: hasPlan ? [buildDiscordProgressEmbed(progress, finalContent)] : [],
+      };
+
+      if (finalContent !== undefined) {
+        payload.content = finalContent || null;
+      } else if (!hasPlan) {
+        payload.content = `_${discordProgressStatusLabel(progress.status)}..._`;
+      } else {
+        payload.content = null;
+      }
+
+      await interaction.editReply(payload);
+    };
+
+    try {
+      this.beginRequest('thinking');
+      await flushProgress(true);
+      for await (const event of this.engine.processRequest(request)) {
+        this.updateStatusForEvent(event.type, event.toolName);
+        applyEventToDiscordProgress(progress, event);
+
+        switch (event.type) {
+          case 'content':
+            fullContent += event.content ?? '';
+            break;
+          case 'plan':
+            toolUpdates.push(`Planned ${event.plan?.tasks?.length ?? 0} tasks`);
+            break;
+          case 'task_update':
+            if (event.taskStatus === 'in_progress') {
+              toolUpdates.push(`Working on ${event.taskTitle}`);
+            }
+            break;
+          case 'tool_start':
+            toolUpdates.push(`Running \`${event.toolName}\`...`);
+            break;
+          case 'tool_result':
+            toolUpdates.push(`${event.toolResult?.success ? 'Finished' : 'Failed'} \`${event.toolName}\``);
+            break;
+          case 'error':
+            fullContent += `\nError: ${event.error}`;
+            break;
+        }
+
+        await flushProgress();
+      }
+
+      const messages = buildOutgoingMessages(
+        fullContent,
+        toolUpdates,
+        {
+          replyStyle: 'single',
+          showToolProgress: false,
+        },
+        1900,
+      );
+
+      progress.status = progress.error ? 'error' : 'done';
+      await flushProgress(true, messages[0] ?? '(No response)');
+      for (let i = 1; i < messages.length; i++) {
+        await interaction.followUp({ content: messages[i], ephemeral: mode === 'private' });
+      }
+    } catch (err: any) {
+      log.error({ error: err.message }, 'Slash command /question error');
+      progress.status = 'error';
+      progress.error = err.message;
+      await flushProgress(true, `Error: ${err.message}`);
+    } finally {
+      this.endRequest();
+    }
   }
 
   private async handleModelCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -743,11 +1126,40 @@ export class DiscordChannel {
     // Ignore other bots unless configured
     if (message.author.bot && !this.config.allowBots) return;
 
-    // Check if bot is mentioned or it's a DM
+    const dndSession = this.dnd.getSessionForThread(message.channel.id);
+    const inProtectedDndThread = Boolean(dndSession);
+    const isDndPlayer = dndSession
+      ? this.dnd.isPlayerInThread(message.channel.id, message.author.id)
+      : false;
+
+    if (inProtectedDndThread && !isDndPlayer) {
+      await message.reply({
+        content: 'This DnD thread is reserved for enrolled players. Use `/dnd join` if you want to join the campaign midway.',
+        allowedMentions: { repliedUser: false },
+      });
+      return;
+    }
+
+    const replyMeta = await this.getReplyMetadata(message);
+
+    // Check if bot is mentioned, directly replied to, or it's a DM
     const isMentioned = message.mentions.has(this.client.user!);
     const isDM = !message.guild;
+    const isReplyToBot = replyMeta.authorId === this.client.user?.id;
+    const shouldTreatAsDndTableTalk = inProtectedDndThread && isDndPlayer && (isMentioned || isReplyToBot);
 
-    if (!isMentioned && !isDM) return;
+    if (shouldTreatAsDndTableTalk) {
+      const gate = this.dnd.validateNarrativeTurn(message.channel.id, message.author.id);
+      if (!gate.ok) {
+        await message.reply({
+          content: gate.reason,
+          allowedMentions: { repliedUser: false },
+        });
+        return;
+      }
+    }
+
+    if (!isMentioned && !isDM && !shouldTreatAsDndTableTalk) return;
 
     // Replace Discord mentions with readable string formats (@username) before sending to LLM.
     // Instead of stripping `<@123>`, we map it to `@username`.
@@ -763,13 +1175,25 @@ export class DiscordChannel {
 
     // Strip out the bot's own mention
     if (this.client.user) {
-       const selfPattern = new RegExp(`<@!?${this.client.user.id}>`, 'g');
-       content = content.replace(selfPattern, '').trim();
+      const selfPattern = new RegExp(`<@!?${this.client.user.id}>`, 'g');
+      content = content.replace(selfPattern, '').trim();
     }
 
     if (!content && message.attachments.size === 0) return;
 
-    const replyContext = await this.buildReplyContext(message);
+    const replyContext = replyMeta.context;
+    let dndRagContext = 'No relevant RAG context found for this session yet.';
+    if (shouldTreatAsDndTableTalk) {
+      try {
+        dndRagContext = await this.dnd.buildNarrativeRagContext(message.channel.id, content || '(image attached)');
+      } catch (error: any) {
+        log.warn({ error: error.message, channelId: message.channel.id }, 'Failed to build DnD narrative RAG context');
+      }
+    }
+    const effectivePrompt = shouldTreatAsDndTableTalk
+      ? this.dnd.buildTableTalkPrompt(message.channel.id, message.author.id, content || '(image attached)', dndRagContext)
+      : (content || '(image attached)');
+
     const effectiveMessage = buildStructuredIncomingMessage(
       {
         platform: 'discord',
@@ -784,74 +1208,154 @@ export class DiscordChannel {
           tag: message.author.tag,
         },
         isGroupChat: Boolean(message.guildId),
-        wasMentioned: isMentioned,
+        wasMentioned: isMentioned || shouldTreatAsDndTableTalk,
         mentionTargets,
         replyContext,
       },
-      content || '(image attached)'
+      effectivePrompt
     );
 
-    log.info({
-      user: message.author.tag,
-      channel: message.channel.id,
-      isDM,
-      contentLength: content.length,
-    }, 'Discord message passed filters');
+    const images = await this.collectMessageImages(message);
 
-    const sessionKey = `discord:${message.channel.id}`;
+    await this.processAgentTurn({
+      channel: message.channel as any,
+      author: message.author,
+      replyTo: message,
+      effectiveMessage,
+      mentionTargets,
+      images: images.length > 0 ? images : undefined,
+      shouldTreatAsDndTableTalk,
+    });
+  }
+
+  /**
+   * Core logic for processing a single agent turn and sending the response.
+   * Shared by handleMessage and handleButtonInteraction.
+   */
+  private async processAgentTurn(params: {
+    channel: TextChannel | ThreadChannel | DMChannel;
+    author: User;
+    replyTo: Message | null;
+    effectiveMessage: string;
+    mentionTargets: MentionTarget[];
+    images?: string[];
+    shouldTreatAsDndTableTalk: boolean;
+  }): Promise<void> {
+    const { channel, author, replyTo, effectiveMessage, mentionTargets, images, shouldTreatAsDndTableTalk } = params;
+    const sessionKey = `discord:${channel.id}`;
+
+    log.info({
+      user: author.tag,
+      channel: channel.id,
+      contentLength: effectiveMessage.length,
+    }, 'Processing Discord agent turn');
 
     let fullContent = '';
     const toolUpdates: string[] = [];
     let hasThought = false;
     const addedReactions = new Set<string>();
+    const progress = createDiscordProgressState();
+    let progressMessage: Message | null = null;
+    let lastProgressFlush = 0;
+
+    const flushProgress = async (force = false, finalContent?: string): Promise<void> => {
+      if (!progressMessage) return;
+      const now = Date.now();
+      if (!force && now - lastProgressFlush < 1500) return;
+      lastProgressFlush = now;
+
+      const hasPlan = progress.tasks.length > 0;
+      const payload: any = {
+        embeds: hasPlan ? [buildDiscordProgressEmbed(progress, finalContent)] : [],
+      };
+
+      if (finalContent !== undefined) {
+        payload.content = finalContent || null;
+      } else if (!hasPlan) {
+        payload.content = `_${discordProgressStatusLabel(progress.status)}..._`;
+      } else {
+        payload.content = null;
+      }
+
+      await progressMessage.edit(payload);
+    };
 
     const typingInterval = setInterval(async () => {
       try {
-        await (message.channel as any).sendTyping();
+        await (channel as any).sendTyping();
       } catch { /* ignore */ }
     }, 7_000);
 
     try {
       // ── Step 1: React with 👀 (received) ──
-      await this.react(message, REACTIONS.RECEIVED);
+      if (replyTo) await this.react(replyTo, REACTIONS.RECEIVED);
       this.beginRequest('thinking');
 
-      const images = await this.collectMessageImages(message);
+      const progressPayload = {
+        content: `_${discordProgressStatusLabel(progress.status)}..._`,
+        allowedMentions: { repliedUser: false },
+      };
+
+      progressMessage = replyTo
+        ? await replyTo.reply(progressPayload)
+        : await (channel as any).send(progressPayload);
 
       // ── Build Request ──
       const request: AgentRequest = {
         message: effectiveMessage,
-        images: images.length > 0 ? images : undefined,
+        images,
         sessionKey,
+        disablePlanner: shouldTreatAsDndTableTalk,
         channelType: 'discord',
-        channelTarget: message.channel.id,
-        userIdentifier: message.author.tag,
+        channelTarget: channel.id,
+        userIdentifier: author.tag,
         workingDir: this.config.workspace || getConfig().agent?.workspace || getStateDir(),
         sendFile: async (filePath: string, fileName?: string) => {
-          await this.sendFile(message, filePath, fileName);
+          if (replyTo) {
+            await this.sendFile(replyTo, filePath, fileName);
+          } else {
+            // Fallback for button interactions if we don't have a direct replyTo message
+            const name = fileName ?? basename(filePath);
+            const attachment = new AttachmentBuilder(filePath, { name });
+            await (channel as any).send({
+              content: `📎 Sending file: **${name}**`,
+              files: [attachment],
+            });
+          }
         },
         sendInteractiveChoice: async (choiceRequest) => {
           return this.sendInteractiveChoice({
-            channelId: message.channel.id,
-            replyTo: async (payload) => message.reply(payload),
+            channelId: channel.id,
+            replyTo: async (payload) => replyTo ? replyTo.reply(payload) : (channel as any).send(payload),
           }, choiceRequest);
         },
       };
 
+      // For DnD sessions, use the dedicated GM system prompt and keep reasoning enabled
+      if (shouldTreatAsDndTableTalk) {
+        const { readFileSync } = await import('fs');
+        const { resolve } = await import('path');
+        const gmPromptPath = resolve(process.cwd(), 'config/dnd_gm_prompt.md');
+        if (existsSync(gmPromptPath)) {
+          request.systemPromptOverride = readFileSync(gmPromptPath, 'utf-8');
+        }
+      }
+
       for await (const event of this.engine.processRequest(request)) {
         this.updateStatusForEvent(event.type, event.toolName);
+        applyEventToDiscordProgress(progress, event);
+        await flushProgress();
 
-        // Remove the looking emoji once the agent starts doing ANY work (thinking, content, tools)
-        if (['thinking', 'content', 'tool_start', 'plan', 'task_update'].includes(event.type) && addedReactions.has(REACTIONS.RECEIVED)) {
-          await this.unreact(message, REACTIONS.RECEIVED);
+        // Remove the looking emoji once the agent starts doing ANY work
+        if (['thinking', 'content', 'tool_start', 'plan', 'task_update'].includes(event.type) && addedReactions.has(REACTIONS.RECEIVED) && replyTo) {
+          await this.unreact(replyTo, REACTIONS.RECEIVED);
           addedReactions.delete(REACTIONS.RECEIVED);
         }
 
         switch (event.type) {
           case 'thinking':
-            // React with 🧠 on first thinking chunk
-            if (!hasThought) {
-              await this.react(message, REACTIONS.THINKING);
+            if (!hasThought && replyTo) {
+              await this.react(replyTo, REACTIONS.THINKING);
               addedReactions.add(REACTIONS.THINKING);
               hasThought = true;
             }
@@ -859,9 +1363,8 @@ export class DiscordChannel {
 
           case 'content':
             fullContent += event.content ?? '';
-            // Remove thinking reaction once content starts flowing
-            if (addedReactions.has(REACTIONS.THINKING)) {
-              await this.unreact(message, REACTIONS.THINKING);
+            if (addedReactions.has(REACTIONS.THINKING) && replyTo) {
+              await this.unreact(replyTo, REACTIONS.THINKING);
               addedReactions.delete(REACTIONS.THINKING);
             }
             break;
@@ -871,9 +1374,7 @@ export class DiscordChannel {
             break;
 
           case 'task_update': {
-            const prefix = event.taskIndex && event.taskTotal
-              ? `[${event.taskIndex}/${event.taskTotal}] `
-              : '';
+            const prefix = event.taskIndex && event.taskTotal ? `[${event.taskIndex}/${event.taskTotal}] ` : '';
             if (event.taskStatus === 'in_progress') {
               toolUpdates.push(`→ ${prefix}${event.taskTitle}`);
             } else if (event.taskStatus) {
@@ -884,10 +1385,9 @@ export class DiscordChannel {
           }
 
           case 'tool_start':
-            // React with tool-specific emoji
             const toolEmoji = this.getToolReaction(event.toolName ?? '');
-            if (!addedReactions.has(toolEmoji)) {
-              await this.react(message, toolEmoji);
+            if (!addedReactions.has(toolEmoji) && replyTo) {
+              await this.react(replyTo, toolEmoji);
               addedReactions.add(toolEmoji);
             }
             toolUpdates.push(`⚙ Running \`${event.toolName}\`...`);
@@ -896,10 +1396,9 @@ export class DiscordChannel {
           case 'tool_result': {
             const icon = event.toolResult?.success ? '✓' : '✗';
             toolUpdates.push(`${icon} \`${event.toolName}\` ${event.toolResult?.success ? 'completed' : 'failed'}`);
-            // Clean up tool-specific reaction
             const doneToolEmoji = this.getToolReaction(event.toolName ?? '');
-            if (addedReactions.has(doneToolEmoji)) {
-              await this.unreact(message, doneToolEmoji);
+            if (addedReactions.has(doneToolEmoji) && replyTo) {
+              await this.unreact(replyTo, doneToolEmoji);
               addedReactions.delete(doneToolEmoji);
             }
             break;
@@ -911,61 +1410,191 @@ export class DiscordChannel {
         }
       }
 
-      // ── Final: remove intermediate reactions, add ✅ ──
+      await flushProgress(true);
       for (const emoji of addedReactions) {
-        await this.unreact(message, emoji);
+        if (replyTo) await this.unreact(replyTo, emoji);
       }
-      await this.react(message, REACTIONS.DONE);
+      if (replyTo) await this.react(replyTo, REACTIONS.DONE);
 
-      // Timeout to remove the check emoji after 10s
       setTimeout(async () => {
-        await this.unreact(message, REACTIONS.DONE);
+        if (replyTo) await this.unreact(replyTo, REACTIONS.DONE);
       }, 10_000);
 
       // Format and send response
-      await this.sendResponse(message, fullContent, toolUpdates, mentionTargets);
+      const structuredNarrative = shouldTreatAsDndTableTalk
+        ? await this.dnd.processStructuredNarrativeResponse(channel.id, fullContent)
+        : { content: fullContent, shopEmbeds: [], combatEmbeds: [], combatComponents: null, actionComponents: null, rollComponents: null };
+
+      progress.status = progress.error ? 'error' : 'done';
+
+      if (shouldTreatAsDndTableTalk) {
+        const dndDetails = this.dnd.getSessionForThread(channel.id);
+        this.dnd.markNarrativeTurnSpent(channel.id, author.id);
+
+        // For DnD narrative responses, send as a rich embed for best markdown rendering
+        const spentNotice = this.dnd.buildNarrativeTurnSpentNotice(channel.id, author.id);
+        const decoratedContent = spentNotice && !(structuredNarrative.combatEmbeds?.length > 0)
+          ? `${structuredNarrative.content}\n\n*${spentNotice}*`
+          : structuredNarrative.content;
+        const resolvedContent = resolveDiscordMentions(decoratedContent, mentionTargets);
+        const narrativeEmbed = new EmbedBuilder()
+          .setColor(0x8e44ad)
+          .setDescription(resolvedContent.content.slice(0, 4096));
+        const trackerEmbed = this.dnd.buildTurnTrackerEmbed(channel.id);
+        const actionComponents = spentNotice && !(structuredNarrative.combatEmbeds?.length > 0)
+          ? []
+          : (structuredNarrative.actionComponents || []);
+
+        if (progressMessage) {
+          const components = [
+            ...(structuredNarrative.combatComponents || []),
+            ...actionComponents,
+            ...(structuredNarrative.rollComponents || []),
+          ].slice(0, 5); // Discord limit
+
+          await progressMessage.edit({
+            content: null,
+            embeds: [
+              ...(progress.tasks.length > 0 ? [buildDiscordProgressEmbed(progress, resolvedContent.content)] : []),
+              narrativeEmbed,
+              ...(trackerEmbed ? [trackerEmbed] : []),
+              ...structuredNarrative.shopEmbeds,
+              ...structuredNarrative.combatEmbeds,
+            ],
+            components,
+            allowedMentions: {
+              users: resolvedContent.userIds,
+              repliedUser: false,
+            },
+          });
+          if (dndDetails) {
+            await this.dnd.recordCanonicalSceneState({
+              threadId: channel.id,
+              sessionId: dndDetails.session.id,
+              source: 'narrative',
+              title: narrativeEmbed.data.title ?? null,
+              content: structuredNarrative.content,
+              messageId: progressMessage.id,
+            });
+          }
+        } else {
+          const components = [
+            ...(structuredNarrative.combatComponents || []),
+            ...actionComponents,
+            ...(structuredNarrative.rollComponents || []),
+          ].slice(0, 5);
+
+          const sentMessage = await (channel as any).send({
+            embeds: [
+              narrativeEmbed,
+              ...(trackerEmbed ? [trackerEmbed] : []),
+              ...structuredNarrative.shopEmbeds,
+              ...structuredNarrative.combatEmbeds,
+            ],
+            components,
+            allowedMentions: { users: resolvedContent.userIds },
+          });
+          if (dndDetails) {
+            await this.dnd.recordCanonicalSceneState({
+              threadId: channel.id,
+              sessionId: dndDetails.session.id,
+              source: 'narrative',
+              title: narrativeEmbed.data.title ?? null,
+              content: structuredNarrative.content,
+              messageId: sentMessage?.id ?? null,
+            });
+          }
+        }
+      } else {
+        // Non-DnD responses: standard text output
+        const messages = buildOutgoingMessages(
+          structuredNarrative.content,
+          toolUpdates,
+          {
+            replyStyle: this.config.replyStyle ?? 'single',
+            showToolProgress: this.config.showToolProgress ?? false,
+          },
+          1900
+        );
+
+        const first = messages[0] ?? '(No response)';
+        const resolvedFirst = resolveDiscordMentions(first, mentionTargets);
+
+        if (progressMessage) {
+          await progressMessage.edit({
+            content: resolvedFirst.content,
+            embeds: progress.tasks.length > 0 ? [buildDiscordProgressEmbed(progress, resolvedFirst.content)] : [],
+            allowedMentions: {
+              users: resolvedFirst.userIds,
+              repliedUser: false,
+            },
+          });
+        }
+
+        for (let i = 1; i < messages.length; i++) {
+          const resolved = resolveDiscordMentions(messages[i], mentionTargets);
+          await (channel as any).send({
+            content: resolved.content,
+            allowedMentions: {
+              users: resolved.userIds,
+            },
+          });
+        }
+      }
 
       log.info({
-        user: message.author.tag,
+        user: author.tag,
         responseLength: fullContent.length,
         tools: toolUpdates.length,
       }, 'Discord response sent');
 
     } catch (err: any) {
-      log.error({ error: err.message }, 'Discord message handling error');
-
-      // Clean up and add error reaction
+      log.error({ error: err.message }, 'Discord agent turn error');
       for (const emoji of addedReactions) {
-        await this.unreact(message, emoji);
+        if (replyTo) await this.unreact(replyTo, emoji);
       }
-      await this.react(message, REACTIONS.ERROR);
-      await message.reply(`⚠ Error: ${err.message}`);
+      if (replyTo) {
+        await this.react(replyTo, REACTIONS.ERROR);
+        await replyTo.reply(`⚠ Error: ${err.message}`);
+      } else {
+        await (channel as any).send(`⚠ Error: ${err.message}`);
+      }
     } finally {
       clearInterval(typingInterval);
       this.endRequest();
     }
   }
 
-  private async buildReplyContext(message: Message): Promise<string | null> {
-    if (!message.reference?.messageId) return null;
+  private async getReplyMetadata(message: Message): Promise<{ context: string | null; authorId: string | null }> {
+    if (!message.reference?.messageId) {
+      return { context: null, authorId: null };
+    }
 
     try {
       const referenced = typeof message.fetchReference === 'function'
         ? await message.fetchReference()
         : null;
 
-      if (!referenced) return null;
+      if (!referenced) return { context: null, authorId: null };
 
       const referencedContent = referenced.content?.trim() || summarizeAttachments(referenced.attachments);
-      if (!referencedContent) return null;
+      if (!referencedContent) {
+        return {
+          context: null,
+          authorId: referenced.author?.id ?? null,
+        };
+      }
 
-      return formatReplyContext(
-        referenced.author?.tag || referenced.author?.username || 'Unknown user',
-        referencedContent
-      );
+      return {
+        context: formatReplyContext(
+          referenced.author?.tag || referenced.author?.username || 'Unknown user',
+          referencedContent
+        ),
+        authorId: referenced.author?.id ?? null,
+      };
     } catch (err: any) {
       log.debug({ error: err.message, messageId: message.id }, 'Failed to fetch replied-to Discord message');
-      return null;
+      return { context: null, authorId: null };
     }
   }
 
@@ -1093,6 +1722,16 @@ export class DiscordChannel {
   private async handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {
     const customId = interaction.customId;
 
+    const dndResult = await this.dnd.handleButton(interaction);
+    if (dndResult === true) {
+      return;
+    }
+    if (typeof dndResult === 'string') {
+      // It's a DnD action choice OR a roll result!
+      await this.processDndActionChoice(interaction, dndResult);
+      return;
+    }
+
     if (customId.startsWith('liteclaw_confirm_')) {
       const confirmId = customId.replace('liteclaw_confirm_', '');
       this.confirmations.resolveConfirmation(confirmId, true);
@@ -1109,6 +1748,89 @@ export class DiscordChannel {
       });
     } else if (customId.startsWith('liteclaw_choice_')) {
       await this.handleInteractiveChoice(interaction);
+    }
+  }
+
+  /**
+   * Specifically handles action choices from DnD buttons by feeding them back into the engine.
+   */
+  private async processDndActionChoice(interaction: ChatInputCommandInteraction | ButtonInteraction, actionText: string): Promise<void> {
+    const channel = interaction.channel;
+    if (!channel || !channel.isTextBased()) return;
+
+    if (this.dnd.shouldQueueNarrativeActions(channel.id)) {
+      const queued = this.dnd.queueNarrativeAction(channel.id, interaction.user.id, actionText);
+      await (channel as any).send({
+        content: `${interaction.user} **->** ${actionText}`,
+      });
+      if (!queued.shouldResolve || !queued.combinedActionText) {
+        await (channel as any).send({
+          content: queued.waitingOn.length > 0
+            ? `Waiting on: **${queued.waitingOn.join(', ')}** before resolving the shared scene.`
+            : 'Queued action recorded.',
+        });
+        return;
+      }
+      actionText = queued.combinedActionText;
+    }
+
+    // Post the action as a visible message so the table sees what was chosen
+    await (channel as any).send({
+      content: `${interaction.user} **->** ${actionText}`,
+    });
+
+    // Build the engine request
+    const mentionTargets: MentionTarget[] = [
+      createDiscordMentionTarget(
+        interaction.user.id,
+        (interaction.member as any)?.displayName || interaction.user.globalName || interaction.user.username,
+        interaction.user.username,
+        interaction.user.tag
+      )
+    ];
+
+    const dndRagContext = await this.dnd.buildNarrativeRagContext(channel.id, actionText);
+    const effectivePrompt = this.dnd.buildTableTalkPrompt(channel.id, interaction.user.id, actionText, dndRagContext);
+
+    const effectiveMessage = buildStructuredIncomingMessage(
+      {
+        platform: 'discord',
+        conversationLabel: interaction.guild
+          ? `Guild #${'name' in channel ? (channel as any).name : channel.id}`
+          : 'Discord DM',
+        sender: {
+          id: interaction.user.id,
+          label: interaction.user.tag,
+          name: (interaction.member as any)?.displayName || interaction.user.globalName || interaction.user.username,
+          username: interaction.user.username,
+          tag: interaction.user.tag,
+        },
+        isGroupChat: Boolean(interaction.guildId),
+        wasMentioned: true,
+        mentionTargets,
+      },
+      effectivePrompt
+    );
+
+    await this.processAgentTurn({
+      channel: channel as any,
+      author: interaction.user,
+      replyTo: null, // Buttons don't have a specific message to reply to for reactions
+      effectiveMessage,
+      mentionTargets,
+      shouldTreatAsDndTableTalk: true,
+    });
+  }
+
+  private async handleSelectMenuInteraction(interaction: AnySelectMenuInteraction): Promise<void> {
+    if (await this.dnd.handleSelectMenu(interaction)) {
+      return;
+    }
+  }
+
+  private async handleModalInteraction(interaction: ModalSubmitInteraction): Promise<void> {
+    if (await this.dnd.handleModalSubmit(interaction)) {
+      return;
     }
   }
 
@@ -1160,11 +1882,32 @@ export class DiscordChannel {
       throw new Error('Discord token not configured. Set DISCORD_TOKEN in .env or config.yaml');
     }
 
-    await this.client.login(token);
+    await ensureDiscordGatewayReachable();
+
+    let retries = 0;
+    const maxRetries = 5;
+    while (retries < maxRetries) {
+      try {
+        await this.client.login(token);
+        return;
+      } catch (err: any) {
+        retries++;
+        const delay = Math.min(1000 * Math.pow(2, retries), 30000);
+        log.warn({ error: err.message, retry: retries, nextRetryDelay: delay }, 'Discord login failed, retrying...');
+        if (isDiscordDnsFailure(err)) {
+          throw new Error(`Discord gateway DNS lookup failed: ${err.message}`);
+        }
+        if (retries >= maxRetries) {
+          throw new Error(`Failed to login to Discord after ${maxRetries} attempts: ${err.message}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
   }
 
   stop(): void {
     if (this.statusTimer) clearInterval(this.statusTimer);
+    void this.dnd.shutdown();
     this.client.destroy();
   }
 
@@ -1261,23 +2004,50 @@ export class DiscordChannel {
 
 // ─── Utilities ───────────────────────────────────────────────────────
 
-function splitMessage(text: string, maxLen: number): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
 
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt < maxLen / 2) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
-  }
-
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
-}
 
 function buildEffectiveIncomingMessage(replyContext: string | null, content: string): string {
   return replyContext ? `${replyContext}\n\nUser reply: ${content}` : content;
+}
+
+function buildDndQuestionPrompt(
+  details: DndSessionDetails,
+  userId: string,
+  question: string,
+  mode: 'private' | 'public',
+  ragContext: string,
+): string {
+  const asker = details.players.find(player => player.userId === userId);
+  const activePlayer = details.players.find(player => player.userId === details.session.activePlayerUserId);
+  const playerSummary = details.players
+    .map(player => `${player.characterName} [${player.status}]${player.userId === details.session.hostUserId ? ' host' : ''}`)
+    .join(', ');
+  const voteSummary = details.vote
+    ? `${details.vote.vote.question} | status=${details.vote.vote.status}`
+    : 'none';
+
+  return [
+    `This is a ${mode} out-of-band player question about an ongoing DnD session.`,
+    'Answer as the session GM, but do not advance turns, do not treat this as an in-world action, and do not change the party decision state.',
+    mode === 'public'
+      ? 'The answer will be visible to the table, so phrase it as GM clarification for the group.'
+      : 'The answer will only be visible to the asking player, so you can be concise and direct.',
+    'Keep the answer grounded in the current session state. If something is unknown, say so clearly.',
+    '',
+    `Session: ${details.session.title} (${details.session.id})`,
+    `Phase: ${details.session.phase}`,
+    `Tone: ${details.session.tone ?? 'not set'}`,
+    `Round/Turn: ${details.session.roundNumber}/${details.session.turnNumber}`,
+    `Active player: ${activePlayer?.characterName ?? 'none'}`,
+    `Asking player: ${asker?.characterName ?? 'unknown player'}`,
+    `Players: ${playerSummary}`,
+    `Open vote: ${voteSummary}`,
+    '',
+    'Relevant retrieved context:',
+    ragContext,
+    '',
+    `Question: ${question}`,
+  ].join('\n');
 }
 
 function buildStructuredIncomingMessage(
@@ -1463,13 +2233,261 @@ function buildOutgoingMessages(
   return splitMessage(fullText, maxLen);
 }
 
-function sanitizeChannelContent(text: string): string {
-  return text
-    .replace(/<tool_result>\s*[\s\S]*?<\/tool_result>/gi, '')
-    .replace(/<\/?tool_result>/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+function createDiscordProgressState(): DiscordProgressState {
+  return {
+    startedAt: Date.now(),
+    status: 'starting',
+    planSummary: '',
+    tasks: [],
+    recentTools: [],
+  };
 }
+
+function applyEventToDiscordProgress(progress: DiscordProgressState, event: AgentStreamEvent): void {
+  switch (event.type) {
+    case 'thinking':
+      if (progress.status === 'starting') progress.status = 'thinking';
+      break;
+    case 'plan':
+      progress.status = 'planning';
+      progress.planSummary = event.plan?.summary ?? progress.planSummary;
+      progress.tasks = (event.plan?.tasks ?? []).map((task, index) => ({
+        id: task.id || `task_${index + 1}`,
+        title: task.title || `Task ${index + 1}`,
+        status: task.status || 'pending',
+        summary: task.summary,
+      }));
+      break;
+    case 'task_update': {
+      progress.status = event.taskStatus === 'in_progress' ? 'working' : progress.status;
+      if (event.plan?.summary) progress.planSummary = event.plan.summary;
+
+      const taskId = event.taskId || event.taskTitle || `task_${event.taskIndex ?? progress.tasks.length + 1}`;
+      const title = event.taskTitle || 'Task';
+      const existing = progress.tasks.find((task) => task.id === taskId);
+      if (existing) {
+        existing.title = title;
+        existing.status = event.taskStatus || existing.status;
+        existing.summary = event.taskSummary || existing.summary;
+      } else {
+        progress.tasks.push({
+          id: taskId,
+          title,
+          status: event.taskStatus || 'pending',
+          summary: event.taskSummary,
+        });
+      }
+
+      if (event.taskIndex && event.taskTotal) {
+        progress.currentTaskLabel = `[${event.taskIndex}/${event.taskTotal}] ${title}`;
+      } else {
+        progress.currentTaskLabel = title;
+      }
+      break;
+    }
+    case 'tool_start':
+      progress.status = 'working';
+      pushRecentToolUpdate(progress, `Running ${event.toolName ?? 'tool'}...`);
+      break;
+    case 'tool_result':
+      pushRecentToolUpdate(
+        progress,
+        `${event.toolResult?.success ? 'Done' : 'Failed'} ${event.toolName ?? 'tool'}`
+      );
+      break;
+    case 'error':
+      progress.status = 'error';
+      progress.error = event.error;
+      break;
+    case 'done':
+      if (progress.status !== 'error') progress.status = 'done';
+      break;
+  }
+}
+
+function pushRecentToolUpdate(progress: DiscordProgressState, text: string): void {
+  progress.recentTools.push(text);
+  if (progress.recentTools.length > 5) {
+    progress.recentTools = progress.recentTools.slice(-5);
+  }
+}
+
+function buildDiscordProgressEmbed(progress: DiscordProgressState, finalContent?: string): EmbedBuilder {
+  const elapsedMs = Date.now() - progress.startedAt;
+  const completed = progress.tasks.filter((task) => task.status === 'completed').length;
+  const failed = progress.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
+  const active = progress.tasks.filter((task) => task.status === 'in_progress').length;
+  const total = progress.tasks.length;
+  const pending = Math.max(0, total - completed - failed - active);
+
+  const embed = new EmbedBuilder()
+    .setTitle(embedTitleForProgress(progress))
+    .setColor(progress.status === 'error' ? 0xff5f6d : progress.status === 'done' ? 0x7eff37 : 0xffa928)
+    .setDescription(buildOverviewBlock(progress, elapsedMs, total, completed, active, pending, failed))
+    .setFooter({ text: footerForProgress(progress) })
+    .setTimestamp();
+
+  if (progress.planSummary) {
+    embed.addFields({
+      name: '\u{1F5FA} Plan',
+      value: truncateDiscordEmbedField(progress.planSummary, 1024),
+      inline: false,
+    });
+  }
+
+  if (progress.tasks.length > 0) {
+    const taskLines = progress.tasks
+      .slice(0, 8)
+      .map((task, index) => `${index + 1}. ${discordTaskStatusIcon(task.status)} ${task.title}${task.summary ? ` - ${task.summary}` : ''}`);
+    embed.addFields({
+      name: '\u{1F4CB} Tasks',
+      value: truncateDiscordEmbedField(taskLines.join('\n'), 1024),
+      inline: false,
+    });
+    embed.addFields({
+      name: '\u{1F4D8} Legend',
+      value: `${discordTaskStatusIcon('completed')} completed\n${discordTaskStatusIcon('in_progress')} active\n${discordTaskStatusIcon('pending')} pending\n${discordTaskStatusIcon('blocked')} blocked\n${discordTaskStatusIcon('failed')} failed`,
+      inline: false,
+    });
+  }
+
+  if (progress.currentTaskLabel || progress.recentTools.length > 0 || progress.error) {
+    const activityLines = [
+      progress.currentTaskLabel ? `Current focus\n${progress.currentTaskLabel}` : '',
+      ...progress.recentTools.map((line) => `- ${line}`),
+      progress.error ? `Error: ${progress.error}` : '',
+    ].filter(Boolean);
+
+    if (activityLines.length > 0) {
+      embed.addFields({
+        name: '\u{2699} Activity',
+        value: truncateDiscordEmbedField(activityLines.join('\n'), 1024),
+        inline: false,
+      });
+    }
+  }
+
+  const finalState = buildFinalStateBlock(progress, finalContent);
+  if (finalState) {
+    embed.addFields({
+      name: '\u{1F3C1} Outcome',
+      value: truncateDiscordEmbedField(finalState, 1024),
+      inline: false,
+    });
+  }
+
+  return embed;
+}
+
+function discordProgressStatusLabel(status: DiscordProgressState['status']): string {
+  switch (status) {
+    case 'thinking': return '\u{1F9E0} Thinking';
+    case 'planning': return '\u{1F5FA} Planning';
+    case 'working': return '\u{2699} Working';
+    case 'done': return '\u{2705} Complete';
+    case 'error': return '\u{274C} Error';
+    case 'starting':
+    default:
+      return '\u{1F440} Starting';
+  }
+}
+
+function discordTaskStatusIcon(status: string): string {
+  switch (status) {
+    case 'completed': return '\u{2705}';
+    case 'in_progress': return '\u{1F7E1}';
+    case 'failed': return '\u{274C}';
+    case 'blocked': return '\u{26A0}';
+    default: return '\u{23F3}';
+  }
+}
+
+function formatDurationShort(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function truncateDiscordEmbedField(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - 1)).trimEnd()}...`;
+}
+
+function embedTitleForProgress(progress: DiscordProgressState): string {
+  switch (progress.status) {
+    case 'planning':
+      return 'LiteClaw \u00B7 Task Planner';
+    case 'working':
+      return 'LiteClaw \u00B7 In Progress';
+    case 'done':
+      return 'LiteClaw \u00B7 Completed';
+    case 'error':
+      return 'LiteClaw \u00B7 Needs Attention';
+    case 'thinking':
+      return 'LiteClaw \u00B7 Thinking';
+    case 'starting':
+    default:
+      return 'LiteClaw \u00B7 Starting';
+  }
+}
+
+function buildOverviewBlock(
+  progress: DiscordProgressState,
+  elapsedMs: number,
+  total: number,
+  completed: number,
+  active: number,
+  pending: number,
+  failed: number
+): string {
+  const lines = [
+    `\u{1F4CA} Overview`,
+    `${discordProgressStatusLabel(progress.status)}  \u2022  ${formatDurationShort(elapsedMs)}`,
+    '',
+    `${discordTaskStatusIcon('completed')} ${completed}/${total || 0} done  \u2022  ${discordTaskStatusIcon('in_progress')} ${active} active`,
+    `${discordTaskStatusIcon('pending')} ${pending} pending${failed ? `  \u2022  ${discordTaskStatusIcon('blocked')} ${failed} issue${failed === 1 ? '' : 's'}` : ''}`,
+  ];
+
+  if (progress.currentTaskLabel && progress.status !== 'done' && progress.status !== 'error') {
+    lines.push('');
+    lines.push(`Current: ${progress.currentTaskLabel}`);
+  }
+
+  return lines.join('\n');
+}
+
+function footerForProgress(progress: DiscordProgressState): string {
+  switch (progress.status) {
+    case 'done':
+      return 'Plan execution finished';
+    case 'error':
+      return 'Plan execution stopped with an error';
+    default:
+      return 'Live progress updates';
+  }
+}
+
+function buildFinalStateBlock(progress: DiscordProgressState, finalContent?: string): string | null {
+  if (progress.status !== 'done' && progress.status !== 'error') {
+    return null;
+  }
+
+  if (progress.status === 'error') {
+    return progress.error
+      ? `The task ended with an error:\n${progress.error}`
+      : 'The task ended before a final answer was produced.';
+  }
+
+  const condensed = sanitizeChannelContent(finalContent ?? '').replace(/\s+/g, ' ').trim();
+  if (!condensed) {
+    return 'Reply sent below.';
+  }
+
+  return 'Reply sent below.';
+}
+
+// sanitizeChannelContent is imported from utils.js
 
 function splitRapidMessages(text: string, maxLen: number): string[] {
   const paragraphs = text

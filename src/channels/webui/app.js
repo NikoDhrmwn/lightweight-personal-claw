@@ -4,6 +4,7 @@
   let isStreaming = false;
   let currentAssistantEl = null;
   let currentContent = "";
+  let lastThinkingChunk = "";
   let currentSessionKey = "webui:default";
   let currentFilter = "";
   let currentConfig = {};
@@ -11,9 +12,11 @@
   let sessions = [];
   let currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
   let pendingConfirmationId = null;
+  let pendingRegeneration = null;
+  let isRegenerating = false;
   let workspacePath = ".";
   let selectedWorkspaceFile = "";
-  const attachedImages = [];
+  const attachments = [];
 
   const $ = (selector) => document.querySelector(selector);
   const messagesEl = $("#messages");
@@ -66,6 +69,11 @@
     exportBtn: $("#exportBtn"),
     settingModel: $("#settingModel"),
     settingThinking: $("#settingThinking"),
+    settingTemperature: $("#settingTemperature"),
+    settingTopP: $("#settingTopP"),
+    settingTopK: $("#settingTopK"),
+    settingMaxOutputTokens: $("#settingMaxOutputTokens"),
+    llmParamsGroup: $("#llmParamsGroup"),
     settingWorkspace: $("#settingWorkspace"),
     settingMaxTurns: $("#settingMaxTurns"),
     settingPlannerMode: $("#settingPlannerMode"),
@@ -290,7 +298,14 @@
       history.forEach((msg) => {
         if (msg.role === "user") {
           const cleaned = cleanMessageContent(msg.content || "");
-          addUserMessage(cleaned.text, [], false, cleaned.sender);
+          let attachmentsList = [];
+          if (msg.metadata) {
+            try {
+              const meta = JSON.parse(msg.metadata);
+              attachmentsList = meta.attachments || [];
+            } catch {}
+          }
+          addUserMessage(cleaned.text, attachmentsList, false, cleaned.sender);
         }
         if (msg.role === "assistant") {
           addRestoredAssistantMessage(msg.content || "");
@@ -318,6 +333,7 @@
     hideWelcome();
     const el = document.createElement("div");
     el.className = "message assistant restored-plan";
+    el.dataset.messageRole = "plan";
     el.innerHTML = `
       <div class="message-avatar">LC</div>
       <div class="message-body">
@@ -360,11 +376,18 @@
   function hydrateSettings(config) {
     const models = config.llm?.availableModels || [];
     const currentPrimary = config.llm?.primary || "";
+    const llmDefaults = config.llm?.defaults || config.llm || {};
     refs.settingModel.innerHTML = models.length
       ? models.map((model) => `<option value="${escapeHtml(model.id)}"${model.id === currentPrimary ? " selected" : ""}>${escapeHtml(model.label)}</option>`).join("")
       : `<option value="${escapeHtml(currentPrimary)}">${escapeHtml(currentPrimary || "unknown")}</option>`;
 
     refs.settingThinking.value = config.agent?.thinkingDefault || "medium";
+    refs.settingTemperature.value = llmDefaults.temperature ?? 1.0;
+    refs.settingTopP.value = llmDefaults.topP ?? 1.0;
+    refs.settingTopK.value = llmDefaults.topK ?? 45;
+    refs.settingMaxOutputTokens.value = llmDefaults.maxOutputTokens ?? 8192;
+    updateLlmParamsVisibility();
+
     refs.settingWorkspace.value = config.agent?.workspace || "";
     refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
     refs.settingPlannerMode.value = config.agent?.planner?.mode || "auto";
@@ -400,11 +423,23 @@
       : "Auth: local WebUI endpoints open";
   }
 
+  function updateLlmParamsVisibility() {
+    if (refs.llmParamsGroup) {
+      refs.llmParamsGroup.style.display = "grid";
+    }
+  }
+
+  refs.settingModel.addEventListener("change", updateLlmParamsVisibility);
+
   function gatherSettingsPayload() {
     const toolLoading = document.querySelector("#toolLoadingGroup .toggle-chip.active")?.dataset.value || "lazy";
     return {
       llm: {
         primary: refs.settingModel.value,
+        temperature: Number(refs.settingTemperature.value || 1.0),
+        topP: Number(refs.settingTopP.value || 1.0),
+        topK: Number(refs.settingTopK.value || 45),
+        maxOutputTokens: Number(refs.settingMaxOutputTokens.value || 8192),
       },
       agent: {
         workspace: refs.settingWorkspace.value.trim(),
@@ -587,33 +622,59 @@
       cleaned = cleaned.replace(/^Use only these handles[^\n]*\n?/gm, "");
     }
 
+    // Strip backend-injected file contents
+    cleaned = cleaned.replace(/\n\nAttached files content:[\s\S]*$/m, "");
+
     return { text: cleaned.trim(), sender };
   }
 
-  function addUserMessage(text, images, animate = true, sender = "You") {
+  function addUserMessage(text, attachmentsList, animate = true, sender = "You") {
     hideWelcome();
     const el = document.createElement("div");
-    el.className = "message user";
-    if (!animate) el.style.animation = "none";
-    
-    // Generate an initial for the avatar
-    const avatarInitial = sender === "You" ? "U" : sender.charAt(0).toUpperCase();
+    el.className = "message user" + (animate ? " animate-in" : "");
+    el.dataset.messageRole = "user";
+    el._rawText = text;
+    const avatarInitial = sender.charAt(0).toUpperCase();
+
+    let attachmentsHtml = "";
+    if (attachmentsList && attachmentsList.length > 0) {
+      attachmentsHtml = `<div class="message-attachments" style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px;">`;
+      attachmentsList.forEach(att => {
+        const dataUrl = typeof att === 'string' ? att : att.dataUrl;
+        const name = typeof att === 'string' ? 'image' : att.name;
+        const isImage = dataUrl.startsWith("data:image/");
+
+        if (isImage) {
+          attachmentsHtml += `<img src="${dataUrl}" alt="attachment" style="max-width:140px; border:1px solid var(--line); border-radius: 4px;">`;
+        } else {
+          const icon = name.endsWith(".pdf") ? "📄" : (name.endsWith(".xlsx") || name.endsWith(".csv")) ? "📊" : "📝";
+          attachmentsHtml += `
+            <div class="file-chip" style="opacity: 1; pointer-events: none;">
+              <span class="icon">${icon}</span>
+              <span>${escapeHtml(name)}</span>
+            </div>`;
+        }
+      });
+      attachmentsHtml += `</div>`;
+    }
 
     el.innerHTML = `
       <div class="message-body">
         <div class="message-sender">${escapeHtml(sender)}</div>
         <div class="message-content">${escapeHtml(text)}</div>
-        ${images.length ? `<div class="image-preview">${images.map((src) => `<img src="${src}" alt="attachment" style="max-width:140px;border:1px solid var(--line);margin-top:8px;">`).join("")}</div>` : ""}
+        ${attachmentsHtml}
       </div>
       <div class="message-avatar">${escapeHtml(avatarInitial)}</div>
     `;
     messagesEl.appendChild(el);
+    el._attachments = attachmentsList;
     scrollToBottom();
   }
 
   function addRestoredAssistantMessage(content) {
     const el = document.createElement("div");
     el.className = "message assistant";
+    el.dataset.messageRole = "assistant";
     el.innerHTML = `
       <div class="message-avatar">LC</div>
       <div class="message-body">
@@ -622,7 +683,9 @@
       </div>
     `;
     messagesEl.appendChild(el);
-    addCopyButtons(el.querySelector(".message-content"));
+    const contentEl = el.querySelector(".message-content");
+    addCopyButtons(contentEl);
+    addMessageActions(el.querySelector(".message-body"), content);
   }
 
   function ensureAssistantMessage() {
@@ -630,6 +693,7 @@
     hideWelcome();
     currentAssistantEl = document.createElement("div");
     currentAssistantEl.className = "message assistant";
+    currentAssistantEl.dataset.messageRole = "assistant";
     currentAssistantEl.innerHTML = `
       <div class="message-avatar">LC</div>
       <div class="message-body">
@@ -641,24 +705,56 @@
     isStreaming = true;
   }
 
+  function splitVisibleAndThinking(text) {
+    let visible = String(text || "");
+    const thinking = [];
+
+    visible = visible.replace(/<(think|thought|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, content) => {
+      const entry = String(content || "");
+      if (entry) thinking.push(entry);
+      return "";
+    });
+
+    visible = visible
+      .replace(/<\/?(think|thought|thinking)>/gi, "")
+      .replace(/<[|｜]DSML[|｜]tool_calls[\s\S]*?<\/[|｜]DSML[|｜]tool_calls>/gi, "");
+
+    const prefixMatch = visible.match(/^\s*(?:think|thoughts?|thinking)\s*\n([\s\S]*)$/i);
+    if (prefixMatch && /\b(the user|i should|i need to|according to|first|let me|i'll|i will)\b/i.test(prefixMatch[1] || "")) {
+      const trimmed = String(prefixMatch[1] || "").trim();
+      if (trimmed) thinking.push(trimmed);
+      visible = "";
+    }
+
+    return {
+      visible: visible,
+      thinking,
+    };
+  }
+
   function renderAssistantContent() {
     if (!currentAssistantEl) return;
     const contentEl = currentAssistantEl.querySelector(".message-content");
-    contentEl.innerHTML = renderMarkdown(currentContent) + (isStreaming ? '<span class="streaming-cursor"></span>' : "");
+    const visibleContent = dedupeRepeatedParagraphs(splitVisibleAndThinking(currentContent).visible);
+    contentEl.innerHTML = renderMarkdown(visibleContent) + (isStreaming ? '<span class="streaming-cursor"></span>' : "");
     addCopyButtons(contentEl);
     scrollToBottom();
   }
 
   function appendThinking(text) {
+    const chunk = String(text || "");
+    if (!chunk) return;
+    if (chunk === lastThinkingChunk) return;
+
     ensureAssistantMessage();
     const body = currentAssistantEl.querySelector(".message-body");
     const wrappers = body.querySelectorAll(".thinking-wrapper");
     let wrapper = wrappers[wrappers.length - 1];
-    
+
     if (!wrapper || wrapper.dataset.closed === "true") {
       wrapper = document.createElement("div");
-      wrapper.className = "thinking-wrapper";
-      
+      wrapper.className = "thinking-wrapper expanded"; // Show by default during streaming
+
       const header = document.createElement("button");
       header.className = "thinking-header";
       header.type = "button";
@@ -666,17 +762,24 @@
         <span class="thinking-toggle-icon"></span>
         <span class="thinking-label pulsing">Thinking...</span>
       `;
-      
+
       const content = document.createElement("div");
       content.className = "thinking-content";
-      
+
       wrapper.appendChild(header);
       wrapper.appendChild(content);
       body.insertBefore(wrapper, body.querySelector(".message-content"));
     }
 
     const contentEl = wrapper.querySelector(".thinking-content");
-    contentEl.textContent += text || "";
+    const existing = contentEl._rawText || "";
+    const merged = existing + chunk;
+    contentEl._rawText = merged;
+
+    // Render as Markdown for headers, lists, etc.
+    contentEl.innerHTML = renderMarkdown(merged);
+
+    lastThinkingChunk = chunk;
     scrollToBottom();
   }
 
@@ -766,6 +869,8 @@
 
   function finishStreaming(metrics) {
     isStreaming = false;
+    const finalized = splitVisibleAndThinking(currentContent);
+    currentContent = dedupeRepeatedParagraphs(finalized.visible || "");
     renderAssistantContent();
 
     if (metrics && currentAssistantEl) {
@@ -784,8 +889,11 @@
       body.appendChild(metricsEl);
     }
 
+    addMessageActions(currentAssistantEl.querySelector(".message-body"), currentContent);
+
     currentAssistantEl?.querySelectorAll(".thinking-wrapper").forEach((el) => {
       el.dataset.closed = "true";
+      el.classList.remove("expanded"); // Collapse after finishing
       const label = el.querySelector(".thinking-label");
       if (label) {
         label.classList.remove("pulsing");
@@ -794,6 +902,7 @@
     });
     currentAssistantEl = null;
     currentContent = "";
+    lastThinkingChunk = "";
     inputEl.disabled = false;
     sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
     inputEl.focus();
@@ -814,7 +923,11 @@
         break;
       case "content":
         ensureAssistantMessage();
-        currentContent += msg.content || "";
+        {
+          const parsed = splitVisibleAndThinking(msg.content || "");
+          parsed.thinking.forEach((entry) => appendThinking(entry));
+          currentContent += parsed.visible || "";
+        }
         renderAssistantContent();
         break;
       case "plan":
@@ -886,30 +999,35 @@
     confirmModal.hidden = true;
   }
 
+  function cancelPendingModalAction() {
+    pendingRegeneration = null;
+    pendingConfirmationId = null;
+    confirmModal.hidden = true;
+  }
+
   // ─── Send Message ─────────────────────────────────────────────────
 
-  function sendMessage() {
-    const text = inputEl.value.trim();
-    if ((!text && attachedImages.length === 0) || !ws || ws.readyState !== WebSocket.OPEN) return;
+  function sendMessage(manualText = null) {
+    const text = manualText !== null ? manualText : inputEl.value.trim();
+    if ((!text && attachments.length === 0) || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-    addUserMessage(text || "(image attached)", [...attachedImages]);
+    addUserMessage(text || "(attachments)", [...attachments]);
     ws.send(JSON.stringify({
       type: "message",
       content: text,
       sessionKey: currentSessionKey,
       workingDir: refs.settingWorkspace.value.trim() || currentConfig.agent?.workspace,
-      images: attachedImages.length ? [...attachedImages] : undefined,
+      attachments: attachments.length ? [...attachments] : undefined,
     }));
 
-    inputEl.value = "";
-    inputEl.style.height = "auto";
-    attachedImages.length = 0;
-    imagePreview.hidden = true;
-    imagePreview.innerHTML = "";
-    sendBtn.disabled = true;
-    inputEl.disabled = true;
-    currentAssistantEl = null;
-    currentContent = "";
+    if (manualText === null) {
+      inputEl.value = "";
+      inputEl.style.height = "auto";
+      attachments.length = 0;
+      imagePreview.hidden = true;
+      imagePreview.innerHTML = "";
+      sendBtn.disabled = true;
+    }
   }
 
   // ─── Markdown Renderer ────────────────────────────────────────────
@@ -917,10 +1035,10 @@
   function renderMarkdown(text) {
     const codeBlocks = [];
     const thinkBlocks = [];
-    let working = String(text || "");
+    let working = normalizeMarkdownForDisplay(dedupeRepeatedParagraphs(String(text || "")));
 
-    // Handle thinking tags
-    working = working.replace(/<think>([\s\S]*?)<\/think>/g, (_, content) => {
+    // Isolate thinking blocks so they don't get wrapped inside <p> tags.
+    working = working.replace(/<(think|thought|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, content) => {
       const token = `@@THINK${thinkBlocks.length}@@`;
       thinkBlocks.push(`
         <div class="thinking-wrapper">
@@ -931,7 +1049,7 @@
           <div class="thinking-content">${escapeHtml(content.trim())}</div>
         </div>
       `);
-      return token;
+      return `\n\n${token}\n\n`;
     });
 
     working = working.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
@@ -950,9 +1068,13 @@
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
     html = html.split(/\n{2,}/).map((chunk) => {
-      const trimmed = chunk.trim();
+      // Don't trim the end during streaming to avoid stripping the space the model just typed
+      const trimmed = isStreaming ? chunk.trimStart() : chunk.trim();
       if (!trimmed) return "";
-      if (/^@@CODE\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
+      if (/^@@CODE\d+@@$/.test(trimmed) || /^@@THINK\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
+      if (looksLikeMarkdownTable(trimmed)) {
+        return renderMarkdownTable(trimmed);
+      }
       if (/^[-*] /m.test(trimmed)) {
         const items = trimmed.split("\n").filter(Boolean).map((line) => {
           if (/^[-*] /.test(line)) return `<li>${line.slice(2)}</li>`;
@@ -978,6 +1100,129 @@
     return html;
   }
 
+  function normalizeMarkdownForDisplay(text) {
+    let normalized = String(text || "").replace(/\r\n/g, "\n");
+
+    normalized = normalized
+      .replace(/([^\n])\s*(#{1,3}\s+)/g, "$1\n\n$2")
+      .replace(/([^\n])\s*(\|[^\n]+\|\s*\n\|[-:| ]+\|)/g, "$1\n\n$2")
+      .replace(/([^\n])\s*(?:-\s+)/g, (match, prefix) => `${prefix}\n- `)
+      .replace(/([^\n])\s*(\d+\.\s+)/g, "$1\n$2")
+      .replace(/(#{1,6}[^\n#|]+)(?=#{1,6}\s)/g, "$1\n\n")
+      .replace(/(\|\|)(?=[A-Za-z#])/g, "||\n")
+      .replace(/([a-z0-9])(?=#{1,6}[A-Z])/g, "$1\n\n")
+      .replace(/([.!?])\s+(?=[A-Z][a-z].{0,40}:)/g, "$1\n")
+      .replace(/\|\|/g, "|\n|")
+      .replace(/([a-z0-9)])(\*\*[A-Z])/g, "$1\n\n$2")
+      .replace(/([a-z0-9)])(#{1,6}\s)/g, "$1\n\n$2")
+      .replace(/([a-z])([A-Z][a-z]+:)/g, "$1\n$2");
+
+    return repairCompressedVisibleText(normalized);
+  }
+
+  function repairCompressedVisibleText(text) {
+    return String(text || "")
+      .split("\n")
+      .map((line) => repairCompressedVisibleLine(line))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n");
+  }
+
+  function repairCompressedVisibleLine(line) {
+    return line; // Disabled aggressive repair that was stripping/mangling whitespace
+  }
+
+  function dedupeRepeatedParagraphs(text) {
+    const parts = String(text || "")
+      .replace(/\r\n/g, "\n")
+      .split(/\n{2,}/)
+      .filter(Boolean);
+
+    const deduped = [];
+    let previous = "";
+    for (const part of parts) {
+      if (part === previous) continue;
+      if (deduped.includes(part) && part.length > 120) continue;
+      deduped.push(part);
+      previous = part;
+    }
+
+    return deduped.join("\n\n");
+  }
+
+  function normalizeThinkingForDisplay(text) {
+    return String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\t/g, "  ")
+      .split("\n")
+      .map((line) => repairCompressedThinkingLine(line))
+      .join("\n")
+      .replace(/([.!?])\s+(?=[A-Z][a-z])/g, "$1\n")
+      .replace(/(:)\s+(?=(?:First|Second|Third|Next|Then|Finally|The user|I need|I should|I'll|I will|Let me)\b)/g, "$1\n")
+      .replace(/\n{3,}/g, "\n\n");
+  }
+
+  function repairCompressedThinkingLine(line) {
+    return line; // Disabled aggressive repair
+  }
+
+  function normalizeThinkingForComparison(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\p{L}\p{N} ]/gu, "")
+      .trim();
+  }
+
+  function isNearDuplicateThinkingChunk(existing, chunk) {
+    if (!chunk || chunk.trim().length < 40) return false;
+    if (!existing) return false;
+
+    const normalizedChunk = normalizeThinkingForComparison(chunk);
+    const normalizedExisting = normalizeThinkingForComparison(existing);
+
+    if (!normalizedChunk) return false;
+    if (normalizedExisting.includes(normalizedChunk)) return true;
+    if (normalizedChunk.length > 120 && normalizedExisting.includes(normalizedChunk.slice(0, 120))) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function mergeThinkingChunks(existing, chunk) {
+    return existing + chunk;
+  }
+
+  function looksLikeMarkdownTable(text) {
+    const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) return false;
+    if (!lines[0].includes("|")) return false;
+    return /^\|?[\s:-]+\|[\s|:-]*$/.test(lines[1]);
+  }
+
+  function renderMarkdownTable(text) {
+    const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) return `<p>${text}</p>`;
+
+    const parseRow = (line) => line
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+
+    const headers = parseRow(lines[0]);
+    const rows = lines.slice(2).map(parseRow);
+
+    const headHtml = headers.map((cell) => `<th>${cell}</th>`).join("");
+    const bodyHtml = rows.map((row) => {
+      const cells = headers.map((_, index) => `<td>${row[index] ?? ""}</td>`).join("");
+      return `<tr>${cells}</tr>`;
+    }).join("");
+
+    return `<div class="table-wrap"><table><thead><tr>${headHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`;
+  }
+
   function escapeHtml(text) {
     const div = document.createElement("div");
     div.textContent = text;
@@ -990,16 +1235,137 @@
       if (pre.querySelector(".copy-btn")) return;
       const btn = document.createElement("button");
       btn.className = "copy-btn";
-      btn.textContent = "Copy";
+      btn.innerHTML = "Copy";
       btn.addEventListener("click", () => {
         navigator.clipboard.writeText(pre.querySelector("code")?.textContent || "");
-        btn.textContent = "Copied";
+        btn.innerHTML = "✓ Copied";
+        btn.classList.add("success");
         setTimeout(() => {
-          btn.textContent = "Copy";
-        }, 1200);
+          btn.innerHTML = "Copy";
+          btn.classList.remove("success");
+        }, 2000);
       });
       pre.appendChild(btn);
     });
+  }
+
+  function addMessageActions(body, content) {
+    if (!body || body.querySelector(".message-actions")) return;
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    const messageEl = body.closest(".message.assistant");
+
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "action-btn";
+    copyBtn.innerHTML = `<span>📋</span> Copy`;
+    copyBtn.title = "Copy full message content";
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(content);
+      copyBtn.innerHTML = `<span>✓</span> Copied`;
+      copyBtn.classList.add("success");
+      setTimeout(() => {
+        copyBtn.innerHTML = `<span>📋</span> Copy`;
+        copyBtn.classList.remove("success");
+      }, 2000);
+    });
+
+    const regenBtn = document.createElement("button");
+    regenBtn.className = "action-btn";
+    regenBtn.innerHTML = `<span>⟳</span> Regenerate`;
+    regenBtn.title = "Regenerate assistant response";
+    regenBtn.addEventListener("click", () => {
+      if (messageEl) requestRegeneration(messageEl);
+    });
+
+    actions.appendChild(copyBtn);
+    actions.appendChild(regenBtn);
+    body.appendChild(actions);
+  }
+
+  function requestRegeneration(assistantEl) {
+    if (isStreaming || isRegenerating) return;
+    const turn = findRegenerationTurn(assistantEl);
+    if (!turn) {
+      showNotice("Couldn’t locate the original prompt for that reply.", "error", 2800);
+      return;
+    }
+    pendingRegeneration = turn;
+    const turnsAffected = Math.max(1, Math.floor(turn.rollbackCount / 2));
+    const label = turnsAffected > 1 ? `This will remove this reply and ${turnsAffected - 1} later turn(s), then replay the selected prompt.` : `This will replace this reply and replay the same prompt.`;
+    confirmBody.innerHTML = `<p>${label}</p>`;
+    confirmModal.hidden = false;
+  }
+
+  function findRegenerationTurn(assistantEl) {
+    const conversation = Array.from(messagesEl.querySelectorAll('.message[data-message-role="user"], .message[data-message-role="assistant"]'));
+    const assistantIndex = conversation.indexOf(assistantEl);
+    if (assistantIndex === -1) return null;
+
+    let userIndex = -1;
+    for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+      if (conversation[index].dataset.messageRole === "user") {
+        userIndex = index;
+        break;
+      }
+    }
+
+    if (userIndex === -1) return null;
+
+    const userEl = conversation[userIndex];
+    const text = userEl._rawText || userEl.querySelector(".message-content")?.textContent || "";
+    const savedAttachments = Array.isArray(userEl._attachments) ? [...userEl._attachments] : [];
+    const rollbackCount = conversation.length - userIndex;
+
+    return {
+      assistantEl,
+      userEl,
+      text,
+      attachments: savedAttachments,
+      rollbackCount,
+    };
+  }
+
+  async function confirmRegeneration() {
+    if (!pendingRegeneration || isRegenerating) return;
+    const turn = pendingRegeneration;
+    pendingRegeneration = null;
+    pendingConfirmationId = null;
+    confirmModal.hidden = true;
+    isRegenerating = true;
+
+    try {
+      const response = await fetchJson(`/api/sessions/${encodeURIComponent(currentSessionKey)}/rollback?count=${encodeURIComponent(turn.rollbackCount)}`, { method: "POST" });
+      if (!response.success) {
+        throw new Error("Rollback request was rejected.");
+      }
+
+      removeConversationTail(turn.userEl);
+
+      currentAssistantEl = null;
+      currentContent = "";
+      isStreaming = false;
+
+      attachments.length = 0;
+      turn.attachments.forEach((item) => attachments.push(item));
+      sendMessage(turn.text);
+      showNotice("Regenerating response…", "info", 1800);
+      fetchSessionMetrics(currentSessionKey);
+      loadSessions();
+    } catch (error) {
+      showNotice(`Regenerate failed: ${error.message || error}`, "error", 3200);
+    } finally {
+      isRegenerating = false;
+    }
+  }
+
+  function removeConversationTail(startEl) {
+    let node = startEl;
+    while (node) {
+      const next = node.nextElementSibling;
+      node.remove();
+      node = next;
+    }
+    if (!messagesEl.children.length) showWelcome();
   }
 
   // ─── Utilities ────────────────────────────────────────────────────
@@ -1075,7 +1441,7 @@
   inputEl.addEventListener("input", () => {
     inputEl.style.height = "auto";
     inputEl.style.height = `${Math.min(inputEl.scrollHeight, 200)}px`;
-    sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+    sendBtn.disabled = inputEl.value.trim().length === 0 && attachments.length === 0;
   });
 
   inputEl.addEventListener("keydown", (event) => {
@@ -1085,31 +1451,64 @@
     }
   });
 
-  imageInput.addEventListener("change", () => {
-    const files = Array.from(imageInput.files || []).slice(0, 4);
-    attachedImages.length = 0;
-    imagePreview.innerHTML = "";
+  window.addEventListener("paste", (event) => {
+    const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+    const files = [];
+    for (const item of items) {
+      if (item.kind === "file") {
+        files.push(item.getAsFile());
+      }
+    }
+    if (files.length > 0) {
+      handleFiles(files);
+    }
+  });
 
-    files.forEach((file, index) => {
+  function handleFiles(files) {
+    const fileList = Array.from(files).slice(0, 8);
+    // Don't clear attachedImages, just append
+    fileList.forEach((file) => {
       const reader = new FileReader();
+      const isImage = file.type.startsWith("image/");
+
       reader.onload = () => {
-        attachedImages.push(String(reader.result));
+        const dataUrl = String(reader.result);
+        const item = { name: file.name, dataUrl };
+        attachments.push(item);
+
         const chip = document.createElement("div");
-        chip.className = "image-chip";
-        chip.innerHTML = `<span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        if (isImage) {
+          chip.className = "image-chip";
+          chip.innerHTML = `<span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        } else {
+          chip.className = "file-chip";
+          const icon = file.name.endsWith(".pdf") ? "📄" : (file.name.endsWith(".xlsx") || file.name.endsWith(".csv")) ? "📊" : "📝";
+          chip.innerHTML = `<span class="icon">${icon}</span><span>${escapeHtml(file.name)}</span><button type="button">×</button>`;
+        }
+
         chip.querySelector("button").addEventListener("click", () => {
-          attachedImages.splice(index, 1);
+          const idx = attachments.indexOf(item);
+          if (idx > -1) attachments.splice(idx, 1);
           chip.remove();
-          if (attachedImages.length === 0) imagePreview.hidden = true;
-          sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+          if (attachments.length === 0) imagePreview.hidden = true;
+          sendBtn.disabled = inputEl.value.trim().length === 0 && attachments.length === 0;
         });
+
         imagePreview.appendChild(chip);
         imagePreview.hidden = false;
-        sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
+        sendBtn.disabled = inputEl.value.trim().length === 0 && attachments.length === 0;
       };
-      reader.readAsDataURL(file);
-    });
 
+      if (isImage || file.type === "application/pdf" || file.type.includes("word") || file.type.includes("sheet") || file.type.startsWith("text/")) {
+        reader.readAsDataURL(file);
+      } else {
+        showNotice(`File type ${file.type} not supported for direct reading.`, "warning");
+      }
+    });
+  }
+
+  imageInput.addEventListener("change", () => {
+    handleFiles(imageInput.files);
     imageInput.value = "";
   });
 
@@ -1176,10 +1575,27 @@
     });
   });
 
-  confirmAccept.addEventListener("click", () => respondToConfirmation(true));
-  confirmReject.addEventListener("click", () => respondToConfirmation(false));
+  confirmAccept.addEventListener("click", () => {
+    if (pendingRegeneration) {
+      confirmRegeneration();
+      return;
+    }
+    respondToConfirmation(true);
+  });
+  confirmReject.addEventListener("click", () => {
+    if (pendingRegeneration) {
+      cancelPendingModalAction();
+      return;
+    }
+    respondToConfirmation(false);
+  });
   confirmModal.addEventListener("click", (event) => {
-    if (event.target === confirmModal) respondToConfirmation(false);
+    if (event.target !== confirmModal) return;
+    if (pendingRegeneration) {
+      cancelPendingModalAction();
+      return;
+    }
+    respondToConfirmation(false);
   });
   settingsOverlay.addEventListener("click", (event) => {
     if (event.target === settingsOverlay) settingsOverlay.hidden = true;

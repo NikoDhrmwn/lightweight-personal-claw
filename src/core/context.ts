@@ -74,7 +74,8 @@ export class ContextManager {
     const config = getConfig();
     this.maxContextTokens = config.agent?.contextTokens ?? 64000;
     this.budgetPct = (config.agent?.contextBudgetPct ?? 80) / 100;
-    this.softThreshold = config.agent?.compaction?.softThresholdTokens ?? 48000;
+    const defaultThreshold = Math.floor(this.maxContextTokens * (this.budgetPct * 0.9));
+    this.softThreshold = config.agent?.compaction?.softThresholdTokens ?? defaultThreshold;
   }
 
   /**
