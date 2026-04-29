@@ -11,6 +11,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.7.0] - 2026-04-29
+
+#### Added
+
+- **Scene-Aware D&D Flow**: Added canonical scene state, narrative validation, queued group actions, rest safety, and continuity checks for session threads.
+- **Expanded D&D Character Tools**: Added avatar, skills, spells, inventory, dice, downtime, shop, death-save, inspiration, and richer stats/rest commands.
+- **Advanced Combat Resolution**: Added pending player actions, active effects, defensive/improvised actions, buff/debuff/control skills, item weights, and round-level combat narration.
+- **WhatsApp Progress UX**: Added command handling, progress tracker messages, send retries, reconnection behavior, and WhatsApp-specific markdown formatting.
+- **Provider Compatibility**: Added native tool prompting, DSML tool-call parsing, provider refresh after config edits, top-k sampling, reasoning-content memory, and WebUI formatting rules.
+- **Session Cleanup CLI**: Added `liteclaw channels logout --channel whatsapp` to clear the local WhatsApp pairing session.
+
+#### Fixed
+
+- **Discord Robustness**: Added gateway DNS checks, login retries, shard diagnostics, and debug token redaction.
+- **Context Thresholds**: Derived default compaction thresholds from configured context size and budget.
+- **Repository Hygiene**: Ignored `scratch/` and stopped `.gitignore` from ignoring itself.
+- **Version Consistency**: Normalized package, CLI, runtime, gateway, migration, and default config version reporting to `0.7.0`.
+
 ### [0.6.3] - 2026-04-24
 
 #### Added
@@ -25,21 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Git Tracking**: Added `brain/` directory to `.gitignore` to prevent generated session data and research logs from being tracked.
 - **Version Consistency**: Normalized version reporting to `0.6.3` across all modules.
-
-### [0.6.0] - 2026-04-23
-
-#### Added
-
-- **Discord DnD Sessions**: Added persistent DnD session threads with SQLite-backed session state, player rosters, turn tracking, and save checkpoints.
-- **Session Recovery Flows**: Added join-existing-session, resume-in-thread, partial-party resume, availability toggles, and session/checkpoint listing commands.
-- **Party Skip Voting**: Added persistent vote-to-skip handling for unavailable players, including restart-safe timeout resolution and automatic turn skipping.
-- **Combat, Stats, and XP Tracking**: Added persistent character sheets, `/stats`, initiative-based combat flow, action menus, checkpoint restore by checkpoint ID, and quest/combat XP progression with level tracking.
-- **DnD Question Modes + RAG**: Added `/question` public/private modes and DnD session RAG context that automatically starts the local embedding server when a session is started or refreshed.
-
-#### Fixed
-
-- **Version Consistency**: Normalized runtime, CLI, gateway, and config version reporting to `0.6.0`.
-- **README Changelog Scope**: Trimmed the visible changelog to the two most recent releases and corrected the release framing for the DnD work.
 
 ## Features
 

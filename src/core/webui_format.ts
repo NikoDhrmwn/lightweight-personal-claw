@@ -1,6 +1,6 @@
 /**
  * LiteClaw — WebUI Formatting Specification
- * 
+ *
  * This file defines the formatting expectations for the WebUI.
  * This specification is injected into the system prompt to ensure the
  * agent generates output that renders reliably in the browser.
