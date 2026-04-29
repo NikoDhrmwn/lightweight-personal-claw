@@ -3,12 +3,14 @@ import { rollDice, type DiceRoll } from './mechanics.js';
 import type {
   DndAbilityKey,
   DndAbilityScores,
+  DndActiveEffect,
   DndCharacterSheet,
   DndCombatEnemy,
   DndCombatLogEntry,
   DndCombatState,
   DndCombatant,
   DndInventoryItemRecord,
+  DndPendingPlayerAction,
   DndPlayerRecord,
 } from './types.js';
 
@@ -27,6 +29,7 @@ export interface DndWeaponDefinition {
   requirement?: DndItemRequirement | null;
   tags?: string[];
   notes?: string;
+  weight?: number;
 }
 
 export interface DndConsumableDefinition {
@@ -37,6 +40,7 @@ export interface DndConsumableDefinition {
   notation: string;
   target: 'self' | 'ally' | 'enemy';
   notes?: string;
+  weight?: number;
 }
 
 export interface DndSkillDefinition {
@@ -44,7 +48,7 @@ export interface DndSkillDefinition {
   name: string;
   aliases: string[];
   classIds: string[];
-  kind: 'attack' | 'heal' | 'buff';
+  kind: 'attack' | 'heal' | 'buff' | 'debuff' | 'crowd_control' | 'defense';
   attackAbility: DndAbilityKey;
   damageNotation?: string;
   healNotation?: string;
@@ -52,6 +56,7 @@ export interface DndSkillDefinition {
   requirement?: DndItemRequirement | null;
   appliesCondition?: string;
   notes?: string;
+  resourceKind?: 'spell' | 'ability' | 'technique';
 }
 
 export interface DndInventoryMetadata {
@@ -80,7 +85,7 @@ export interface StarterCombatKit {
 }
 
 export interface ParsedCombatAction {
-  kind: 'skill' | 'item' | 'weapon' | 'skip';
+  kind: 'skill' | 'item' | 'weapon' | 'skip' | 'improvise';
   skill?: DndSkillDefinition;
   item?: DndInventoryItemRecord;
   weapon?: DndInventoryItemRecord;
@@ -95,6 +100,15 @@ export interface CombatResolutionSummary {
   inventoryUpdates: DndInventoryItemRecord[];
   removedInventoryItemIds: string[];
   messages: string[];
+}
+
+export interface RoundResolutionResult {
+  combat: DndCombatState;
+  playerUpdates: Array<{ userId: string; sheet: DndCharacterSheet }>;
+  inventoryUpdates: DndInventoryItemRecord[];
+  removedInventoryItemIds: string[];
+  messages: string[];
+  roundNarrative: string[];
 }
 
 const DEFAULT_ABILITIES: DndAbilityScores = {
@@ -116,6 +130,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d12',
     requirement: { ability: 'str', minimum: 14 },
     tags: ['heavy', 'melee'],
+    weight: 7,
   },
   longsword: {
     id: 'longsword',
@@ -126,6 +141,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d8',
     requirement: { ability: 'str', minimum: 11 },
     tags: ['melee'],
+    weight: 3,
   },
   warhammer: {
     id: 'warhammer',
@@ -136,6 +152,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d8',
     requirement: { ability: 'str', minimum: 12 },
     tags: ['melee'],
+    weight: 2,
   },
   mace: {
     id: 'mace',
@@ -146,6 +163,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d6',
     requirement: { ability: 'str', minimum: 10 },
     tags: ['melee'],
+    weight: 4,
   },
   quarterstaff: {
     id: 'quarterstaff',
@@ -156,6 +174,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d6',
     requirement: { ability: 'str', minimum: 8 },
     tags: ['melee', 'focus'],
+    weight: 4,
   },
   shortsword: {
     id: 'shortsword',
@@ -166,6 +185,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d6',
     requirement: { ability: 'dex', minimum: 11 },
     tags: ['melee', 'finesse'],
+    weight: 2,
   },
   dagger: {
     id: 'dagger',
@@ -176,6 +196,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d4',
     requirement: { ability: 'dex', minimum: 9 },
     tags: ['melee', 'thrown', 'finesse'],
+    weight: 1,
   },
   shortbow: {
     id: 'shortbow',
@@ -186,6 +207,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d6',
     requirement: { ability: 'dex', minimum: 12 },
     tags: ['ranged'],
+    weight: 2,
   },
   wand: {
     id: 'wand',
@@ -196,6 +218,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d4',
     requirement: { ability: 'int', minimum: 12 },
     tags: ['focus', 'ranged'],
+    weight: 1,
   },
   focus: {
     id: 'focus',
@@ -206,6 +229,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d4',
     requirement: { ability: 'wis', minimum: 12 },
     tags: ['focus'],
+    weight: 1,
   },
   lute: {
     id: 'lute',
@@ -216,6 +240,7 @@ export const WEAPON_DEFINITIONS: Record<string, DndWeaponDefinition> = {
     damageNotation: '1d4',
     requirement: { ability: 'cha', minimum: 12 },
     tags: ['focus'],
+    weight: 2,
   },
 };
 
@@ -227,6 +252,7 @@ export const CONSUMABLE_DEFINITIONS: Record<string, DndConsumableDefinition> = {
     effect: 'heal',
     notation: '2d4+2',
     target: 'self',
+    weight: 0.5,
   },
   fire_bomb: {
     id: 'fire_bomb',
@@ -235,6 +261,7 @@ export const CONSUMABLE_DEFINITIONS: Record<string, DndConsumableDefinition> = {
     effect: 'damage',
     notation: '2d6',
     target: 'enemy',
+    weight: 1,
   },
 };
 
@@ -243,24 +270,34 @@ export const SKILL_DEFINITIONS: Record<string, DndSkillDefinition> = {
   reckless_cleave: { id: 'reckless_cleave', name: 'Reckless Cleave', aliases: ['reckless cleave', 'cleave'], classIds: ['barbarian'], kind: 'attack', attackAbility: 'str', damageNotation: '2d6', usesPerCombat: 1 },
   cutting_word: { id: 'cutting_word', name: 'Cutting Word', aliases: ['cutting word', 'mockery'], classIds: ['bard'], kind: 'attack', attackAbility: 'cha', damageNotation: '1d8', usesPerCombat: 2, appliesCondition: 'frightened' },
   rallying_song: { id: 'rallying_song', name: 'Rallying Song', aliases: ['rallying song', 'song'], classIds: ['bard'], kind: 'heal', attackAbility: 'cha', healNotation: '1d8', usesPerCombat: 2 },
-  sacred_flame: { id: 'sacred_flame', name: 'Sacred Flame', aliases: ['sacred flame'], classIds: ['cleric'], kind: 'attack', attackAbility: 'wis', damageNotation: '1d8', usesPerCombat: null },
-  healing_word: { id: 'healing_word', name: 'Healing Word', aliases: ['healing word', 'heal'], classIds: ['cleric', 'paladin', 'bard'], kind: 'heal', attackAbility: 'wis', healNotation: '1d6', usesPerCombat: 2 },
-  thorn_whip: { id: 'thorn_whip', name: 'Thorn Whip', aliases: ['thorn whip'], classIds: ['druid'], kind: 'attack', attackAbility: 'wis', damageNotation: '1d8', usesPerCombat: null },
-  moon_burst: { id: 'moon_burst', name: 'Moon Burst', aliases: ['moon burst', 'moonbeam'], classIds: ['druid'], kind: 'attack', attackAbility: 'wis', damageNotation: '2d4', usesPerCombat: 2 },
+  sacred_flame: { id: 'sacred_flame', name: 'Sacred Flame', aliases: ['sacred flame'], classIds: ['cleric'], kind: 'attack', attackAbility: 'wis', damageNotation: '1d8', usesPerCombat: null, resourceKind: 'spell' },
+  healing_word: { id: 'healing_word', name: 'Healing Word', aliases: ['healing word', 'heal'], classIds: ['cleric', 'paladin', 'bard'], kind: 'heal', attackAbility: 'wis', healNotation: '1d6', usesPerCombat: 2, resourceKind: 'spell' },
+  thorn_whip: { id: 'thorn_whip', name: 'Thorn Whip', aliases: ['thorn whip'], classIds: ['druid'], kind: 'attack', attackAbility: 'wis', damageNotation: '1d8', usesPerCombat: null, resourceKind: 'spell' },
+  moon_burst: { id: 'moon_burst', name: 'Moon Burst', aliases: ['moon burst', 'moonbeam'], classIds: ['druid'], kind: 'attack', attackAbility: 'wis', damageNotation: '2d4', usesPerCombat: 2, resourceKind: 'spell' },
   power_strike: { id: 'power_strike', name: 'Power Strike', aliases: ['power strike'], classIds: ['fighter'], kind: 'attack', attackAbility: 'str', damageNotation: '1d10', usesPerCombat: null },
   second_wind: { id: 'second_wind', name: 'Second Wind', aliases: ['second wind'], classIds: ['fighter'], kind: 'heal', attackAbility: 'con', healNotation: '1d10', usesPerCombat: 1 },
   flurry: { id: 'flurry', name: 'Flurry of Blows', aliases: ['flurry', 'flurry of blows'], classIds: ['monk'], kind: 'attack', attackAbility: 'dex', damageNotation: '2d4', usesPerCombat: 2 },
   centered_breath: { id: 'centered_breath', name: 'Centered Breath', aliases: ['centered breath', 'breath'], classIds: ['monk'], kind: 'heal', attackAbility: 'wis', healNotation: '1d6', usesPerCombat: 1 },
-  divine_smite: { id: 'divine_smite', name: 'Divine Smite', aliases: ['divine smite', 'smite'], classIds: ['paladin'], kind: 'attack', attackAbility: 'str', damageNotation: '2d6', usesPerCombat: 2 },
+  divine_smite: { id: 'divine_smite', name: 'Divine Smite', aliases: ['divine smite', 'smite'], classIds: ['paladin'], kind: 'attack', attackAbility: 'str', damageNotation: '2d6', usesPerCombat: 2, resourceKind: 'spell' },
   aimed_shot: { id: 'aimed_shot', name: 'Aimed Shot', aliases: ['aimed shot'], classIds: ['ranger'], kind: 'attack', attackAbility: 'dex', damageNotation: '1d10', usesPerCombat: null },
-  hunters_mark: { id: 'hunters_mark', name: 'Hunter Mark', aliases: ['hunter mark', 'hunters mark'], classIds: ['ranger'], kind: 'attack', attackAbility: 'wis', damageNotation: '1d8', usesPerCombat: 2 },
+  hunters_mark: { id: 'hunters_mark', name: 'Hunter Mark', aliases: ['hunter mark', 'hunters mark'], classIds: ['ranger'], kind: 'attack', attackAbility: 'wis', damageNotation: '1d8', usesPerCombat: 2, resourceKind: 'spell' },
   sneak_attack: { id: 'sneak_attack', name: 'Sneak Attack', aliases: ['sneak attack'], classIds: ['rogue'], kind: 'attack', attackAbility: 'dex', damageNotation: '2d6', usesPerCombat: 1 },
   evasive_step: { id: 'evasive_step', name: 'Evasive Step', aliases: ['evasive step', 'evade'], classIds: ['rogue'], kind: 'heal', attackAbility: 'dex', healNotation: '1d4', usesPerCombat: 1, notes: 'Regain footing and recover a little stamina.' },
-  fireball: { id: 'fireball', name: 'Fireball', aliases: ['fireball'], classIds: ['sorcerer', 'wizard'], kind: 'attack', attackAbility: 'int', damageNotation: '2d8', usesPerCombat: 2 },
-  magic_missile: { id: 'magic_missile', name: 'Magic Missile', aliases: ['magic missile'], classIds: ['wizard'], kind: 'attack', attackAbility: 'int', damageNotation: '2d4', usesPerCombat: null },
-  chaos_bolt: { id: 'chaos_bolt', name: 'Chaos Bolt', aliases: ['chaos bolt'], classIds: ['sorcerer'], kind: 'attack', attackAbility: 'cha', damageNotation: '2d6', usesPerCombat: null },
-  eldritch_blast: { id: 'eldritch_blast', name: 'Eldritch Blast', aliases: ['eldritch blast'], classIds: ['warlock'], kind: 'attack', attackAbility: 'cha', damageNotation: '1d10', usesPerCombat: null },
-  dark_pact: { id: 'dark_pact', name: 'Dark Pact', aliases: ['dark pact'], classIds: ['warlock'], kind: 'heal', attackAbility: 'cha', healNotation: '1d8', usesPerCombat: 1 },
+  fireball: { id: 'fireball', name: 'Fireball', aliases: ['fireball'], classIds: ['sorcerer', 'wizard'], kind: 'attack', attackAbility: 'int', damageNotation: '2d8', usesPerCombat: 2, resourceKind: 'spell' },
+  magic_missile: { id: 'magic_missile', name: 'Magic Missile', aliases: ['magic missile'], classIds: ['wizard'], kind: 'attack', attackAbility: 'int', damageNotation: '2d4', usesPerCombat: null, resourceKind: 'spell' },
+  chaos_bolt: { id: 'chaos_bolt', name: 'Chaos Bolt', aliases: ['chaos bolt'], classIds: ['sorcerer'], kind: 'attack', attackAbility: 'cha', damageNotation: '2d6', usesPerCombat: null, resourceKind: 'spell' },
+  eldritch_blast: { id: 'eldritch_blast', name: 'Eldritch Blast', aliases: ['eldritch blast'], classIds: ['warlock'], kind: 'attack', attackAbility: 'cha', damageNotation: '1d10', usesPerCombat: null, resourceKind: 'spell' },
+  dark_pact: { id: 'dark_pact', name: 'Dark Pact', aliases: ['dark pact'], classIds: ['warlock'], kind: 'heal', attackAbility: 'cha', healNotation: '1d8', usesPerCombat: 1, resourceKind: 'spell' },
+  // New Skills for Phase 3
+  shield_of_faith: { id: 'shield_of_faith', name: 'Shield of Faith', aliases: ['shield of faith', 'shield'], classIds: ['cleric', 'paladin'], kind: 'buff', attackAbility: 'wis', usesPerCombat: 1, resourceKind: 'spell', notes: '+2 AC for 3 rounds' },
+  bless: { id: 'bless', name: 'Bless', aliases: ['bless'], classIds: ['cleric', 'paladin'], kind: 'buff', attackAbility: 'cha', usesPerCombat: 1, resourceKind: 'spell', notes: '+2 to attack rolls for 3 rounds' },
+  bane: { id: 'bane', name: 'Bane', aliases: ['bane'], classIds: ['cleric', 'bard'], kind: 'debuff', attackAbility: 'cha', usesPerCombat: 1, resourceKind: 'spell', notes: '-2 to enemy attack rolls for 3 rounds' },
+  hex: { id: 'hex', name: 'Hex', aliases: ['hex'], classIds: ['warlock'], kind: 'debuff', attackAbility: 'cha', usesPerCombat: 1, resourceKind: 'spell', notes: 'Extra damage on hit' },
+  sleep: { id: 'sleep', name: 'Sleep', aliases: ['sleep'], classIds: ['wizard', 'sorcerer', 'bard'], kind: 'crowd_control', attackAbility: 'int', usesPerCombat: 1, resourceKind: 'spell', notes: 'Target becomes stunned for 1 round' },
+  hold_person: { id: 'hold_person', name: 'Hold Person', aliases: ['hold person', 'hold'], classIds: ['cleric', 'druid', 'wizard', 'warlock'], kind: 'crowd_control', attackAbility: 'wis', usesPerCombat: 1, resourceKind: 'spell', notes: 'Target becomes stunned for 2 rounds' },
+  grease: { id: 'grease', name: 'Grease', aliases: ['grease'], classIds: ['wizard', 'sorcerer'], kind: 'crowd_control', attackAbility: 'int', usesPerCombat: 1, resourceKind: 'spell', notes: 'Target becomes prone' },
+  dodge: { id: 'dodge', name: 'Dodge', aliases: ['dodge'], classIds: ['fighter', 'monk', 'rogue'], kind: 'defense', attackAbility: 'dex', usesPerCombat: null, notes: 'Disadvantage on attacks against you for 1 round' },
+  parry: { id: 'parry', name: 'Parry', aliases: ['parry'], classIds: ['fighter', 'rogue'], kind: 'defense', attackAbility: 'dex', usesPerCombat: 1, notes: 'Reduce damage from the next hit' },
 };
 
 const CLASS_KITS: Record<string, StarterCombatKit> = {
@@ -369,6 +406,8 @@ export function createCombatState(players: DndPlayerRecord[], enemies: DndCombat
     victory: null,
     lastActionMessageChannelId: null,
     lastActionMessageId: null,
+    pendingPlayerActions: {},
+    activeEffects: [],
   };
 }
 
@@ -449,7 +488,13 @@ export function detectAction(
     };
   }
 
-  throw new Error(`No usable combat action matched "${rawAction}". Use one of your known skills, equipped weapon, or combat items.`);
+  // Fallback: treat as improvised action
+  return {
+    kind: 'improvise',
+    targetSide: 'enemy',
+    targetName: extractNamedTarget(lowered, combat.enemies.map(e => e.name)),
+    raw: rawAction,
+  };
 }
 
 export function resolvePlayerAction(args: {
@@ -489,15 +534,29 @@ export function resolvePlayerAction(args: {
 
     if (skill.kind === 'heal') {
       const targetPlayer = resolveAllyTarget(args.action.targetName, args.players, args.actor.userId);
-      const targetSheet = cloneSheet(args.playerSheets.get(targetPlayer.userId));
+      const targetSheet = cloneSheet(args.playerSheets.get(targetPlayer.userId) ?? playerUpdates.get(targetPlayer.userId));
       const healRoll = rollDice(skill.healNotation ?? '1d4');
       const healed = scaleCombatNumber(healRoll.total, abilityModifier(args.actorSheet.abilities[skill.attackAbility]));
       targetSheet.hp = Math.min(targetSheet.maxHp, targetSheet.hp + healed);
       playerUpdates.set(targetPlayer.userId, targetSheet);
       messages.push(`${args.actor.characterName} uses ${skill.name} on ${targetPlayer.characterName}, restoring ${healed} HP.`);
+    } else if (skill.kind === 'buff') {
+      const targetPlayer = resolveAllyTarget(args.action.targetName, args.players, args.actor.userId);
+      const effect = createActiveEffectFromSkill(skill, targetPlayer.userId, undefined);
+      combat.activeEffects.push(effect);
+      messages.push(`${args.actor.characterName} casts ${skill.name} on ${targetPlayer.characterName}: ${skill.notes ?? 'Applied buff'}.`);
+    } else if (skill.kind === 'debuff' || skill.kind === 'crowd_control') {
+      const enemy = resolveEnemyTarget(combat, args.action.targetName);
+      const effect = createActiveEffectFromSkill(skill, undefined, enemy.id);
+      combat.activeEffects.push(effect);
+      messages.push(`${args.actor.characterName} uses ${skill.name} on ${enemy.name}: ${skill.notes ?? 'Applied condition'}.`);
+    } else if (skill.kind === 'defense') {
+      const effect = createActiveEffectFromSkill(skill, args.actor.userId, undefined);
+      combat.activeEffects.push(effect);
+      messages.push(`${args.actor.characterName} adopts a defensive stance with ${skill.name}: ${skill.notes ?? 'Gained defense'}.`);
     } else {
       const enemy = resolveEnemyTarget(combat, args.action.targetName);
-      const attackRoll = performAttackRoll(args.actorSheet, skill.attackAbility);
+      const attackRoll = performAttackRoll(combat, args.actor.userId, skill.attackAbility);
       if (attackRoll.total >= enemy.ac) {
         const damage = scaleCombatNumber(rollDice(skill.damageNotation ?? '1d6').total, abilityModifier(args.actorSheet.abilities[skill.attackAbility]));
         enemy.hp = Math.max(0, enemy.hp - damage);
@@ -539,7 +598,7 @@ export function resolvePlayerAction(args: {
       const targetPlayer = consumable.target === 'self'
         ? args.players.find(player => player.userId === args.actor.userId)!
         : resolveAllyTarget(args.action.targetName, args.players, args.actor.userId);
-      const targetSheet = cloneSheet(args.playerSheets.get(targetPlayer.userId));
+      const targetSheet = cloneSheet(args.playerSheets.get(targetPlayer.userId) ?? playerUpdates.get(targetPlayer.userId));
       const healed = rollDice(consumable.notation).total;
       targetSheet.hp = Math.min(targetSheet.maxHp, targetSheet.hp + healed);
       playerUpdates.set(targetPlayer.userId, targetSheet);
@@ -587,7 +646,7 @@ export function resolvePlayerAction(args: {
     }
 
     const enemy = resolveEnemyTarget(combat, args.action.targetName);
-    const attackRoll = performAttackRoll(args.actorSheet, weapon.attackAbility);
+    const attackRoll = performAttackRoll(combat, args.actor.userId, weapon.attackAbility);
     if (attackRoll.total >= enemy.ac) {
       const baseDamage = rollDice(weapon.damageNotation).total + Math.max(0, abilityModifier(args.actorSheet.abilities[weapon.damageAbility]));
       const damage = scaleCombatNumber(baseDamage, abilityModifier(args.actorSheet.abilities[weapon.damageAbility]));
@@ -609,7 +668,182 @@ export function resolvePlayerAction(args: {
     };
   }
 
+  if (args.action.kind === 'improvise') {
+    const ability = inferImproviseAbility(args.action.raw, args.actorSheet);
+    const roll = performAttackRoll(combat, args.actor.userId, ability);
+    const enemy = resolveEnemyTarget(combat, args.action.targetName);
+
+    if (roll.total >= 15) {
+      // Full effect: +2 AC or disadvantage on one enemy
+      combat.activeEffects.push({
+        id: `improvise-${args.actor.userId}-${Date.now()}`,
+        name: `Improvised Maneuver (${args.actor.characterName})`,
+        targetUserId: args.actor.userId,
+        durationRounds: 1,
+        effect: 'ac_bonus',
+        value: 2,
+      });
+      messages.push(`${args.actor.characterName} pulls off a brilliant improvised maneuver (${roll.total})! They gain +2 AC for the round.`);
+    } else if (roll.total >= 10) {
+      // Partial effect: +1 AC
+      combat.activeEffects.push({
+        id: `improvise-partial-${args.actor.userId}-${Date.now()}`,
+        name: `Partial Maneuver (${args.actor.characterName})`,
+        targetUserId: args.actor.userId,
+        durationRounds: 1,
+        effect: 'ac_bonus',
+        value: 1,
+      });
+      messages.push(`${args.actor.characterName} attempts something clever (${roll.total}), gaining +1 AC from their focused defense.`);
+    } else {
+      messages.push(`${args.actor.characterName}'s improvised attempt (${roll.total}) falls flat, leaving them exposed.`);
+    }
+    messages.forEach(message => appendCombatLog(combat, args.actor.characterName, message));
+    return {
+      combat,
+      playerUpdates: [],
+      inventoryUpdates,
+      removedInventoryItemIds,
+      messages,
+    };
+  }
+
   throw new Error(`Unsupported combat action: ${args.action.kind}`);
+}
+
+export function resolveCombatRound(args: {
+  combat: DndCombatState;
+  players: DndPlayerRecord[];
+  playerSheets: Map<string, DndCharacterSheet>;
+  getInventory: (userId: string) => DndInventoryItemRecord[];
+}): RoundResolutionResult {
+  const combat = cloneCombatState(args.combat);
+  const messages: string[] = [];
+  const roundNarrative: string[] = [];
+  const inventoryUpdates: DndInventoryItemRecord[] = [];
+  const removedInventoryItemIds: string[] = [];
+  const playerUpdates = new Map<string, DndCharacterSheet>();
+
+  const livingPlayers = args.players.filter(p => {
+    const sheet = args.playerSheets.get(p.userId);
+    return sheet && sheet.hp > 0 && p.status !== 'left';
+  });
+
+  // Resolve player actions in initiative order
+  for (const combatant of combat.order) {
+    if (combatant.side !== 'player') continue;
+    const pending = combat.pendingPlayerActions[combatant.userId];
+    if (!pending) continue;
+
+    const actor = args.players.find(p => p.userId === combatant.userId);
+    if (!actor) continue;
+    const actorSheet = cloneSheet(playerUpdates.get(actor.userId) ?? args.playerSheets.get(actor.userId));
+    if (!actorSheet || actorSheet.hp <= 0) continue;
+
+    const inventory = args.getInventory(actor.userId);
+    let action: ParsedCombatAction;
+    if (pending.actionJson) {
+      try {
+        action = JSON.parse(pending.actionJson);
+      } catch {
+        action = detectAction(pending.actionText, actor, actorSheet, inventory, combat, args.players);
+      }
+    } else {
+      action = detectAction(pending.actionText, actor, actorSheet, inventory, combat, args.players);
+    }
+
+    const result = resolvePlayerAction({
+      combat,
+      actor,
+      actorSheet,
+      action,
+      players: args.players,
+      playerSheets: new Map([...args.playerSheets, ...playerUpdates]),
+      inventory,
+    });
+
+    for (const update of result.playerUpdates) {
+      playerUpdates.set(update.userId, update.sheet);
+    }
+    inventoryUpdates.push(...result.inventoryUpdates);
+    removedInventoryItemIds.push(...result.removedInventoryItemIds);
+    messages.push(...result.messages);
+
+    // Build narrative snippet for this action
+    const narrativeSnippet = buildActionNarrativeSnippet(actor.characterName, pending.actionText, action, result.messages);
+    roundNarrative.push(narrativeSnippet);
+  }
+
+  // Clear pending actions for the round
+  combat.pendingPlayerActions = {};
+
+  // Run enemy turns
+  const enemyResult = runEnemyTurns({
+    combat,
+    players: args.players,
+    playerSheets: new Map([...args.playerSheets, ...playerUpdates]),
+  });
+
+  for (const update of enemyResult.playerUpdates) {
+    playerUpdates.set(update.userId, update.sheet);
+  }
+  messages.push(...enemyResult.messages);
+
+  // Advance to next round
+  advanceTurnIndex(enemyResult.combat, args.players, new Map([...args.playerSheets, ...playerUpdates]));
+
+  // Decrement active effects
+  enemyResult.combat.activeEffects = enemyResult.combat.activeEffects
+    .map(effect => ({ ...effect, durationRounds: effect.durationRounds - 1 }))
+    .filter(effect => effect.durationRounds > 0);
+
+  return {
+    combat: enemyResult.combat,
+    playerUpdates: Array.from(playerUpdates.entries()).map(([userId, sheet]) => ({ userId, sheet })),
+    inventoryUpdates,
+    removedInventoryItemIds,
+    messages,
+    roundNarrative,
+  };
+}
+
+function buildActionNarrativeSnippet(actorName: string, rawText: string, action: ParsedCombatAction, resultMessages: string[]): string {
+  if (action.kind === 'improvise') {
+    return `**${actorName}** attempts something unconventional: "_${rawText}_"`;
+  }
+  if (action.kind === 'skill' && action.skill) {
+    return `**${actorName}** uses **${action.skill.name}**`;
+  }
+  if (action.kind === 'weapon' && action.weapon) {
+    return `**${actorName}** attacks with **${action.weapon.name}**`;
+  }
+  if (action.kind === 'item' && action.item) {
+    return `**${actorName}** uses **${action.item.name}**`;
+  }
+  return `**${actorName}** acts`;
+}
+
+function inferImproviseAbility(rawText: string, sheet: DndCharacterSheet): DndAbilityKey {
+  const lowered = rawText.toLowerCase();
+  const abilityHints: Array<{ keywords: string[]; ability: DndAbilityKey }> = [
+    { keywords: ['block', 'dodge', 'parry', 'evade', 'duck', 'roll'], ability: 'dex' },
+    { keywords: ['staff', 'wand', 'spell', 'magic', 'arcane', 'blast', 'fireball'], ability: 'int' },
+    { keywords: ['focus', 'holy', 'prayer', 'sacred', 'divine', 'totem'], ability: 'wis' },
+    { keywords: ['taunt', 'mock', 'insult', 'seduce', 'charm', 'intimidate'], ability: 'cha' },
+    { keywords: ['shove', 'grapple', 'break', 'smash', 'charge', 'tackle'], ability: 'str' },
+    { keywords: ['endure', 'resist', 'tough', 'brace'], ability: 'con' },
+  ];
+
+  for (const hint of abilityHints) {
+    if (hint.keywords.some(kw => lowered.includes(kw))) {
+      return hint.ability;
+    }
+  }
+
+  // Default to the character's highest ability
+  const entries = Object.entries(sheet.abilities) as [DndAbilityKey, number][];
+  entries.sort((a, b) => b[1] - a[1]);
+  return entries[0]?.[0] ?? 'str';
 }
 
 export function runEnemyTurns(args: {
@@ -650,19 +884,39 @@ export function runEnemyTurns(args: {
 
     livingPlayers.sort((a, b) => a.sheet.hp - b.sheet.hp || a.player.characterName.localeCompare(b.player.characterName));
     const target = livingPlayers[0];
-    const roll = d20(enemy.attackBonus);
-    if (roll.total >= target.sheet.ac) {
+
+    // Check for disadvantage against this player
+    const disadvantage = combat.activeEffects.some(e => e.targetUserId === target.player.userId && e.effect === 'disadvantage_attacks');
+
+    // Check for AC bonus
+    let acBonus = 0;
+    for (const e of combat.activeEffects) {
+      if (e.targetUserId === target.player.userId && e.effect === 'ac_bonus') acBonus += e.value;
+    }
+
+    const targetAc = target.sheet.ac + acBonus;
+
+    let roll: DiceRoll;
+    if (disadvantage) {
+      const r1 = d20(enemy.attackBonus);
+      const r2 = d20(enemy.attackBonus);
+      roll = r1.total < r2.total ? r1 : r2;
+    } else {
+      roll = d20(enemy.attackBonus);
+    }
+
+    if (roll.total >= targetAc) {
       const damage = rollDice(enemy.damageNotation).total;
       target.sheet.hp = Math.max(0, target.sheet.hp - damage);
       if (target.sheet.hp === 0) {
         target.sheet.conditions = Array.from(new Set([...target.sheet.conditions, 'unconscious']));
       }
       playerUpdates.set(target.player.userId, target.sheet);
-      const summary = `${enemy.name} hits ${target.player.characterName} (${roll.total} vs AC ${target.sheet.ac}) for ${damage} damage.`;
+      const summary = `${enemy.name} hits ${target.player.characterName} (${roll.total} vs AC ${targetAc}) for ${damage} damage.`;
       messages.push(summary);
       appendCombatLog(combat, enemy.name, summary);
     } else {
-      const summary = `${enemy.name} attacks ${target.player.characterName}, but misses (${roll.total} vs AC ${target.sheet.ac}).`;
+      const summary = `${enemy.name} attacks ${target.player.characterName}, but misses (${roll.total} vs AC ${targetAc}).`;
       messages.push(summary);
       appendCombatLog(combat, enemy.name, summary);
     }
@@ -846,8 +1100,108 @@ function extractNamedTarget(text: string, names: string[]): string | null {
   return names.find(name => lowered.includes(name.toLowerCase())) ?? null;
 }
 
-function performAttackRoll(sheet: DndCharacterSheet, ability: DndAbilityKey): DiceRoll {
-  return d20(abilityModifier(sheet.abilities[ability]) + sheet.proficiencyBonus);
+function performAttackRoll(combat: DndCombatState, actorUserId: string, ability: DndAbilityKey, sheet?: DndCharacterSheet): DiceRoll {
+  const combatant = combat.order.find(c => c.userId === actorUserId);
+
+  let bonus = 0;
+  let advantage = false;
+  let disadvantage = false;
+
+  if (sheet) {
+    bonus += abilityModifier(sheet.abilities[ability]) + (sheet.proficiencyBonus ?? 2);
+  }
+
+  // Check active effects for actor
+  for (const effect of combat.activeEffects) {
+    if (effect.targetUserId === actorUserId || (combatant?.side === 'enemy' && effect.targetEnemyId === actorUserId)) {
+      if (effect.effect === 'attack_bonus') bonus += effect.value;
+      if (effect.effect === 'advantage_attacks') advantage = true;
+      if (effect.effect === 'disadvantage_attacks') disadvantage = true;
+      if (effect.effect === 'stunned') disadvantage = true;
+    }
+  }
+
+  if (advantage && !disadvantage) {
+    const r1 = Math.floor(Math.random() * 20) + 1;
+    const r2 = Math.floor(Math.random() * 20) + 1;
+    const roll = Math.max(r1, r2);
+    return {
+      notation: `d20adv${bonus >= 0 ? `+${bonus}` : bonus}`,
+      rolls: [r1, r2],
+      modifier: bonus,
+      total: roll + bonus,
+    };
+  } else if (disadvantage && !advantage) {
+    const r1 = Math.floor(Math.random() * 20) + 1;
+    const r2 = Math.floor(Math.random() * 20) + 1;
+    const roll = Math.min(r1, r2);
+    return {
+      notation: `d20dis${bonus >= 0 ? `+${bonus}` : bonus}`,
+      rolls: [r1, r2],
+      modifier: bonus,
+      total: roll + bonus,
+    };
+  }
+
+  return d20(bonus);
+}
+
+function createActiveEffectFromSkill(skill: DndSkillDefinition, targetUserId?: string, targetEnemyId?: string): DndActiveEffect {
+  const effect: any = {
+    id: `${skill.id}-${Date.now()}`,
+    name: skill.name,
+    targetUserId,
+    targetEnemyId,
+    durationRounds: 3, // Default duration
+    effect: 'ac_bonus',
+    value: 0,
+  };
+
+  switch (skill.id) {
+    case 'shield_of_faith':
+      effect.effect = 'ac_bonus';
+      effect.value = 2;
+      effect.durationRounds = 3;
+      break;
+    case 'bless':
+      effect.effect = 'attack_bonus';
+      effect.value = 2;
+      effect.durationRounds = 3;
+      break;
+    case 'bane':
+      effect.effect = 'attack_bonus';
+      effect.value = -2;
+      effect.durationRounds = 3;
+      break;
+    case 'hex':
+      effect.effect = 'damage_bonus';
+      effect.value = 3;
+      effect.durationRounds = 3;
+      break;
+    case 'sleep':
+      effect.effect = 'stunned';
+      effect.durationRounds = 1;
+      break;
+    case 'hold_person':
+      effect.effect = 'stunned';
+      effect.durationRounds = 2;
+      break;
+    case 'grease':
+      effect.effect = 'prone';
+      effect.durationRounds = 1;
+      break;
+    case 'dodge':
+      effect.effect = 'disadvantage_attacks';
+      effect.durationRounds = 1;
+      break;
+    case 'parry':
+      effect.effect = 'ac_bonus';
+      effect.value = 3;
+      effect.durationRounds = 1;
+      break;
+  }
+
+  return effect;
 }
 
 function d20(modifier: number): DiceRoll {

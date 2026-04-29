@@ -10,7 +10,7 @@
 
 import { EventEmitter } from 'events';
 import { ContextManager, estimateTokens } from './context.js';
-import { LLMClient, LLMMessage, LLMToolCall, LLMToolDef } from './llm.js';
+import { LLMClient, LLMMessage, LLMToolCall, LLMToolDef, shouldUseNativeTools } from './llm.js';
 import { MemoryStore } from './memory.js';
 import { buildSkillPrompt, LoadedSkill, selectRelevantSkills } from './skills.js';
 import {
@@ -28,8 +28,73 @@ import { ConfirmationManager } from './confirmation.js';
 import { getConfig, loadSystemPrompt } from '../config.js';
 import { createLogger } from '../logger.js';
 import { toolRegistry, ToolContext, ToolDefinition, ToolResult } from './tools.js';
+import { WEBUI_FORMATTING_RULES } from './webui_format.js';
 
 const log = createLogger('engine');
+
+function usesNativeToolPrompt(llm: LLMClient, toolDefs: LLMToolDef[]): boolean {
+  if (toolDefs.length === 0) return false;
+  const provider = llm.getProviders()[0];
+  if (!provider) return false;
+  return shouldUseNativeTools(provider, toolDefs);
+}
+
+function buildToolUseInstructions(nativeToolsEnabled: boolean, includeTaskUpdate: boolean): string {
+  const fileHandling = `FILE HANDLING:
+- When modifying existing files, PREFER the "edit_file" tool over "write_file".
+- Use "read_file" with "lineNumbers: true" for precise matching.
+- DO NOT try to read binary files (e.g., .docx, .pdf, .zip, images). If you need to "see" them, ask the user to describe them or use specialized tools if available.`;
+
+  if (nativeToolsEnabled) {
+    const executionRules = includeTaskUpdate
+      ? `CRITICAL: In every turn, you MUST emit either a native tool call or a <task_update>.
+NEVER output plain text outside of structural tags when a <task_update> is required.
+If you have the final answer for the user, you MUST put it in the "userFacing" field of a <task_update> block.
+
+If the current task is complete, blocked, or failed, emit exactly:
+<task_update>
+{"status":"completed|blocked|failed","summary":"what happened","artifacts":[],"userFacing":"Put your final response to the user here","needsReplan":false}
+</task_update>
+
+If you need more tools to reach the objective, call a tool with the provider's native function-calling interface.
+Do NOT emit <tool_call> XML or raw tool-call JSON in normal text.`
+      : `To use a tool, call it with the provider's native function-calling interface.
+Do NOT emit <tool_call> XML or raw tool-call JSON in normal text.
+
+After a tool call, you will receive the tool result in the conversation. Use only ONE tool at a time.`;
+
+    return `${executionRules}
+
+${fileHandling}
+
+AUTONOMOUS PLANNING: If the task is complex and requires a multi-step structured plan, emit <request_plan reason="brief reason" /> to switch to planning mode.`;
+  }
+
+  const executionRules = includeTaskUpdate
+    ? `CRITICAL: In every turn, you MUST emit either a <tool_call> or a <task_update>.
+NEVER output plain text outside of structural tags. If you have the final answer for the user, you MUST put it in the "userFacing" field of a <task_update> block.
+
+If the current task is complete, blocked, or failed, emit exactly:
+<task_update>
+{"status":"completed|blocked|failed","summary":"what happened","artifacts":[],"userFacing":"Put your final response to the user here","needsReplan":false}
+</task_update>
+
+If you need more tools to reach the objective, emit a <tool_call> block.`
+    : `To use a tool, output exactly this xml format:
+<tool_call>
+{"name": "tool_name", "arguments": {"param1": "value"}}
+</tool_call>
+
+CRITICAL: Always put your multi-step reasoning inside <think> tags before calling a tool. In the final response (outside tags), do NOT narrate your plan. No "I will now check...", no "I need to...". Emit the <tool_call> block immediately after your thoughts. Any text outside of <think> or <tool_call> tags while a tool is being used is forbidden.
+
+After emitting a tool call, you will receive a <tool_result> message. Use only ONE tool at a time.`;
+
+  return `${executionRules}
+
+${fileHandling}
+
+AUTONOMOUS PLANNING: If the task is complex and requires a multi-step structured plan, emit <request_plan reason="brief reason" /> to switch to planning mode.`;
+}
 
 export interface AgentAttachment {
   name: string;
@@ -158,7 +223,9 @@ export class AgentEngine extends EventEmitter {
       release = resolve;
     });
     this.sessionLocks.set(sessionKey, currentLock.then(() => nextLock));
+    log.debug({ sessionKey }, 'Attempting to acquire session lock');
     await currentLock;
+    log.debug({ sessionKey }, 'Session lock acquired');
     return release;
   }
 
@@ -167,6 +234,7 @@ export class AgentEngine extends EventEmitter {
     try {
       yield* this._processRequest(request);
     } finally {
+      log.debug({ sessionKey: request.sessionKey }, 'Releasing session lock');
       release();
     }
   }
@@ -386,7 +454,8 @@ export class AgentEngine extends EventEmitter {
     this.memory.saveMessage({
       sessionKey: request.sessionKey,
       role: 'assistant',
-      content: contentToSave,
+      content: finalResponse,
+      reasoningContent: allThinkingContent || undefined,
       timestamp: Date.now(),
     });
 
@@ -405,7 +474,13 @@ export class AgentEngine extends EventEmitter {
 
   private async prepareRequestContext(request: AgentRequest): Promise<PreparedRequestContext> {
     const config = getConfig();
-    const systemPrompt = request.systemPromptOverride ?? loadSystemPrompt();
+    let systemPrompt = request.systemPromptOverride ?? loadSystemPrompt();
+
+    // Inject WebUI-specific formatting rules if the request is coming from the WebUI
+    if (request.channelType === 'webui') {
+      systemPrompt += `\n\n${WEBUI_FORMATTING_RULES}`;
+    }
+
     const activeSkills = config.agent?.skills?.enabled === false
       ? []
       : selectRelevantSkills(request.message, config.agent?.skills?.maxInjected);
@@ -418,6 +493,10 @@ export class AgentEngine extends EventEmitter {
         role: entry.role as 'user' | 'assistant',
         content: entry.content,
       };
+
+      if (entry.reasoningContent) {
+        message.reasoning_content = entry.reasoningContent;
+      }
 
       if (entry.role === 'user' && entry.metadata) {
         try {
@@ -528,7 +607,8 @@ export class AgentEngine extends EventEmitter {
     this.memory.saveMessage({
       sessionKey: request.sessionKey,
       role: 'assistant',
-      content: contentToSave,
+      content: finalResponse,
+      reasoningContent: allThinkingContent || undefined,
       timestamp: Date.now(),
     });
 
@@ -553,19 +633,24 @@ export class AgentEngine extends EventEmitter {
     const maxIterations = config.agent?.maxTurns ?? 20;
     const skillPrompt = buildSkillPrompt(prepared.activeSkills);
     const toolDefs = [...prepared.toolDefs];
+    const nativeToolsEnabled = usesNativeToolPrompt(this.llm, toolDefs);
 
     let systemPrompt = prepared.systemPrompt;
     if (skillPrompt) {
       systemPrompt += `\n\n---\n\n${skillPrompt}`;
     }
     if (toolDefs.length > 0) {
-      systemPrompt += `\n\n# Available Tools\nYou have access to the following tools:\n<tools>\n`;
-      systemPrompt += JSON.stringify(toolDefs, null, 2);
-      systemPrompt += `\n</tools>`;
+      if (!nativeToolsEnabled) {
+        systemPrompt += `\n\n# Available Tools\nYou have access to the following tools:\n<tools>\n`;
+        systemPrompt += JSON.stringify(toolDefs, null, 2);
+        systemPrompt += `\n</tools>`;
+      } else {
+        systemPrompt += `\n\n# Tools\nThe runtime has attached tool schemas through the provider's native function-calling interface.`;
+      }
       if (prepared.toolGuidance) {
         systemPrompt += `\n\n${prepared.toolGuidance}`;
       }
-      systemPrompt += `\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nCRITICAL: Always put your multi-step reasoning inside <think> tags before calling a tool. In the final response (outside tags), do NOT narrate your plan. No "I will now check...", no "I need to...". Emit the <tool_call> block immediately after your thoughts. Any text outside of <think> or <tool_call> tags while a tool is being used is forbidden.\n\nAfter emitting a tool call, you will receive a <tool_result> message. Use only ONE tool at a time.\n\nFILE HANDLING:\n- When modifying existing files, PREFER the "edit_file" tool over "write_file".\n- Use "read_file" with "lineNumbers: true" for precise matching.\n- DO NOT try to read binary files (e.g., .docx, .pdf, .zip, images). If you need to "see" them, ask the user to describe them or use specialized tools if available.\n\nAUTONOMOUS PLANNING: If the task is complex and requires a multi-step structured plan, emit <request_plan reason="brief reason" /> to switch to planning mode.`;
+      systemPrompt += `\n\n${buildToolUseInstructions(nativeToolsEnabled, false)}`;
     }
 
     const messages: LLMMessage[] = [
@@ -585,11 +670,12 @@ export class AgentEngine extends EventEmitter {
       let assistantContent = '';
       let thinkingContent = '';
       const toolCalls: LLMToolCall[] = [];
- 
+
       const llmDefaults = config.llm?.defaults;
       for await (const chunk of this.llm.streamChat(messages, toolDefs, {
         temperature: llmDefaults?.temperature,
         topP: llmDefaults?.topP,
+        topK: llmDefaults?.topK,
         maxTokens: llmDefaults?.maxOutputTokens,
         disableReasoning: request.disableReasoning
       })) {
@@ -647,6 +733,11 @@ export class AgentEngine extends EventEmitter {
       }
 
       if (toolCalls.length === 0) {
+        if (assistantContent.trim() && isLikelyHiddenReasoning(assistantContent)) {
+          thinkingContent += `${thinkingContent ? '\n' : ''}${assistantContent.trim()}`;
+          assistantContent = '';
+        }
+
         if (!assistantContent.trim() && thinkingContent.trim()) {
           if (repairAttempts < 2) {
             repairAttempts++;
@@ -809,6 +900,7 @@ export class AgentEngine extends EventEmitter {
     for await (const chunk of this.llm.streamChat(messages, undefined, {
       temperature: 0.2, // Planner remains low temp for structure
       topP: llmDefaults?.topP,
+      topK: llmDefaults?.topK,
       maxTokens: 1200
     })) {
       if (chunk.type === 'thinking' && chunk.content) {
@@ -850,15 +942,20 @@ export class AgentEngine extends EventEmitter {
     const selectedTools = this.resolveTaskTools(prepared, task, request.message);
     const toolDefs = toolRegistry.toLLMToolDefs(selectedTools);
     const toolGuidance = toolRegistry.buildToolGuidance(selectedTools, `${request.message}\n${task.title}\n${task.objective}`);
+    const nativeToolsEnabled = usesNativeToolPrompt(this.llm, toolDefs);
 
     let systemPrompt = prepared.systemPrompt;
     if (skillPrompt) {
       systemPrompt += `\n\n---\n\n${skillPrompt}`;
     }
     if (toolDefs.length > 0) {
-      systemPrompt += `\n\n# Available Tools\nYou have access to the following tools:\n<tools>\n`;
-      systemPrompt += JSON.stringify(toolDefs, null, 2);
-      systemPrompt += `\n</tools>`;
+      if (!nativeToolsEnabled) {
+        systemPrompt += `\n\n# Available Tools\nYou have access to the following tools:\n<tools>\n`;
+        systemPrompt += JSON.stringify(toolDefs, null, 2);
+        systemPrompt += `\n</tools>`;
+      } else {
+        systemPrompt += `\n\n# Tools\nThe runtime has attached tool schemas through the provider's native function-calling interface.`;
+      }
       if (toolGuidance) {
         systemPrompt += `\n\n${toolGuidance}`;
       }
@@ -870,16 +967,7 @@ Stay focused on the current task only.
 Use one tool at a time when needed.
 Do not answer the user directly during task execution.
 
-CRITICAL: In every turn, you MUST emit either a <tool_call> or a <task_update>.
-NEVER output plain text outside of structural tags. If you have the final answer for the user, you MUST put it in the "userFacing" field of a <task_update> block.
-
-If the current task is complete, blocked, or failed, emit exactly:
-<task_update>
-{"status":"completed|blocked|failed","summary":"what happened","artifacts":[],"userFacing":"Put your final response to the user here","needsReplan":false}
-</task_update>
-
-If you need more tools to reach the objective, emit a <tool_call> block.
-FILE EDITING: When modifying existing files, PREFER the "edit_file" tool over "write_file". This prevents accidental truncation. Use "read_file" with "lineNumbers: true" to get precise blocks for searching.
+${buildToolUseInstructions(nativeToolsEnabled, true)}
 Do not expose the internal plan outside tags.`;
 
     const completedTaskSummaries = plan.tasks
@@ -925,11 +1013,12 @@ Do not expose the internal plan outside tags.`;
       let assistantContent = '';
       let thinkingContent = '';
       const toolCalls: LLMToolCall[] = [];
- 
+
       const llmDefaults = getConfig().llm?.defaults;
       for await (const chunk of this.llm.streamChat(messages, toolDefs, {
         temperature: llmDefaults?.temperature,
         topP: llmDefaults?.topP,
+        topK: llmDefaults?.topK,
         maxTokens: llmDefaults?.maxOutputTokens,
         disableReasoning: request.disableReasoning
       })) {
@@ -1160,6 +1249,7 @@ Do not expose the internal plan outside tags.`;
     ], undefined, {
       temperature: llmDefaults?.temperature,
       topP: llmDefaults?.topP,
+      topK: llmDefaults?.topK,
       maxTokens: llmDefaults?.maxOutputTokens ?? 800
     })) {
       if (chunk.type === 'thinking' && chunk.content) {
@@ -1227,7 +1317,7 @@ Do not expose the internal plan outside tags.`;
     let assistantContent = '';
     let thinkingContent = '';
     let tokens = 0;
- 
+
     const llmDefaults = getConfig().llm?.defaults;
     for await (const chunk of this.llm.streamChat([
       { role: 'system', content: prompt },
@@ -1236,6 +1326,7 @@ Do not expose the internal plan outside tags.`;
     ], undefined, {
       temperature: 0.2, // Replanner low temp
       topP: llmDefaults?.topP,
+      topK: llmDefaults?.topK,
       maxTokens: 1200
     })) {
       if (chunk.type === 'thinking' && chunk.content) {
@@ -1354,10 +1445,24 @@ function extractEmbeddedToolCalls(
       { regex: /<\|tool_call\|>call:\s*([a-z0-9_-]+)({[\s\S]*?})(?:<\/tool_call>|<tool_call\|>|(?:\n|$))/gi, group: 0, complex: true },
       { regex: /<\|tool_call>call:\s*([a-z0-9_-]+)({[\s\S]*?})(?:<\/tool_call>|<tool_call\|>|(?:\n|$))/gi, group: 0, complex: true },
       { regex: /<tool_call>\s*(<function=[\s\S]*?<\/function>)\s*<\/tool_call>/gi, group: 1, functionStyle: true },
+      { regex: /<[|｜]DSML[|｜]tool_calls[\s\S]*?<\/[|｜]DSML[|｜]tool_calls>/gi, group: 0, dsml: true },
       { regex: /```(?:json)?\s*({[\s\S]*?})\s*```/g, group: 1 },
     ];
 
     for (const matcher of matchers) {
+      if ((matcher as any).dsml) {
+        const matches = source.matchAll(matcher.regex);
+        for (const match of matches) {
+          const dsmlCalls = parseDsmlToolCalls(match[0].trim(), toolNames);
+          for (const call of dsmlCalls) {
+            if (!calls.some(existing => existing.function.name === call.function.name && existing.function.arguments === call.function.arguments)) {
+              calls.push(call);
+            }
+          }
+        }
+        continue;
+      }
+
       if ((matcher as any).functionStyle) {
         const matches = source.matchAll(matcher.regex);
         for (const match of matches) {
@@ -1437,8 +1542,10 @@ function stripEmbeddedToolCalls(text: string): string {
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
     .replace(/<\|tool_call\|?>[\s\S]*?(?:<\/tool_call>|<tool_call\|>|(?:\n|$))/gi, '')
     .replace(/<tool_call>\s*<function=[\s\S]*?<\/function>\s*<\/tool_call>/gi, '')
+    .replace(/<[|｜]DSML[|｜]tool_calls[\s\S]*?<\/[|｜]DSML[|｜]tool_calls>/gi, '')
     .replace(/```(?:json)?\s*{[\s\S]*?}\s*```/g, '')
     .replace(/<\/?task_update>/gi, '')
+    .replace(/<\/?(think|thinking|thought)>/gi, '')
     .trim();
 }
 
@@ -1491,6 +1598,49 @@ function parseFunctionStyleToolCall(raw: string): { name: string; arguments: Rec
   }
 
   return { name, arguments: args };
+}
+
+function parseDsmlToolCalls(dsml: string, toolNames: Set<string>): LLMToolCall[] {
+  const calls: LLMToolCall[] = [];
+  const invokeRegex = /<[|｜]DSML[|｜]invoke\s+name="([^"]+)">([\s\S]*?)<\/[|｜]DSML[|｜]invoke>/gi;
+  const paramRegex = /<[|｜]DSML[|｜]parameter\s+name="([^"]+)"\s+string="(true|false)">([\s\S]*?)<\/[|｜]DSML[|｜]parameter>/gi;
+
+  let invokeMatch: RegExpExecArray | null;
+  while ((invokeMatch = invokeRegex.exec(dsml)) !== null) {
+    const name = invokeMatch[1];
+    if (!toolNames.has(name)) continue;
+
+    const body = invokeMatch[2] ?? '';
+    const args: Record<string, unknown> = {};
+    let paramMatch: RegExpExecArray | null;
+    while ((paramMatch = paramRegex.exec(body)) !== null) {
+      const key = paramMatch[1];
+      const asString = paramMatch[2] === 'true';
+      const rawValue = (paramMatch[3] ?? '').trim();
+
+      if (asString) {
+        args[key] = rawValue;
+        continue;
+      }
+
+      try {
+        args[key] = JSON.parse(rawValue);
+      } catch {
+        args[key] = rawValue;
+      }
+    }
+
+    calls.push({
+      id: `embedded_dsml_${Date.now()}_${calls.length}`,
+      type: 'function',
+      function: {
+        name,
+        arguments: JSON.stringify(args),
+      },
+    });
+  }
+
+  return calls;
 }
 
 function inferSafeToolCall(
@@ -1658,6 +1808,14 @@ function isLikelyHiddenReasoning(text: string): boolean {
 
   if (!cleaned) return false;
 
+  if (/^`[\s\S]{0,800}$/m.test(text) && /\b(import |def |subprocess|requests?|python|bash|powershell|curl)\b/i.test(text)) {
+    return true;
+  }
+
+  if (/^\s*(task plan|searching for|thought process|reasoning:)\b/i.test(cleaned)) {
+    return true;
+  }
+
   return [
     /^i need to\b/i,
     /^let me\b/i,
@@ -1669,5 +1827,9 @@ function isLikelyHiddenReasoning(text: string): boolean {
     /^to answer this[, ]/i,
     /\buse (?:the )?[a-z0-9_]+\b/i,
     /\b(search|check|look up|inspect|compare|analyze|review|read|open|fetch)\b.+\b(first|before|then)\b/i,
+    /\bthe agent could not complete\b/i,
+    /\b(searching for|researching|cross[- ]?checking|looking up)\b/i,
+    /\bimport subprocess\b/i,
+    /\bdef [a-z_]+\(/i,
   ].some((pattern) => pattern.test(cleaned));
 }

@@ -26,6 +26,7 @@ config/personality/*.md
 !config/personality/*.template.md
 
 # Scratch and temp data
+scratch/
 .tmp/
 tmp/
 temp/
@@ -36,7 +37,6 @@ temp/
 Thumbs.db
 .vscode/
 .idea/
-.gitignore
 
 # Research
 liteclaw_research/

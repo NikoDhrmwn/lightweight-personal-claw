@@ -9,6 +9,8 @@ import type {
   DndDowntimeProgressRecord,
   DndDowntimeRecord,
   DndInventoryItemRecord,
+  DndQueuedNarrativeAction,
+  DndSceneState,
   DndDeathSaveState,
   DndAbilityScores,
   DndOnboardingStep,
@@ -35,9 +37,12 @@ import {
   parseEnemyDefinitions,
   parseInventoryMetadata,
   resolvePlayerAction,
+  resolveCombatRound,
   runEnemyTurns,
   advanceTurnIndex,
+  SKILL_DEFINITIONS,
   type StarterItemTemplate,
+  type RoundResolutionResult,
 } from './combat-system.js';
 
 const log = createLogger('dnd-manager');
@@ -70,7 +75,7 @@ export interface DndActor {
 }
 
 export class DndSessionManager {
-  constructor(private readonly store: DndStore) {}
+  constructor(private readonly store: DndStore) { }
 
   close(): void {
     this.store.close();
@@ -142,6 +147,76 @@ export class DndSessionManager {
   getInventory(sessionId: string, userId: string): DndInventoryItemRecord[] {
     this.requirePlayerInSession(sessionId, userId);
     return this.store.listInventoryItems(sessionId, userId);
+  }
+
+  updateSessionWorldState(
+    sessionId: string,
+    patch: {
+      safeRest?: boolean;
+      sceneDanger?: 'safe' | 'tense' | 'danger';
+      restInProgress?: boolean;
+      restStartedAt?: number | null;
+      restType?: 'short' | 'long' | null;
+      queuedActionsJson?: string | null;
+    },
+  ): SessionSummary {
+    this.requireDetails(sessionId);
+    this.store.updateSessionWorldState(sessionId, patch);
+    return this.requireDetails(sessionId);
+  }
+
+  getQueuedNarrativeActions(sessionId: string): DndQueuedNarrativeAction[] {
+    const details = this.requireDetails(sessionId);
+    if (!details.session.queuedActionsJson) return [];
+    try {
+      const parsed = JSON.parse(details.session.queuedActionsJson) as DndQueuedNarrativeAction[];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  queueNarrativeAction(sessionId: string, userId: string, actionText: string): DndQueuedNarrativeAction[] {
+    const details = this.requireDetails(sessionId);
+    const player = requirePlayer(details.players, userId);
+    const existing = this.getQueuedNarrativeActions(sessionId)
+      .filter(entry => entry.userId !== userId);
+    existing.push({
+      userId,
+      characterName: player.characterName,
+      actionText: actionText.trim(),
+      createdAt: Date.now(),
+    });
+    this.store.updateSessionWorldState(sessionId, { queuedActionsJson: JSON.stringify(existing) });
+    return existing;
+  }
+
+  clearQueuedNarrativeActions(sessionId: string): void {
+    this.requireDetails(sessionId);
+    this.store.updateSessionWorldState(sessionId, { queuedActionsJson: null });
+  }
+
+  setAvatar(
+    sessionId: string,
+    userId: string,
+    avatar: { url: string | null; source: 'discord' | 'upload' | 'class_default' | null },
+  ): DndPlayerRecord {
+    const details = this.requireDetails(sessionId);
+    const player = requirePlayer(details.players, userId);
+    this.store.upsertPlayer(sessionId, {
+      userId: player.userId,
+      displayName: player.displayName,
+      characterName: player.characterName,
+      className: player.className,
+      race: player.race,
+      characterSheet: parseCharacterSheet(player.characterSheetJson),
+      isHost: player.isHost,
+      status: player.status,
+      onboardingState: player.onboardingState ?? null,
+      avatarUrl: avatar.url,
+      avatarSource: avatar.source,
+    });
+    return this.store.getPlayers(sessionId).find(entry => entry.userId === userId)!;
   }
 
   confiscateInventory(
@@ -227,6 +302,11 @@ export class DndSessionManager {
 
   updateWorldInfo(sessionId: string, worldInfo: string): void {
     this.store.updateWorldInfo(sessionId, worldInfo);
+  }
+
+  updateSceneState(sessionId: string, sceneState: DndSceneState | null): void {
+    this.requireDetails(sessionId);
+    this.store.updateSceneState(sessionId, sceneState);
   }
 
   updateSessionPhase(sessionId: string, phase: 'lobby' | 'active' | 'paused' | 'completed'): void {
@@ -341,14 +421,14 @@ export class DndSessionManager {
     return this.requireDetails(sessionId);
   }
 
-  setAvailability(sessionId: string, actorUserId: string, available: boolean): SessionSummary {
+  async setAvailability(sessionId: string, actorUserId: string, available: boolean, engine: any): Promise<SessionSummary> {
     const details = this.requireDetails(sessionId);
     const player = requirePlayer(details.players, actorUserId);
     this.store.updatePlayerStatus(sessionId, actorUserId, available ? 'available' : 'unavailable');
     const updated = this.requireDetails(sessionId);
 
     if (!available && updated.session.activePlayerUserId === actorUserId) {
-      return this.advanceTurn(sessionId, actorUserId, true);
+      return await this.advanceTurn(sessionId, actorUserId, engine, true);
     }
 
     if (available && !updated.session.activePlayerUserId && updated.session.phase === 'active') {
@@ -458,6 +538,28 @@ export class DndSessionManager {
     return this.store.getPlayers(sessionId).find(p => p.userId === userId)!;
   }
 
+  learnCombatSkill(sessionId: string, userId: string, skillId: string): DndPlayerRecord {
+    const details = this.requireDetails(sessionId);
+    const player = requirePlayer(details.players, userId);
+    const sheet = parseCharacterSheet(player.characterSheetJson);
+
+    if (!SKILL_DEFINITIONS[skillId]) {
+      throw new Error(`Unknown skill: ${skillId}`);
+    }
+
+    if (sheet.knownSkillIds.includes(skillId)) {
+      throw new Error(`${player.characterName} already knows ${SKILL_DEFINITIONS[skillId].name}.`);
+    }
+
+    sheet.knownSkillIds.push(skillId);
+    return this.setCharacterSheet(sessionId, userId, sheet);
+  }
+
+  getKnownSkills(sessionId: string, userId: string): any[] {
+    const sheet = this.getCharacterSheet(sessionId, userId);
+    return sheet.knownSkillIds.map(id => SKILL_DEFINITIONS[id]).filter(Boolean);
+  }
+
   /**
    * Generate onboarding stat rolls for a player.
    */
@@ -465,14 +567,14 @@ export class DndSessionManager {
     const rolled = rollStatArray();
     const details = this.requireDetails(sessionId);
     const player = requirePlayer(details.players, userId);
-    
+
     const state: DndOnboardingState = {
       step: 'rolled',
       rolledStats: rolled,
       selectedClassId: player.onboardingState?.selectedClassId ?? null,
       allocated: false,
     };
-    
+
     this.store.updateOnboardingState(sessionId, userId, state);
     if (state.selectedClassId) {
       const classDef = getClassById(state.selectedClassId);
@@ -601,20 +703,42 @@ export class DndSessionManager {
   performShortRest(sessionId: string, userId: string, hitDice: number): { sheet: DndCharacterSheet; player: DndPlayerRecord; hitDiceUsed: number; hpRegained: number } {
     const { applyShortRest } = require('./mechanics.js');
     const details = this.requireDetails(sessionId);
+    ensureRestAllowed(details.session, 'short');
     const player = requirePlayer(details.players, userId);
     const sheet = parseCharacterSheet(player.characterSheetJson);
+    this.store.updateSessionWorldState(sessionId, {
+      restInProgress: true,
+      restStartedAt: Date.now(),
+      restType: 'short',
+    });
     const { sheet: updated, result } = applyShortRest(sheet, hitDice);
     const updatedPlayer = this.setCharacterSheet(sessionId, userId, updated);
+    this.store.updateSessionWorldState(sessionId, {
+      restInProgress: false,
+      restStartedAt: null,
+      restType: null,
+    });
     return { sheet: updated, player: updatedPlayer, hitDiceUsed: result.hitDiceUsed, hpRegained: result.hpRegained };
   }
 
   performLongRest(sessionId: string, userId: string): { sheet: DndCharacterSheet; player: DndPlayerRecord; hpRegained: number; conditionsCleared: string[]; exhaustionReduced: boolean } {
     const { applyLongRest } = require('./mechanics.js');
     const details = this.requireDetails(sessionId);
+    ensureRestAllowed(details.session, 'long');
     const player = requirePlayer(details.players, userId);
     const sheet = parseCharacterSheet(player.characterSheetJson);
+    this.store.updateSessionWorldState(sessionId, {
+      restInProgress: true,
+      restStartedAt: Date.now(),
+      restType: 'long',
+    });
     const { sheet: updated, result } = applyLongRest(sheet);
     const updatedPlayer = this.setCharacterSheet(sessionId, userId, updated);
+    this.store.updateSessionWorldState(sessionId, {
+      restInProgress: false,
+      restStartedAt: null,
+      restType: null,
+    });
     return { sheet: updated, player: updatedPlayer, hpRegained: result.hpRegained, conditionsCleared: result.conditionsCleared, exhaustionReduced: result.exhaustionReduced };
   }
 
@@ -902,6 +1026,7 @@ export class DndSessionManager {
       notes: cleanOptional(input.notes),
       consumable: Boolean(input.consumable),
       metadataJson: input.metadataJson ?? null,
+      weight: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -1209,7 +1334,7 @@ export class DndSessionManager {
     return { userId: player.userId, summary: buildProvisioningSummary(player, sheet, ownedItems) };
   }
 
-  advanceTurn(sessionId: string, actorUserId: string, allowHostOverride = false): SessionSummary {
+  async advanceTurn(sessionId: string, actorUserId: string, engine: any, allowHostOverride = false): Promise<SessionSummary> {
     const details = this.requireDetails(sessionId);
     if (!allowHostOverride) {
       const isHost = details.session.hostUserId === actorUserId;
@@ -1220,7 +1345,8 @@ export class DndSessionManager {
 
     const combat = parseCombatState(details.session.combatStateJson);
     if (combat?.active) {
-      return this.advanceCombatTurn(sessionId, actorUserId, allowHostOverride).summary;
+      const result = await this.advanceCombatTurn(sessionId, actorUserId, engine, allowHostOverride);
+      return result.summary;
     }
 
     const result = computeNextTurn(details.players, details.session);
@@ -1255,6 +1381,13 @@ export class DndSessionManager {
     }
 
     this.store.updateCombatState(sessionId, combat);
+    this.store.updateSessionWorldState(sessionId, {
+      sceneDanger: 'danger',
+      safeRest: false,
+      restInProgress: false,
+      restStartedAt: null,
+      restType: null,
+    });
     this.store.updateTurnState(sessionId, {
       activePlayerUserId: combat.active && combat.order[combat.turnIndex]?.side === 'player'
         ? combat.order[combat.turnIndex].userId
@@ -1274,40 +1407,101 @@ export class DndSessionManager {
     return parseCombatState(details.session.combatStateJson);
   }
 
-  resolveCombatTurnAction(sessionId: string, actorUserId: string, actionText: string): {
+  async submitCombatAction(sessionId: string, actorUserId: string, actionInput: string | any, engine: any): Promise<{
     summary: SessionSummary;
     combat: DndCombatState;
+    status: 'waiting' | 'resolved';
+    waitingOn: string[];
     messages: string[];
-  } {
+    roundNarrative: string[];
+  }> {
     const details = this.requireDetails(sessionId);
     const combat = requireCombat(details.session);
-    const current = combat.order[combat.turnIndex];
-    if (!current || current.side !== 'player' || current.userId !== actorUserId) {
-      throw new Error('It is not your combat turn.');
+
+    if (!combat.active) {
+      throw new Error('Combat is not active.');
     }
 
+    // Validate actor is a living player in combat
     const actor = requirePlayer(details.players, actorUserId);
-    const actorSheet = parseCharacterSheet(actor.characterSheetJson);
-    const inventory = this.store.listInventoryItems(sessionId, actorUserId);
-    const playerSheets = new Map(details.players.map(player => [player.userId, parseCharacterSheet(player.characterSheetJson)]));
-    const action = detectAction(actionText, actor, actorSheet, inventory, combat, details.players);
+    if (!isEligibleForTurns(actor)) {
+      throw new Error('You cannot act while incapacitated or not in the party.');
+    }
 
-    const playerResult = resolvePlayerAction({
+    // Record the action
+    const pending = combat.pendingPlayerActions || {};
+    if (typeof actionInput === 'string') {
+      pending[actorUserId] = {
+        actionText: actionInput.trim(),
+        submittedAt: Date.now(),
+      };
+    } else {
+      pending[actorUserId] = {
+        actionText: actionInput.actionText || 'Acts decisively.',
+        actionJson: JSON.stringify(actionInput),
+        submittedAt: Date.now(),
+      };
+    }
+    combat.pendingPlayerActions = pending;
+
+    this.store.updateCombatState(sessionId, combat);
+
+    // Check if everyone is ready
+    const livingPlayers = details.players.filter(p => isEligibleForTurns(p));
+    const readyPlayers = Object.keys(pending);
+    const waitingOn = livingPlayers
+      .filter(p => !readyPlayers.includes(p.userId))
+      .map(p => p.characterName);
+
+    if (waitingOn.length > 0) {
+      return {
+        summary: this.requireDetails(sessionId),
+        combat,
+        status: 'waiting',
+        waitingOn,
+        messages: [],
+        roundNarrative: [],
+      };
+    }
+
+    // Everyone is ready! Resolve the round
+    const resolution = await this.resolveCombatRoundWithNarrative(sessionId, engine);
+    return {
+      summary: this.requireDetails(sessionId),
+      combat: resolution.combat,
+      status: 'resolved',
+      waitingOn: [],
+      messages: resolution.messages,
+      roundNarrative: resolution.roundNarrative,
+    };
+  }
+
+  private resolveCombatRoundInternal(
+    sessionId: string,
+    combat: DndCombatState,
+    players: DndPlayerRecord[],
+    playerSheets: Map<string, DndCharacterSheet>,
+  ): {
+    summary: SessionSummary;
+    combat: DndCombatState;
+    status: 'resolved';
+    waitingOn: string[];
+    messages: string[];
+    roundNarrative: string[];
+  } {
+    const result = resolveCombatRound({
       combat,
-      actor,
-      actorSheet,
-      action,
-      players: details.players,
+      players,
       playerSheets,
-      inventory,
+      getInventory: (userId: string) => this.store.listInventoryItems(sessionId, userId),
     });
 
-    for (const update of playerResult.playerUpdates) {
-      const player = requirePlayer(details.players, update.userId);
+    for (const update of result.playerUpdates) {
+      const player = requirePlayer(players, update.userId);
       this.setCharacterSheet(sessionId, update.userId, update.sheet, player.className ?? undefined, player.race ?? undefined);
       playerSheets.set(update.userId, update.sheet);
     }
-    for (const update of playerResult.inventoryUpdates) {
+    for (const update of result.inventoryUpdates) {
       this.store.updateInventoryItem(update.id, {
         quantity: update.quantity,
         category: update.category,
@@ -1316,86 +1510,80 @@ export class DndSessionManager {
         metadataJson: update.metadataJson,
       });
     }
-    for (const itemId of playerResult.removedInventoryItemIds) {
+    for (const itemId of result.removedInventoryItemIds) {
       this.store.deleteInventoryItem(itemId);
     }
 
-    const nextCombat = playerResult.combat;
-    advanceTurnIndex(nextCombat, details.players, playerSheets);
-    const enemyResult = runEnemyTurns({
-      combat: nextCombat,
-      players: details.players,
-      playerSheets,
-    });
-
-    for (const update of enemyResult.playerUpdates) {
-      const player = requirePlayer(details.players, update.userId);
-      this.setCharacterSheet(sessionId, update.userId, update.sheet, player.className ?? undefined, player.race ?? undefined);
-      playerSheets.set(update.userId, update.sheet);
-    }
-
-    const finalCombat = enemyResult.combat;
+    const finalCombat = result.combat;
     this.store.updateCombatState(sessionId, finalCombat.active ? finalCombat : { ...finalCombat, active: false });
     this.store.updateTurnState(sessionId, {
-      activePlayerUserId: finalCombat.active && finalCombat.order[finalCombat.turnIndex]?.side === 'player'
-        ? finalCombat.order[finalCombat.turnIndex].userId
-        : null,
+      activePlayerUserId: null,
       roundNumber: finalCombat.round,
-      turnNumber: details.session.turnNumber + 1,
+      turnNumber: combat.round + 1,
     });
 
     if (!finalCombat.active) {
-      this.store.updateCombatState(sessionId, finalCombat);
+      this.store.updateSessionWorldState(sessionId, {
+        restInProgress: false,
+        restStartedAt: null,
+        restType: null,
+      });
     }
 
     return {
       summary: this.requireDetails(sessionId),
       combat: finalCombat,
-      messages: [...playerResult.messages, ...enemyResult.messages],
+      status: 'resolved',
+      waitingOn: [],
+      messages: result.messages,
+      roundNarrative: result.roundNarrative,
     };
   }
 
-  advanceCombatTurn(sessionId: string, actorUserId: string, allowHostOverride = false): { summary: SessionSummary; combat: DndCombatState; messages: string[] } {
+  /**
+   * Host can force-resolve a combat round, skipping any players who haven't submitted.
+   */
+  async advanceCombatTurn(sessionId: string, actorUserId: string, engine: any, allowHostOverride = false): Promise<{ summary: SessionSummary; combat: DndCombatState; messages: string[]; roundNarrative: string[] }> {
     const details = this.requireDetails(sessionId);
     const combat = requireCombat(details.session);
 
-    if (!allowHostOverride) {
-      const isHost = details.session.hostUserId === actorUserId;
-      const active = combat.order[combat.turnIndex];
-      if (!isHost && active?.userId !== actorUserId) {
-        throw new Error('Only the active combatant can end this combat turn.');
-      }
+    const isHost = details.session.hostUserId === actorUserId;
+    if (!allowHostOverride && !isHost) {
+      throw new Error('Only the host can force-resolve a combat round.');
     }
 
     const playerSheets = new Map(details.players.map(player => [player.userId, parseCharacterSheet(player.characterSheetJson)]));
-    const nextCombat: DndCombatState = JSON.parse(JSON.stringify(combat)) as DndCombatState;
-    advanceTurnIndex(nextCombat, details.players, playerSheets);
-    const enemyResult = runEnemyTurns({
-      combat: nextCombat,
-      players: details.players,
-      playerSheets,
-    });
-    for (const update of enemyResult.playerUpdates) {
-      const player = requirePlayer(details.players, update.userId);
-      this.setCharacterSheet(sessionId, update.userId, update.sheet, player.className ?? undefined, player.race ?? undefined);
-      playerSheets.set(update.userId, update.sheet);
-    }
-    const finalCombat = enemyResult.combat;
-
-    this.store.updateCombatState(sessionId, finalCombat);
-    this.store.updateTurnState(sessionId, {
-      activePlayerUserId: finalCombat.active && finalCombat.order[finalCombat.turnIndex]?.side === 'player'
-        ? finalCombat.order[finalCombat.turnIndex].userId
-        : null,
-      roundNumber: finalCombat.round,
-      turnNumber: details.session.turnNumber + 1,
-    });
+    const result = await this.resolveCombatRoundWithNarrative(sessionId, engine);
 
     return {
       summary: this.requireDetails(sessionId),
-      combat: finalCombat,
-      messages: enemyResult.messages,
+      combat: result.combat,
+      messages: result.messages,
+      roundNarrative: result.roundNarrative,
     };
+  }
+
+  getPendingCombatActions(sessionId: string): { combat: DndCombatState; submitted: string[]; waitingOn: string[] } {
+    const details = this.requireDetails(sessionId);
+    const combat = parseCombatState(details.session.combatStateJson);
+    if (!combat?.active) {
+      throw new Error('Combat is not active.');
+    }
+
+    const playerSheets = new Map(details.players.map(player => [player.userId, parseCharacterSheet(player.characterSheetJson)]));
+    const livingPlayers = details.players.filter(p => {
+      const sheet = playerSheets.get(p.userId);
+      return sheet && sheet.hp > 0 && p.status !== 'left';
+    });
+
+    const submitted = livingPlayers
+      .filter(p => combat.pendingPlayerActions[p.userId])
+      .map(p => p.characterName);
+    const waitingOn = livingPlayers
+      .filter(p => !combat.pendingPlayerActions[p.userId])
+      .map(p => p.characterName);
+
+    return { combat, submitted, waitingOn };
   }
 
   recordCombatActionMessage(sessionId: string, channelId: string, messageId: string): void {
@@ -1417,6 +1605,12 @@ export class DndSessionManager {
     ensureHost(details.session, actorUserId);
 
     this.store.updateCombatState(sessionId, null);
+    this.store.updateSessionWorldState(sessionId, {
+      sceneDanger: 'tense',
+      restInProgress: false,
+      restStartedAt: null,
+      restType: null,
+    });
     const event = xpAward > 0
       ? this.awardXp(sessionId, actorUserId, 'combat', title, xpAward, notes)
       : null;
@@ -1445,6 +1639,67 @@ export class DndSessionManager {
     });
 
     return this.requireDetails(sessionId);
+  }
+
+  fleeCombat(sessionId: string, actorUserId: string): {
+    summary: SessionSummary;
+    combat: DndCombatState;
+    success: boolean;
+    message: string;
+  } {
+    const details = this.requireDetails(sessionId);
+    const combat = requireCombat(details.session);
+    const active = combat.order[combat.turnIndex];
+    if (!active || active.side !== 'player' || active.userId !== actorUserId) {
+      throw new Error('It is not your combat turn.');
+    }
+
+    const player = requirePlayer(details.players, actorUserId);
+    const sheet = parseCharacterSheet(player.characterSheetJson);
+    const pursuer = combat.enemies[0];
+    const { rollAbilityCheck, formatDiceRoll } = require('./mechanics.js');
+    const playerRoll = rollAbilityCheck(sheet.abilities.dex, 0, sheet.exhaustion);
+    const enemyRoll = pursuer
+      ? rollAbilityCheck(pursuer.abilities.dex ?? 10, 0, 0)
+      : { total: 0, notation: 'd20+0', rolls: [0], modifier: 0 };
+
+    const success = playerRoll.total >= enemyRoll.total;
+    const message = success
+      ? `${player.characterName} escapes the fight. ${formatDiceRoll(playerRoll)} vs ${formatDiceRoll(enemyRoll)}.`
+      : `${player.characterName} tries to flee but is cut off. ${formatDiceRoll(playerRoll)} vs ${formatDiceRoll(enemyRoll)}.`;
+
+    if (!success) {
+      return { summary: details, combat, success, message };
+    }
+
+    const endedCombat: DndCombatState = {
+      ...combat,
+      active: false,
+      victory: 'players',
+      log: [
+        ...combat.log,
+        {
+          id: `flee_${Date.now()}`,
+          round: combat.round,
+          actorName: player.characterName,
+          summary: message,
+          createdAt: Date.now(),
+        },
+      ],
+    };
+    this.store.updateCombatState(sessionId, endedCombat);
+    this.store.updateSessionWorldState(sessionId, {
+      sceneDanger: 'tense',
+      restInProgress: false,
+      restStartedAt: null,
+      restType: null,
+    });
+    this.store.updateTurnState(sessionId, {
+      activePlayerUserId: actorUserId,
+      roundNumber: details.session.roundNumber,
+      turnNumber: details.session.turnNumber,
+    });
+    return { summary: this.requireDetails(sessionId), combat: endedCombat, success, message };
   }
 
   applyQuestCompletion(
@@ -1563,7 +1818,7 @@ export class DndSessionManager {
     this.store.recordVoteMessage(voteId, channelId, messageId);
   }
 
-  castVote(voteId: string, voterUserId: string, optionId: string): { vote: DndVoteDetails; resolved: VoteResolution | null } {
+  async castVote(voteId: string, voterUserId: string, optionId: string, engine: any): Promise<{ vote: DndVoteDetails; resolved: VoteResolution | null }> {
     const vote = this.requireVote(voteId);
     if (vote.vote.status !== 'open') {
       throw new Error('That vote is no longer open.');
@@ -1583,19 +1838,19 @@ export class DndSessionManager {
 
     this.store.castBallot(voteId, voterUserId, optionId);
     const updatedVote = this.requireVote(voteId);
-    const resolution = this.tryResolveVote(updatedVote, details.players);
+    const resolution = await this.tryResolveVote(updatedVote, details.players, engine);
     return {
       vote: resolution?.vote ?? updatedVote,
       resolved: resolution,
     };
   }
 
-  resolveExpiredVote(voteId: string): VoteResolution | null {
+  async resolveExpiredVote(voteId: string, engine: any): Promise<VoteResolution | null> {
     const vote = this.requireVote(voteId);
     if (vote.vote.status !== 'open') return null;
     if (vote.vote.expiresAt > Date.now()) return null;
     const details = this.requireDetails(vote.vote.sessionId);
-    return this.forceResolveVote(vote, details.players);
+    return await this.forceResolveVote(vote, details.players, engine);
   }
 
   listOpenVotes(): DndVoteRecord[] {
@@ -1606,20 +1861,20 @@ export class DndSessionManager {
     return this.store.getVoteDetails(voteId);
   }
 
-  private tryResolveVote(vote: DndVoteDetails, players: DndPlayerRecord[]): VoteResolution | null {
+  private async tryResolveVote(vote: DndVoteDetails, players: DndPlayerRecord[], engine: any): Promise<VoteResolution | null> {
     const eligibleVoters = players.filter(player => player.userId !== vote.vote.targetUserId && player.status !== 'left');
     const tally = tallyVotes(vote);
     const majority = Math.floor(eligibleVoters.length / 2) + 1;
     const hasMajority = vote.options.some(option => (tally[option.id] ?? 0) >= majority);
 
     if (hasMajority || vote.ballots.length >= eligibleVoters.length) {
-      return this.forceResolveVote(vote, players);
+      return await this.forceResolveVote(vote, players, engine);
     }
 
     return null;
   }
 
-  private forceResolveVote(vote: DndVoteDetails, players: DndPlayerRecord[]): VoteResolution {
+  private async forceResolveVote(vote: DndVoteDetails, players: DndPlayerRecord[], engine: any): Promise<VoteResolution> {
     const tally = tallyVotes(vote);
     const winningOption = [...vote.options]
       .sort((a, b) => {
@@ -1636,7 +1891,7 @@ export class DndSessionManager {
       this.store.updatePlayerStatus(vote.vote.sessionId, vote.vote.targetUserId, 'unavailable');
       const refreshed = this.requireDetails(vote.vote.sessionId);
       if (refreshed.session.activePlayerUserId === vote.vote.targetUserId) {
-        const advanced = this.advanceTurn(vote.vote.sessionId, refreshed.session.hostUserId, true);
+        const advanced = await this.advanceTurn(vote.vote.sessionId, refreshed.session.hostUserId, engine, true);
         return {
           vote: this.requireVote(vote.vote.id),
           winningOptionId,
@@ -1704,14 +1959,6 @@ export class DndSessionManager {
     return event;
   }
 
-  private requireDetails(sessionId: string): DndSessionDetails {
-    const details = this.store.getSessionDetails(sessionId);
-    if (!details) {
-      throw new Error(`Unknown session: ${sessionId}`);
-    }
-    return details;
-  }
-
   private requireVote(voteId: string): DndVoteDetails {
     const vote = this.store.getVoteDetails(voteId);
     if (!vote) {
@@ -1720,9 +1967,80 @@ export class DndSessionManager {
     return vote;
   }
 
-  private requirePlayerInSession(sessionId: string, userId: string): void {
+  async resolveCombatRoundWithNarrative(sessionId: string, engine: any): Promise<RoundResolutionResult> {
     const details = this.requireDetails(sessionId);
-    requirePlayer(details.players, userId);
+    const combat = parseCombatState(details.session.combatStateJson);
+    if (!combat) throw new Error('Combat not active.');
+
+    const players = details.players;
+    const playerSheets = new Map(players.map(p => [p.userId, parseCharacterSheet(p.characterSheetJson)]));
+
+    const result = resolveCombatRound({
+      combat,
+      players,
+      playerSheets,
+      getInventory: (userId) => this.getInventory(sessionId, userId),
+    });
+
+
+    // First, persist the mechanical changes so we don't lose progress if narration fails
+    this.store.updateCombatState(sessionId, result.combat);
+    for (const update of result.playerUpdates) {
+      const player = players.find(p => p.userId === update.userId)!;
+      this.store.upsertPlayer(sessionId, {
+        ...player,
+        characterSheet: update.sheet,
+      });
+    }
+
+    // Ask GM to narrate the round
+    try {
+      const prompt = `Narrate this combat round in 2-3 immersive, visceral sentences per action. Combine them into a single cohesive story of the round.
+Characters and actions:
+${result.roundNarrative.join('\n')}
+
+Mechanical outcomes:
+${result.messages.join('\n')}
+
+The narrative should be cinematic and match the campaign tone. Don't mention specific damage numbers or HP, describe the impact and the feeling of the combat.`;
+
+      const narrative = await engine.generateText(prompt, { system: "You are an expert Dungeon Master narrating a cinematic combat round." });
+      result.combat.lastRoundNarrative = narrative.trim();
+
+      // Update with the narrative
+      this.store.updateCombatState(sessionId, result.combat);
+    } catch (error: any) {
+      log.warn({ error: error.message, sessionId }, 'Failed to generate combat narrative, falling back to basic summary');
+      result.combat.lastRoundNarrative = "The clash of steel and magic echoes as the round resolves. " + result.messages.join(' ');
+      this.store.updateCombatState(sessionId, result.combat);
+    }
+
+    return result;
+  }
+
+  private requireDetails(sessionId: string): DndSessionDetails {
+    const details = this.store.getSessionDetails(sessionId);
+    if (!details) throw new Error('Session not found.');
+    return details;
+  }
+
+  private requirePlayerInSession(sessionId: string, userId: string): DndPlayerRecord {
+    const details = this.requireDetails(sessionId);
+    const player = details.players.find(p => p.userId === userId);
+    if (!player) throw new Error('You are not part of this session.');
+    return player;
+  }
+
+  private requireCombat(session: DndSessionRecord): DndCombatState {
+    const combat = parseCombatState(session.combatStateJson);
+    if (!combat || !combat.active) throw new Error('Combat is not active.');
+    return combat;
+  }
+
+  private requireTurn(session: DndSessionRecord, userId: string): void {
+    if (session.activePlayerUserId !== userId) {
+      throw new Error('It is not your turn.');
+    }
   }
 }
 
@@ -1735,6 +2053,15 @@ function ensureHost(session: DndSessionRecord, actorUserId: string): void {
 function ensureSessionJoinable(session: DndSessionRecord): void {
   if (session.phase === 'completed') {
     throw new Error('That session has already ended.');
+  }
+}
+
+function ensureRestAllowed(session: DndSessionRecord, type: 'short' | 'long'): void {
+  if (!session.safeRest || session.sceneDanger === 'danger') {
+    throw new Error(`${type === 'long' ? 'Long' : 'Short'} rests require a safe scene.`);
+  }
+  if (session.restInProgress) {
+    throw new Error('A rest is already in progress.');
   }
 }
 
@@ -1939,11 +2266,11 @@ export function parseCharacterSheet(sheetJson: string | null): DndCharacterSheet
       exhaustion: typeof parsed.exhaustion === 'number' ? parsed.exhaustion : 0,
       deathSaves: parsed.deathSaves && typeof parsed.deathSaves === 'object'
         ? {
-            successes: typeof parsed.deathSaves.successes === 'number' ? parsed.deathSaves.successes : 0,
-            failures: typeof parsed.deathSaves.failures === 'number' ? parsed.deathSaves.failures : 0,
-            stable: Boolean(parsed.deathSaves.stable),
-            dead: Boolean(parsed.deathSaves.dead),
-          }
+          successes: typeof parsed.deathSaves.successes === 'number' ? parsed.deathSaves.successes : 0,
+          failures: typeof parsed.deathSaves.failures === 'number' ? parsed.deathSaves.failures : 0,
+          stable: Boolean(parsed.deathSaves.stable),
+          dead: Boolean(parsed.deathSaves.dead),
+        }
         : createDefaultCharacterSheet().deathSaves,
       hitDieMax: typeof parsed.hitDieMax === 'number' ? parsed.hitDieMax : 10,
       gold: typeof parsed.gold === 'number' ? parsed.gold : 0,
@@ -1966,12 +2293,12 @@ export function parseCombatState(raw: string | null): DndCombatState | null {
       turnIndex: typeof parsed.turnIndex === 'number' ? parsed.turnIndex : 0,
       order: Array.isArray(parsed.order)
         ? parsed.order.map((entry: any, index) => ({
-            id: typeof entry?.id === 'string' ? entry.id : `${entry?.side === 'enemy' ? 'enemy' : 'player'}:${entry?.userId ?? index}`,
-            side: entry?.side === 'enemy' ? 'enemy' : 'player',
-            userId: typeof entry?.userId === 'string' ? entry.userId : '',
-            characterName: typeof entry?.characterName === 'string' ? entry.characterName : 'Unknown',
-            initiative: typeof entry?.initiative === 'number' ? entry.initiative : 0,
-          }))
+          id: typeof entry?.id === 'string' ? entry.id : `${entry?.side === 'enemy' ? 'enemy' : 'player'}:${entry?.userId ?? index}`,
+          side: entry?.side === 'enemy' ? 'enemy' : 'player',
+          userId: typeof entry?.userId === 'string' ? entry.userId : '',
+          characterName: typeof entry?.characterName === 'string' ? entry.characterName : 'Unknown',
+          initiative: typeof entry?.initiative === 'number' ? entry.initiative : 0,
+        }))
         : [],
       enemies: Array.isArray(parsed.enemies) ? parsed.enemies : [],
       log: Array.isArray(parsed.log) ? parsed.log : [],
@@ -1979,6 +2306,11 @@ export function parseCombatState(raw: string | null): DndCombatState | null {
       victory: parsed.victory === 'players' || parsed.victory === 'enemies' ? parsed.victory : null,
       lastActionMessageChannelId: parsed.lastActionMessageChannelId ?? null,
       lastActionMessageId: parsed.lastActionMessageId ?? null,
+      activeEffects: parsed.activeEffects ?? [],
+      lastRoundNarrative: parsed.lastRoundNarrative ?? null,
+      pendingPlayerActions: parsed.pendingPlayerActions && typeof parsed.pendingPlayerActions === 'object'
+        ? parsed.pendingPlayerActions as Record<string, { actionText: string; submittedAt: number }>
+        : {},
     };
   } catch {
     return null;
@@ -2038,7 +2370,7 @@ function normalizeDowntimeMinutes(minutes: number): number {
   const requested = Math.max(15, Math.min(360, Math.floor(minutes)));
   return allowed.reduce((closest, current) =>
     Math.abs(current - requested) < Math.abs(closest - requested) ? current : closest,
-  allowed[0]);
+    allowed[0]);
 }
 
 function legacyWeeksToMinutes(weeks: number): number {

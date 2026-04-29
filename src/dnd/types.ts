@@ -27,8 +27,33 @@ export interface DndSessionRecord {
   notes: string | null;
   worldKey: string | null;
   worldInfo: string | null;
+  sceneStateJson: string | null;
+  safeRest: boolean;
+  sceneDanger: 'safe' | 'tense' | 'danger';
+  restInProgress: boolean;
+  restStartedAt: number | null;
+  restType: 'short' | 'long' | null;
+  queuedActionsJson: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface DndSceneState {
+  title: string | null;
+  location: string | null;
+  timeOfDay: string | null;
+  weather: string | null;
+  activeNpcs: string[];
+  currentConflict: string | null;
+  currentObjective: string | null;
+  currentRisks: string[];
+  partySituation: string | null;
+  summary: string;
+  narrative: string;
+  source: 'opening' | 'turnprompt' | 'narrative' | 'weave' | 'regenerate' | 'aftermath';
+  updatedAt: number;
+  activePlayerUserId: string | null;
+  messageId?: string | null;
 }
 
 export interface DndPlayerRecord {
@@ -45,6 +70,8 @@ export interface DndPlayerRecord {
   joinedAt: number;
   lastActiveAt: number;
   absentSince: number | null;
+  avatarUrl?: string | null;
+  avatarSource?: 'discord' | 'upload' | 'class_default' | null;
   onboardingState?: DndOnboardingState | null;
 }
 
@@ -63,6 +90,16 @@ export interface DndAbilityScores {
 }
 
 export type DndAbilityKey = keyof DndAbilityScores;
+
+export interface DndActiveEffect {
+  id: string;
+  name: string;
+  targetUserId?: string;      // for buffs/debuffs on allies
+  targetEnemyId?: string;     // for debuffs on enemies
+  durationRounds: number;     // ticks down each round
+  effect: 'ac_bonus' | 'attack_bonus' | 'damage_bonus' | 'stunned' | 'prone' | 'disadvantage_attacks' | 'advantage_attacks';
+  value: number;
+}
 
 export interface DndDeathSaveState {
   successes: number;
@@ -141,6 +178,12 @@ export interface DndCombatLogEntry {
   createdAt: number;
 }
 
+export interface DndPendingPlayerAction {
+  actionText: string;
+  actionJson?: string | null;
+  submittedAt: number;
+}
+
 export interface DndCombatState {
   active: boolean;
   round: number;
@@ -152,6 +195,9 @@ export interface DndCombatState {
   victory: 'players' | 'enemies' | null;
   lastActionMessageChannelId?: string | null;
   lastActionMessageId?: string | null;
+  pendingPlayerActions: Record<string, DndPendingPlayerAction>;
+  activeEffects: DndActiveEffect[];
+  lastRoundNarrative?: string | null;
 }
 
 export interface DndProgressEvent {
@@ -209,9 +255,17 @@ export interface DndInventoryItemRecord {
   category: string | null;
   notes: string | null;
   consumable: boolean;
+  weight: number | null;
   metadataJson: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface DndQueuedNarrativeAction {
+  userId: string;
+  characterName: string;
+  actionText: string;
+  createdAt: number;
 }
 
 export interface DndShopRecord {

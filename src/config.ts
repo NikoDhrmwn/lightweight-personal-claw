@@ -22,6 +22,7 @@ export interface LiteClawConfig {
     defaults?: {
       primary?: string;
       fallbacks?: string[];
+      loadoutModel?: string;
       imageModel?: string;
       temperature?: number;
       topP?: number;
@@ -148,7 +149,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.6.3' },
+    meta: { version: '0.7.0' },
     llm: {
       providers: {
         local: {
