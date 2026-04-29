@@ -11,6 +11,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.7.2] - 2026-04-29
+
+#### Added
+
+- **Workspace Path Safety**: Implemented a centralized `workspace.ts` path resolver with absolute path opt-in and path traversal (`../`) blocking to contain execution within the project root.
+- **Tool Path Validation**: All filesystem operations (`read_file`, `write_file`, etc.) and `exec` cwd arguments now enforce secure workspace containment.
+
 ### [0.7.1] - 2026-04-29
 
 #### Added
@@ -18,24 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI Onboarding UX Overhaul**: Replaced readline-based prompts with modern `@inquirer/prompts` interactive wizards for `setup` and `init`.
 - **Prompt Customization**: Added comprehensive prompt management CLI commands (`prompts list`, `doctor`, `reset`, `edit`, `export`, `import`).
 - **Neutral Defaults**: Migrated default system prompts and personality templates to a structured, neutral config repository.
-
-### [0.7.0] - 2026-04-29
-
-#### Added
-
-- **Scene-Aware D&D Flow**: Added canonical scene state, narrative validation, queued group actions, rest safety, and continuity checks for session threads.
-- **Expanded D&D Character Tools**: Added avatar, skills, spells, inventory, dice, downtime, shop, death-save, inspiration, and richer stats/rest commands.
-- **Advanced Combat Resolution**: Added pending player actions, active effects, defensive/improvised actions, buff/debuff/control skills, item weights, and round-level combat narration.
-- **WhatsApp Progress UX**: Added command handling, progress tracker messages, send retries, reconnection behavior, and WhatsApp-specific markdown formatting.
-- **Provider Compatibility**: Added native tool prompting, DSML tool-call parsing, provider refresh after config edits, top-k sampling, reasoning-content memory, and WebUI formatting rules.
-- **Session Cleanup CLI**: Added `liteclaw channels logout --channel whatsapp` to clear the local WhatsApp pairing session.
-
-#### Fixed
-
-- **Discord Robustness**: Added gateway DNS checks, login retries, shard diagnostics, and debug token redaction.
-- **Context Thresholds**: Derived default compaction thresholds from configured context size and budget.
-- **Repository Hygiene**: Ignored `scratch/` and stopped `.gitignore` from ignoring itself.
-- **Version Consistency**: Normalized package, CLI, runtime, gateway, migration, and default config version reporting to `0.7.0`.
 
 ## Features
 
