@@ -18,6 +18,7 @@ import type {
   DndShopItemRecord,
   DndShopRecord,
   DndPlayerStatus,
+  DndSceneState,
   DndSessionDetails,
   DndSessionPhase,
   DndSessionRecord,
@@ -71,6 +72,13 @@ export class DndStore {
         notes TEXT,
         world_key TEXT,
         world_info TEXT,
+        scene_state_json TEXT,
+        safe_rest INTEGER NOT NULL DEFAULT 0,
+        scene_danger TEXT NOT NULL DEFAULT 'tense',
+        rest_in_progress INTEGER NOT NULL DEFAULT 0,
+        rest_started_at_ms INTEGER,
+        rest_type TEXT,
+        queued_actions_json TEXT,
         created_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL
       );
@@ -96,6 +104,8 @@ export class DndStore {
         last_active_at_ms INTEGER NOT NULL,
         absent_since_ms INTEGER,
         onboarding_json TEXT,
+        avatar_url TEXT,
+        avatar_source TEXT,
         PRIMARY KEY (session_id, user_id)
       );
 
@@ -184,6 +194,7 @@ export class DndStore {
         notes TEXT,
         consumable INTEGER NOT NULL DEFAULT 0,
         metadata_json TEXT,
+        weight REAL,
         created_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL
       );
@@ -228,9 +239,18 @@ export class DndStore {
     this.ensureColumn('dnd_sessions', 'notes', 'ALTER TABLE dnd_sessions ADD COLUMN notes TEXT');
     this.ensureColumn('dnd_sessions', 'world_key', 'ALTER TABLE dnd_sessions ADD COLUMN world_key TEXT');
     this.ensureColumn('dnd_sessions', 'world_info', 'ALTER TABLE dnd_sessions ADD COLUMN world_info TEXT');
+    this.ensureColumn('dnd_sessions', 'scene_state_json', 'ALTER TABLE dnd_sessions ADD COLUMN scene_state_json TEXT');
+    this.ensureColumn('dnd_sessions', 'safe_rest', 'ALTER TABLE dnd_sessions ADD COLUMN safe_rest INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('dnd_sessions', 'scene_danger', "ALTER TABLE dnd_sessions ADD COLUMN scene_danger TEXT NOT NULL DEFAULT 'tense'");
+    this.ensureColumn('dnd_sessions', 'rest_in_progress', 'ALTER TABLE dnd_sessions ADD COLUMN rest_in_progress INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('dnd_sessions', 'rest_started_at_ms', 'ALTER TABLE dnd_sessions ADD COLUMN rest_started_at_ms INTEGER');
+    this.ensureColumn('dnd_sessions', 'rest_type', 'ALTER TABLE dnd_sessions ADD COLUMN rest_type TEXT');
+    this.ensureColumn('dnd_sessions', 'queued_actions_json', 'ALTER TABLE dnd_sessions ADD COLUMN queued_actions_json TEXT');
 
     this.ensureColumn('dnd_players', 'character_sheet_json', 'ALTER TABLE dnd_players ADD COLUMN character_sheet_json TEXT');
     this.ensureColumn('dnd_players', 'onboarding_json', 'ALTER TABLE dnd_players ADD COLUMN onboarding_json TEXT');
+    this.ensureColumn('dnd_players', 'avatar_url', 'ALTER TABLE dnd_players ADD COLUMN avatar_url TEXT');
+    this.ensureColumn('dnd_players', 'avatar_source', 'ALTER TABLE dnd_players ADD COLUMN avatar_source TEXT');
 
     this.ensureColumn('dnd_votes', 'message_channel_id', 'ALTER TABLE dnd_votes ADD COLUMN message_channel_id TEXT');
     this.ensureColumn('dnd_votes', 'message_id', 'ALTER TABLE dnd_votes ADD COLUMN message_id TEXT');
@@ -242,6 +262,7 @@ export class DndStore {
     this.ensureColumn('dnd_inventory_items', 'notes', 'ALTER TABLE dnd_inventory_items ADD COLUMN notes TEXT');
     this.ensureColumn('dnd_inventory_items', 'consumable', 'ALTER TABLE dnd_inventory_items ADD COLUMN consumable INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('dnd_inventory_items', 'metadata_json', 'ALTER TABLE dnd_inventory_items ADD COLUMN metadata_json TEXT');
+    this.ensureColumn('dnd_inventory_items', 'weight', 'ALTER TABLE dnd_inventory_items ADD COLUMN weight REAL');
   }
 
   close(): void {
@@ -254,8 +275,9 @@ export class DndStore {
       INSERT INTO dnd_sessions (
         id, guild_id, channel_id, thread_id, host_user_id, title, tone,
         max_players, phase, active_player_user_id, round_number, turn_number,
-        current_vote_id, combat_state_json, progress_log_json, source_session_id, last_checkpoint_id, notes, world_key, world_info, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'lobby', NULL, 1, 1, NULL, NULL, '[]', NULL, NULL, NULL, ?, NULL, ?, ?)
+        current_vote_id, combat_state_json, progress_log_json, source_session_id, last_checkpoint_id, notes, world_key, world_info, scene_state_json,
+        safe_rest, scene_danger, rest_in_progress, rest_started_at_ms, rest_type, queued_actions_json, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'lobby', NULL, 1, 1, NULL, NULL, '[]', NULL, NULL, NULL, ?, NULL, NULL, 0, 'tense', 0, NULL, NULL, NULL, ?, ?)
     `).run(
       input.id,
       input.guildId,
@@ -296,13 +318,26 @@ export class DndStore {
         notes,
         world_key as worldKey,
         world_info as worldInfo,
+        scene_state_json as sceneStateJson,
+        safe_rest as safeRest,
+        scene_danger as sceneDanger,
+        rest_in_progress as restInProgress,
+        rest_started_at_ms as restStartedAt,
+        rest_type as restType,
+        queued_actions_json as queuedActionsJson,
         created_at_ms as createdAt,
         updated_at_ms as updatedAt
       FROM dnd_sessions
       WHERE id = ?
     `).get(sessionId) as DndSessionRecord | undefined;
 
-    return row ?? null;
+    return row
+      ? {
+          ...row,
+          safeRest: Boolean((row as any).safeRest),
+          restInProgress: Boolean((row as any).restInProgress),
+        }
+      : null;
   }
 
   getSessionByThread(threadId: string): DndSessionRecord | null {
@@ -328,6 +363,13 @@ export class DndStore {
         notes,
         world_key as worldKey,
         world_info as worldInfo,
+        scene_state_json as sceneStateJson,
+        safe_rest as safeRest,
+        scene_danger as sceneDanger,
+        rest_in_progress as restInProgress,
+        rest_started_at_ms as restStartedAt,
+        rest_type as restType,
+        queued_actions_json as queuedActionsJson,
         created_at_ms as createdAt,
         updated_at_ms as updatedAt
       FROM dnd_sessions
@@ -336,7 +378,13 @@ export class DndStore {
       LIMIT 1
     `).get(threadId) as DndSessionRecord | undefined;
 
-    return row ?? null;
+    return row
+      ? {
+          ...row,
+          safeRest: Boolean((row as any).safeRest),
+          restInProgress: Boolean((row as any).restInProgress),
+        }
+      : null;
   }
 
   listSessionsForGuild(guildId: string, includeCompleted = false): DndSessionRecord[] {
@@ -362,6 +410,13 @@ export class DndStore {
         notes,
         world_key as worldKey,
         world_info as worldInfo,
+        scene_state_json as sceneStateJson,
+        safe_rest as safeRest,
+        scene_danger as sceneDanger,
+        rest_in_progress as restInProgress,
+        rest_started_at_ms as restStartedAt,
+        rest_type as restType,
+        queued_actions_json as queuedActionsJson,
         created_at_ms as createdAt,
         updated_at_ms as updatedAt
       FROM dnd_sessions
@@ -370,7 +425,11 @@ export class DndStore {
       ORDER BY updated_at_ms DESC
     `).all(guildId, includeCompleted ? 1 : 0) as DndSessionRecord[];
 
-    return rows;
+    return rows.map((row: any) => ({
+      ...row,
+      safeRest: Boolean(row.safeRest),
+      restInProgress: Boolean(row.restInProgress),
+    }));
   }
 
   listOpenVotes(): DndVoteRecord[] {
@@ -413,7 +472,9 @@ export class DndStore {
         joined_at_ms as joinedAt,
         last_active_at_ms as lastActiveAt,
         absent_since_ms as absentSince,
-        onboarding_json as onboardingJson
+        onboarding_json as onboardingJson,
+        avatar_url as avatarUrl,
+        avatar_source as avatarSource
       FROM dnd_players
       WHERE session_id = ?
       ORDER BY turn_order ASC, joined_at_ms ASC
@@ -446,6 +507,8 @@ export class DndStore {
       isHost?: boolean;
       status?: DndPlayerStatus;
       onboardingState?: DndOnboardingState | null;
+      avatarUrl?: string | null;
+      avatarSource?: 'discord' | 'upload' | 'class_default' | null;
     },
   ): DndPlayerRecord {
     const existing = this.db.prepare(`
@@ -466,8 +529,8 @@ export class DndStore {
     this.db.prepare(`
       INSERT INTO dnd_players (
         session_id, user_id, display_name, character_name, class_name, race,
-        character_sheet_json, status, is_host, turn_order, joined_at_ms, last_active_at_ms, absent_since_ms, onboarding_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        character_sheet_json, status, is_host, turn_order, joined_at_ms, last_active_at_ms, absent_since_ms, onboarding_json, avatar_url, avatar_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_id, user_id) DO UPDATE SET
         display_name = excluded.display_name,
         character_name = excluded.character_name,
@@ -478,7 +541,9 @@ export class DndStore {
         is_host = CASE WHEN excluded.is_host = 1 THEN 1 ELSE dnd_players.is_host END,
         last_active_at_ms = excluded.last_active_at_ms,
         absent_since_ms = excluded.absent_since_ms,
-        onboarding_json = COALESCE(excluded.onboarding_json, dnd_players.onboarding_json)
+        onboarding_json = COALESCE(excluded.onboarding_json, dnd_players.onboarding_json),
+        avatar_url = COALESCE(excluded.avatar_url, dnd_players.avatar_url),
+        avatar_source = COALESCE(excluded.avatar_source, dnd_players.avatar_source)
     `).run(
       sessionId,
       user.userId,
@@ -493,7 +558,9 @@ export class DndStore {
       now,
       now,
       user.status === 'unavailable' ? now : null,
-      user.onboardingState ? JSON.stringify(user.onboardingState) : null
+      user.onboardingState ? JSON.stringify(user.onboardingState) : null,
+      user.avatarUrl ?? null,
+      user.avatarSource ?? null,
     );
 
     this.touchSession(sessionId);
@@ -532,6 +599,49 @@ export class DndStore {
     this.db.prepare(`
       UPDATE dnd_sessions SET world_info = ?, updated_at_ms = ? WHERE id = ?
     `).run(worldInfo, Date.now(), sessionId);
+  }
+
+  updateSceneState(sessionId: string, sceneState: DndSceneState | null): void {
+    this.db.prepare(`
+      UPDATE dnd_sessions SET scene_state_json = ?, updated_at_ms = ? WHERE id = ?
+    `).run(sceneState ? JSON.stringify(sceneState) : null, Date.now(), sessionId);
+  }
+
+  updateSessionWorldState(
+    sessionId: string,
+    patch: {
+      safeRest?: boolean;
+      sceneDanger?: 'safe' | 'tense' | 'danger';
+      restInProgress?: boolean;
+      restStartedAt?: number | null;
+      restType?: 'short' | 'long' | null;
+      queuedActionsJson?: string | null;
+    },
+  ): void {
+    const existing = this.getSessionById(sessionId);
+    if (!existing) return;
+
+    this.db.prepare(`
+      UPDATE dnd_sessions
+      SET
+        safe_rest = ?,
+        scene_danger = ?,
+        rest_in_progress = ?,
+        rest_started_at_ms = ?,
+        rest_type = ?,
+        queued_actions_json = ?,
+        updated_at_ms = ?
+      WHERE id = ?
+    `).run(
+      patch.safeRest !== undefined ? (patch.safeRest ? 1 : 0) : (existing.safeRest ? 1 : 0),
+      patch.sceneDanger ?? existing.sceneDanger,
+      patch.restInProgress !== undefined ? (patch.restInProgress ? 1 : 0) : (existing.restInProgress ? 1 : 0),
+      patch.restStartedAt !== undefined ? patch.restStartedAt : existing.restStartedAt,
+      patch.restType !== undefined ? patch.restType : existing.restType,
+      patch.queuedActionsJson !== undefined ? patch.queuedActionsJson : existing.queuedActionsJson,
+      Date.now(),
+      sessionId,
+    );
   }
 
   updateSessionThread(sessionId: string, channelId: string, threadId: string): void {
@@ -748,8 +858,8 @@ export class DndStore {
   createInventoryItem(item: DndInventoryItemRecord): void {
     this.db.prepare(`
       INSERT INTO dnd_inventory_items (
-        id, session_id, user_id, name, quantity, category, notes, consumable, metadata_json, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, session_id, user_id, name, quantity, category, notes, consumable, metadata_json, weight, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       item.id,
       item.sessionId,
@@ -760,6 +870,7 @@ export class DndStore {
       item.notes,
       item.consumable ? 1 : 0,
       item.metadataJson,
+      item.weight ?? null,
       item.createdAt,
       item.updatedAt,
     );
@@ -778,6 +889,7 @@ export class DndStore {
         notes,
         consumable,
         metadata_json as metadataJson,
+        weight,
         created_at_ms as createdAt,
         updated_at_ms as updatedAt
       FROM dnd_inventory_items
@@ -800,6 +912,7 @@ export class DndStore {
         notes,
         consumable,
         metadata_json as metadataJson,
+        weight,
         created_at_ms as createdAt,
         updated_at_ms as updatedAt
       FROM dnd_inventory_items
@@ -817,6 +930,7 @@ export class DndStore {
     notes?: string | null;
     consumable?: boolean;
     metadataJson?: string | null;
+    weight?: number | null;
   }): void {
     const existing = this.getInventoryItem(itemId);
     if (!existing) return;
@@ -828,6 +942,7 @@ export class DndStore {
         notes = ?,
         consumable = ?,
         metadata_json = ?,
+        weight = ?,
         updated_at_ms = ?
       WHERE id = ?
     `).run(
@@ -836,6 +951,7 @@ export class DndStore {
       patch.notes !== undefined ? patch.notes : existing.notes,
       patch.consumable !== undefined ? (patch.consumable ? 1 : 0) : (existing.consumable ? 1 : 0),
       patch.metadataJson !== undefined ? patch.metadataJson : existing.metadataJson,
+      patch.weight !== undefined ? patch.weight : existing.weight,
       Date.now(),
       itemId,
     );
@@ -1089,6 +1205,18 @@ export class DndStore {
           current_vote_id = NULL,
           combat_state_json = ?,
           progress_log_json = ?,
+          source_session_id = ?,
+          last_checkpoint_id = ?,
+          notes = ?,
+          world_key = ?,
+          world_info = ?,
+          scene_state_json = ?,
+          safe_rest = ?,
+          scene_danger = ?,
+          rest_in_progress = ?,
+          rest_started_at_ms = ?,
+          rest_type = ?,
+          queued_actions_json = ?,
           channel_id = ?,
           thread_id = ?,
           updated_at_ms = ?
@@ -1103,6 +1231,18 @@ export class DndStore {
         snapshot.session.turnNumber,
         snapshot.session.combatStateJson,
         snapshot.session.progressLogJson ?? '[]',
+        snapshot.session.sourceSessionId,
+        snapshot.session.lastCheckpointId,
+        snapshot.session.notes,
+        snapshot.session.worldKey,
+        snapshot.session.worldInfo,
+        snapshot.session.sceneStateJson,
+        snapshot.session.safeRest ? 1 : 0,
+        snapshot.session.sceneDanger,
+        snapshot.session.restInProgress ? 1 : 0,
+        snapshot.session.restStartedAt,
+        snapshot.session.restType,
+        snapshot.session.queuedActionsJson,
         channelId,
         threadId,
         now,
@@ -1115,8 +1255,8 @@ export class DndStore {
         this.db.prepare(`
           INSERT INTO dnd_players (
             session_id, user_id, display_name, character_name, class_name, race, character_sheet_json,
-            status, is_host, turn_order, joined_at_ms, last_active_at_ms, absent_since_ms
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, is_host, turn_order, joined_at_ms, last_active_at_ms, absent_since_ms, onboarding_json, avatar_url, avatar_source
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           targetSessionId,
           player.userId,
@@ -1131,6 +1271,9 @@ export class DndStore {
           player.joinedAt,
           player.lastActiveAt,
           player.absentSince,
+          player.onboardingState ? JSON.stringify(player.onboardingState) : null,
+          player.avatarUrl ?? null,
+          player.avatarSource ?? null,
         );
       }
     });

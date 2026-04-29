@@ -24,7 +24,7 @@ import { createLogger } from '../logger.js';
 import { getConfig } from '../config.js';
 import { splitMessage } from '../channels/utils.js';
 import { MemoryStore } from '../core/memory.js';
-import { LLMClient } from '../core/llm.js';
+import { buildProviders, LLMClient } from '../core/llm.js';
 import type { LLMProvider } from '../core/llm.js';
 import { DndStore } from './store.js';
 import {
@@ -49,6 +49,7 @@ import type {
   DndPlayerRecord,
   DndOnboardingState,
   DndProgressEvent,
+  DndSceneState,
   DndSessionDetails,
   DndSessionRecord,
   DndShopItemRecord,
@@ -76,6 +77,7 @@ import {
   parseInventoryMetadata,
   type StarterItemTemplate,
 } from './combat-system.js';
+import { repairNarrativePacket, type ValidationResult } from './validator.js';
 import {
   DEFAULT_PRECONFIGURED_WORLD_ID,
   getPreconfiguredWorld,
@@ -255,6 +257,40 @@ export const DND_SLASH_COMMANDS = [
         .addIntegerOption(opt =>
           opt.setName('level').setDescription('Exhaustion level').setRequired(true).setMinValue(0).setMaxValue(6))),
 
+  new SlashCommandBuilder()
+    .setName('skills')
+    .setDescription('View your learned combat techniques and abilities')
+    .addSubcommand(sub =>
+      sub.setName('view')
+        .setDescription('Show your known skills and how to use them')),
+
+  new SlashCommandBuilder()
+    .setName('spells')
+    .setDescription('View your spell-like abilities and magical options')
+    .addSubcommand(sub =>
+      sub.setName('view')
+        .setDescription('Show your spell-like abilities')),
+
+  new SlashCommandBuilder()
+    .setName('avatar')
+    .setDescription('Manage your character portrait')
+    .addSubcommand(sub =>
+      sub.setName('view')
+        .setDescription('Show your current character portrait source'))
+    .addSubcommand(sub =>
+      sub.setName('discord')
+        .setDescription('Use your Discord profile avatar as your character portrait'))
+    .addSubcommand(sub =>
+      sub.setName('upload')
+        .setDescription('Set your portrait from an image attachment')
+        .addAttachmentOption(opt =>
+          opt.setName('image').setDescription('Portrait image').setRequired(true)))
+    .addSubcommand(sub =>
+      sub.setName('url')
+        .setDescription('Set your portrait from an image URL')
+        .addStringOption(opt =>
+          opt.setName('image_url').setDescription('Direct image URL').setRequired(true))),
+
   // ─── 🎲 Dice Rolling ──────────────────────────────────────────────
   new SlashCommandBuilder()
     .setName('inventory')
@@ -313,6 +349,10 @@ export const DND_SLASH_COMMANDS = [
     .addSubcommand(sub =>
       sub.setName('turn')
         .setDescription('End your current turn')),
+
+  new SlashCommandBuilder()
+    .setName('flee')
+    .setDescription('Attempt to flee the current combat encounter'),
 
   new SlashCommandBuilder()
     .setName('downtime')
@@ -520,22 +560,16 @@ export class DndDiscordController {
 
   private createLoadoutEngine(): LLMClient {
     const config = getConfig();
-    const googleProvider = (config.llm?.providers?.google ?? null) as Record<string, any> | null;
-    if (!googleProvider) {
+    const selectedId = String(config.llm?.defaults?.loadoutModel ?? '').trim();
+    if (!selectedId) {
       return this.engine;
     }
 
-    const selected: LLMProvider = {
-      id: 'google/gemini-3.1-flash-lite-preview',
-      baseUrl: googleProvider.baseUrl ?? 'https://generativelanguage.googleapis.com/v1beta/openai/',
-      apiKey: googleProvider.apiKey ?? process.env.GOOGLE_API_KEY ?? 'sk-no-key',
-      model: 'gemini-3.1-flash-lite-preview',
-      contextWindow: 1_000_000,
-      maxTokens: 4096,
-      supportsVision: false,
-      supportsTools: true,
-      supportsReasoning: false,
-    };
+    const selected = buildProviders().find((provider) => provider.id === selectedId);
+    if (!selected) {
+      log.warn({ loadoutModel: selectedId }, 'Configured loadout model not found; using primary runtime model instead');
+      return this.engine;
+    }
 
     const worker = new LLMClient();
     (worker as any).providers = [selected];
@@ -555,13 +589,26 @@ export class DndDiscordController {
       case 'stats':
         await this.handleStatsCommand(interaction);
         return true;
+      case 'skills':
+        await this.handleSkillsCommand(interaction);
+        return true;
+      case 'spells':
+        await this.handleSpellsCommand(interaction);
+        return true;
+      case 'avatar':
+        await this.handleAvatarCommand(interaction);
+        return true;
       case 'inventory':
         await this.handleInventoryCommand(interaction);
         return true;
       case 'turn':
-        return await this.handleTurnCommand(interaction);
+        await this.handleTurnCommand(interaction);
+        return true;
       case 'end':
         await this.handleEndShortcutCommand(interaction);
+        return true;
+      case 'flee':
+        await this.handleFleeCommand(interaction);
         return true;
       case 'downtime':
         await this.handleDowntimeCommand(interaction);
@@ -864,6 +911,51 @@ export class DndDiscordController {
     return this.manager.getSessionForThread(threadId);
   }
 
+  shouldQueueNarrativeActions(threadId: string): boolean {
+    const details = this.manager.getSessionForThread(threadId);
+    if (!details) return false;
+    if (this.isCombatActive(threadId)) return false;
+    const availablePlayers = details.players.filter(player => player.status === 'available');
+    if (availablePlayers.length < 2) return false;
+    return Boolean(
+      details.vote?.vote.kind === 'party_decision'
+      || this.parseSceneState(details.session.sceneStateJson)?.partySituation?.toLowerCase().includes('together')
+      || this.parseSceneState(details.session.sceneStateJson)?.currentObjective?.toLowerCase().includes('party'),
+    );
+  }
+
+  queueNarrativeAction(threadId: string, userId: string, actionText: string): {
+    queued: boolean;
+    shouldResolve: boolean;
+    waitingOn: string[];
+    combinedActionText: string | null;
+  } {
+    const details = this.manager.getSessionForThread(threadId);
+    if (!details) {
+      return { queued: false, shouldResolve: false, waitingOn: [], combinedActionText: null };
+    }
+    const queued = this.manager.queueNarrativeAction(details.session.id, userId, actionText);
+    const availablePlayers = details.players.filter(player => player.status === 'available');
+    const queuedIds = new Set(queued.map(entry => entry.userId));
+    const waitingOn = availablePlayers
+      .filter(player => !queuedIds.has(player.userId))
+      .map(player => player.characterName);
+    if (waitingOn.length > 0) {
+      return { queued: true, shouldResolve: false, waitingOn, combinedActionText: null };
+    }
+
+    const voteSummary = details.vote?.vote.kind === 'party_decision'
+      ? `Party vote in play: ${details.vote.vote.question}.`
+      : null;
+    const combinedActionText = [
+      '[SYSTEM: Resolve these queued party actions together in one coherent scene update. Keep the same scene and continuity.]',
+      voteSummary,
+      ...queued.map(entry => `${entry.characterName}: ${entry.actionText}`),
+    ].filter(Boolean).join('\n');
+    this.manager.clearQueuedNarrativeActions(details.session.id);
+    return { queued: true, shouldResolve: true, waitingOn: [], combinedActionText };
+  }
+
   async buildQuestionContext(threadId: string, question: string): Promise<string> {
     const details = this.manager.getSessionForThread(threadId);
     if (!details) {
@@ -882,7 +974,38 @@ export class DndDiscordController {
   }
 
   async buildNarrativeRagContext(threadId: string, message: string): Promise<string> {
-    return this.buildQuestionContext(threadId, message);
+    const details = this.manager.getSessionForThread(threadId);
+    const ragContext = await this.buildQuestionContext(threadId, message);
+    const sceneState = details ? this.parseSceneState(details.session.sceneStateJson) : null;
+    const channel = await this.client.channels.fetch(threadId).catch(() => null);
+    const recentSceneSnapshot = channel?.isTextBased()
+      ? await this.buildRecentSceneSnapshot(channel)
+      : '';
+    const extras: string[] = [ragContext];
+    if (sceneState) {
+      extras.push([
+        '<canonical_scene_state>',
+        `Title: ${sceneState.title ?? 'Scene Update'}`,
+        `Source: ${sceneState.source}`,
+        `Updated: ${new Date(sceneState.updatedAt).toISOString()}`,
+        `Location: ${sceneState.location ?? 'unknown'}`,
+        `Time: ${sceneState.timeOfDay ?? 'unknown'}`,
+        `Weather: ${sceneState.weather ?? 'unknown'}`,
+        `NPCs: ${sceneState.activeNpcs.join(', ') || 'none'}`,
+        `Conflict: ${sceneState.currentConflict ?? 'none'}`,
+        `Objective: ${sceneState.currentObjective ?? 'none'}`,
+        `Risks: ${sceneState.currentRisks.join(', ') || 'none'}`,
+        `Party Situation: ${sceneState.partySituation ?? 'unknown'}`,
+        `Summary: ${sceneState.summary}`,
+        '',
+        sceneState.narrative,
+        '</canonical_scene_state>',
+      ].join('\n'));
+    }
+    if (recentSceneSnapshot) {
+      extras.push(`<recent_scene_snapshot>\n${recentSceneSnapshot}\n</recent_scene_snapshot>`);
+    }
+    return extras.join('\n\n');
   }
 
   isProtectedThread(threadId: string): boolean {
@@ -956,6 +1079,10 @@ export class DndDiscordController {
       ? getPreconfiguredWorld(details.session.worldKey)?.name ?? details.session.worldKey
       : 'Random World';
     const worldAnchor = details.session.worldInfo?.slice(0, 1200) ?? 'No world summary stored.';
+    const sceneState = this.parseSceneState(details.session.sceneStateJson);
+    const canonicalScene = sceneState
+      ? `${sceneState.title ?? 'Scene Update'} (${sceneState.source}, ${new Date(sceneState.updatedAt).toISOString()})\nSummary: ${sceneState.summary}\n${sceneState.narrative}`
+      : 'No canonical scene state stored yet.';
 
     // Session state and world lore context — the GM persona and formatting rules
     // are now provided via systemPromptOverride in the engine request.
@@ -971,6 +1098,10 @@ World Mode: ${worldMode}
 World Identity: ${worldIdentity}
 World Anchor: ${worldAnchor}
 </session_state>
+
+<canonical_scene_state>
+${canonicalScene}
+</canonical_scene_state>
 
 <world_lore>
 ${ragContext?.trim() || 'No active lore context.'}
@@ -999,6 +1130,9 @@ ${message}
    - The outcome can be partial success, self-inflicted trouble, damage, morale loss, an opening to escape, or no effect at all.
    - Keep it fair, vivid, and a little fun when the action invites it.
 9. **Lorebook Fidelity**: If World Mode is preconfigured lorebook, stay inside that established setting and reuse its proper nouns, factions, locations, and tensions. Do not invent a replacement world.
+10. **Continuity Discipline**: Treat both the canonical scene state and the recent scene snapshot as canon. Do not change location, weather, time of day, active NPCs, or the immediate situation unless the player action or the canon already establishes that change.
+11. **No Branching Reality**: Do not write alternate versions of the same beat. Continue from the latest established moment instead of retrying, reframing, or replacing prior events inside the narrative itself.
+12. **Canonical Priority**: If older lore, stale context, or joke bits conflict with the canonical scene state, follow the canonical scene state and continue cleanly from there.
 
 Write your GM response now.`.trim();
   }
@@ -1017,6 +1151,109 @@ Write your GM response now.`.trim();
     return buildTurnTrackerEmbed(details);
   }
 
+  private parseSceneState(sceneStateJson: string | null | undefined): DndSceneState | null {
+    if (!sceneStateJson) return null;
+    try {
+      const parsed = JSON.parse(sceneStateJson) as Partial<DndSceneState>;
+      return {
+        title: parsed.title ?? null,
+        location: parsed.location ?? null,
+        timeOfDay: parsed.timeOfDay ?? null,
+        weather: parsed.weather ?? null,
+        activeNpcs: Array.isArray(parsed.activeNpcs) ? parsed.activeNpcs.filter(Boolean) : [],
+        currentConflict: parsed.currentConflict ?? null,
+        currentObjective: parsed.currentObjective ?? null,
+        currentRisks: Array.isArray(parsed.currentRisks) ? parsed.currentRisks.filter(Boolean) : [],
+        partySituation: parsed.partySituation ?? null,
+        summary: parsed.summary ?? '',
+        narrative: parsed.narrative ?? '',
+        source: parsed.source ?? 'narrative',
+        updatedAt: parsed.updatedAt ?? Date.now(),
+        activePlayerUserId: parsed.activePlayerUserId ?? null,
+        messageId: parsed.messageId ?? null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private summarizeCanonicalScene(content: string): string {
+    const normalized = content.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    const paragraphs = content
+      .split(/\n{2,}/)
+      .map(part => part.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .slice(0, 2);
+    const candidate = (paragraphs.join(' ') || normalized).trim();
+    return candidate.slice(0, 900);
+  }
+
+  async recordCanonicalSceneState(input: {
+    threadId: string;
+    sessionId: string;
+    source: DndSceneState['source'];
+    title: string | null;
+    content: string;
+    messageId?: string | null;
+  }): Promise<void> {
+    if (!input.sessionId) return;
+    const cleanContent = input.content.replace(/\s+\n/g, '\n').trim();
+    if (!cleanContent) return;
+
+    const details = this.manager.getSessionById(input.sessionId);
+    if (!details) return;
+
+    const derived = deriveStructuredSceneState(cleanContent);
+
+    const sceneState: DndSceneState = {
+      title: input.title,
+      location: derived.location,
+      timeOfDay: derived.timeOfDay,
+      weather: derived.weather,
+      activeNpcs: derived.activeNpcs,
+      currentConflict: derived.currentConflict,
+      currentObjective: derived.currentObjective,
+      currentRisks: derived.currentRisks,
+      partySituation: derived.partySituation,
+      summary: this.summarizeCanonicalScene(cleanContent),
+      narrative: cleanContent.slice(0, 2400),
+      source: input.source,
+      updatedAt: Date.now(),
+      activePlayerUserId: details.session.activePlayerUserId,
+      messageId: input.messageId ?? null,
+    };
+
+    this.manager.updateSceneState(input.sessionId, sceneState);
+    this.manager.updateSessionWorldState(input.sessionId, {
+      sceneDanger: derived.currentRisks.length === 0 ? 'safe' : derived.currentRisks.length >= 2 ? 'danger' : 'tense',
+      safeRest: derived.currentRisks.length === 0,
+    });
+    this.memory.saveMessage({
+      sessionKey: `discord:${input.threadId}`,
+      role: 'assistant',
+      content: [
+        '[CANONICAL_SCENE_STATE]',
+        `Title: ${sceneState.title ?? 'Scene Update'}`,
+        `Source: ${sceneState.source}`,
+        'This canonical scene state supersedes older conflicting scene descriptions.',
+        '',
+        `Summary: ${sceneState.summary}`,
+        '',
+        sceneState.narrative,
+      ].join('\n'),
+      timestamp: sceneState.updatedAt,
+      metadata: JSON.stringify({
+        kind: 'dnd_scene_state',
+        sessionId: input.sessionId,
+        source: sceneState.source,
+        title: sceneState.title,
+        location: sceneState.location,
+        messageId: sceneState.messageId ?? null,
+      }),
+    });
+  }
+
 
   async processStructuredNarrativeResponse(threadId: string, content: string): Promise<{
     content: string;
@@ -1025,10 +1262,11 @@ Write your GM response now.`.trim();
     combatComponents: ActionRowBuilder<ButtonBuilder>[] | null;
     actionComponents: ActionRowBuilder<ButtonBuilder>[] | null;
     rollComponents: ActionRowBuilder<ButtonBuilder>[] | null;
+    validation: ValidationResult | null;
   }> {
     const details = this.manager.getSessionForThread(threadId);
     if (!details) {
-      return { content, shopEmbeds: [], combatEmbeds: [], combatComponents: null, actionComponents: null, rollComponents: null };
+      return { content, shopEmbeds: [], combatEmbeds: [], combatComponents: null, actionComponents: null, rollComponents: null, validation: null };
     }
 
     const parsed = parseStructuredNarrative(content);
@@ -1098,6 +1336,7 @@ Write your GM response now.`.trim();
             result.summary.session,
             result.summary.players,
             result.combat,
+            'Combat started.',
             'Combat started from the current narrative scene.',
           ));
           combatComponents = buildCombatActionRows(result.summary.session.id);
@@ -1107,30 +1346,47 @@ Write your GM response now.`.trim();
       }
     }
 
+    const validation = repairNarrativePacket({
+      session: details.session,
+      sceneState: this.parseSceneState(details.session.sceneStateJson),
+      content: parsed.cleanedContent,
+      actionChoices: parsed.actionChoices,
+      rollSuggestions: parsed.rollSuggestions,
+    });
+    if (!validation.ok) {
+      log.warn({
+        threadId,
+        sessionId: details.session.id,
+        issues: validation.issues.map(issue => issue.code),
+        originalContent: parsed.cleanedContent.slice(0, 800),
+      }, 'Validated and repaired GM narrative packet');
+    }
+
     const refreshedDetails = this.manager.getSessionForThread(threadId) ?? details;
     const activeUserId = refreshedDetails.session.activePlayerUserId ?? refreshedDetails.session.hostUserId ?? '';
-    const defaultChoices = buildSceneSpecificFallbackChoices(parsed.cleanedContent, null);
-    const resolvedChoices = parsed.actionChoices && parsed.actionChoices.length > 0
-      ? parsed.actionChoices
+    const defaultChoices = buildSceneSpecificFallbackChoices(validation.repairedContent, null);
+    const resolvedChoices = validation.repairedChoices.length > 0
+      ? validation.repairedChoices
       : defaultChoices;
     const actionComponents = combatEmbeds.length > 0
       ? null
       : activeUserId
-      ? buildActionChoiceRows(refreshedDetails.session.id, activeUserId, resolvedChoices)
-      : null;
+        ? buildActionChoiceRows(refreshedDetails.session.id, activeUserId, resolvedChoices)
+        : null;
 
-    const safeRollSuggestions = sanitizeRollSuggestions(parsed.rollSuggestions ?? []);
+    const safeRollSuggestions = validation.repairedRolls;
     const rollComponents = activeUserId && safeRollSuggestions.length > 0
       ? buildRollChoiceRows(refreshedDetails.session.id, activeUserId, safeRollSuggestions)
       : null;
 
     return {
-      content: parsed.cleanedContent,
+      content: validation.repairedContent,
       shopEmbeds,
       combatEmbeds,
       combatComponents,
       actionComponents,
       rollComponents,
+      validation,
     };
   }
 
@@ -1161,6 +1417,49 @@ Write your GM response now.`.trim();
     }
 
     return fullText.trim();
+  }
+
+  private async generateValidatedNarrative(
+    threadId: string,
+    sessionId: string,
+    systemPrompt: string,
+    prompt: string,
+  ): Promise<{
+    content: string;
+    shopEmbeds: EmbedBuilder[];
+    combatEmbeds: EmbedBuilder[];
+    combatComponents: ActionRowBuilder<ButtonBuilder>[] | null;
+    actionComponents: ActionRowBuilder<ButtonBuilder>[] | null;
+    rollComponents: ActionRowBuilder<ButtonBuilder>[] | null;
+    validation: ValidationResult | null;
+  }> {
+    let attemptPrompt = prompt;
+    let lastProcessed: Awaited<ReturnType<DndDiscordController['processStructuredNarrativeResponse']>> | null = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const rawText = await this.generateGMNarrative(systemPrompt, attemptPrompt);
+      const processed = await this.processStructuredNarrativeResponse(threadId, rawText);
+      lastProcessed = processed;
+      if (!processed.validation?.shouldRegenerate) {
+        return processed;
+      }
+      attemptPrompt = [
+        prompt,
+        '',
+        '[SYSTEM CORRECTION: The previous draft broke continuity or world fidelity.]',
+        `Issues: ${processed.validation.issues.map(issue => issue.code).join(', ')}`,
+        'Regenerate from the same canonical scene. Do not move the scene, swap locations, or invent a replacement setting.',
+      ].join('\n');
+      log.warn({ sessionId, threadId, issues: processed.validation.issues.map(issue => issue.code), attempt }, 'Regenerating invalid GM response');
+    }
+    return lastProcessed ?? {
+      content: '',
+      shopEmbeds: [],
+      combatEmbeds: [],
+      combatComponents: null,
+      actionComponents: null,
+      rollComponents: null,
+      validation: null,
+    };
   }
 
   private async handleDndCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1366,6 +1665,102 @@ Write your GM response now.`.trim();
     }
   }
 
+  private async handleSkillsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    try {
+      const details = this.requireCurrentSession(interaction);
+      this.assertPlayer(details, interaction.user.id);
+      const player = requirePlayer(details.players, interaction.user.id);
+      const sheet = this.manager.getCharacterSheet(details.session.id, interaction.user.id);
+      await interaction.reply({
+        embeds: [buildSkillsEmbed(details.session, player, sheet)],
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (error: any) {
+      await replyError(interaction, error.message);
+    }
+  }
+
+  private async handleSpellsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    try {
+      const details = this.requireCurrentSession(interaction);
+      this.assertPlayer(details, interaction.user.id);
+      const player = requirePlayer(details.players, interaction.user.id);
+      const sheet = this.manager.getCharacterSheet(details.session.id, interaction.user.id);
+      await interaction.reply({
+        embeds: [buildSpellsEmbed(details.session, player, sheet)],
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (error: any) {
+      await replyError(interaction, error.message);
+    }
+  }
+
+  private async handleAvatarCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    try {
+      const details = this.requireCurrentSession(interaction);
+      this.assertPlayer(details, interaction.user.id);
+      const subcommand = interaction.options.getSubcommand(true);
+      const player = requirePlayer(details.players, interaction.user.id);
+
+      if (subcommand === 'view') {
+        await interaction.reply({
+          embeds: [buildAvatarEmbed(details.session, player)],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (subcommand === 'discord') {
+        const avatarUrl = interaction.user.displayAvatarURL({ extension: 'png', size: 512 });
+        const updated = this.manager.setAvatar(details.session.id, interaction.user.id, {
+          url: avatarUrl,
+          source: 'discord',
+        });
+        await interaction.reply({
+          embeds: [buildAvatarEmbed(details.session, updated, 'Using your Discord avatar as your character portrait.')],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (subcommand === 'upload') {
+        const attachment = interaction.options.getAttachment('image', true);
+        if (!attachment.contentType?.startsWith('image/')) {
+          throw new Error('Please upload an image file.');
+        }
+        const updated = this.manager.setAvatar(details.session.id, interaction.user.id, {
+          url: attachment.url,
+          source: 'upload',
+        });
+        await interaction.reply({
+          embeds: [buildAvatarEmbed(details.session, updated, 'Portrait updated from uploaded image.')],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (subcommand === 'url') {
+        const imageUrl = interaction.options.getString('image_url', true).trim();
+        if (!/^https?:\/\//i.test(imageUrl)) {
+          throw new Error('Please provide a direct http(s) image URL.');
+        }
+        const updated = this.manager.setAvatar(details.session.id, interaction.user.id, {
+          url: imageUrl,
+          source: 'upload',
+        });
+        await interaction.reply({
+          embeds: [buildAvatarEmbed(details.session, updated, 'Portrait updated from direct URL.')],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.reply({ content: 'Unknown avatar command.', flags: MessageFlags.Ephemeral });
+    } catch (error: any) {
+      await replyError(interaction, error.message);
+    }
+  }
+
   private async handleInventoryCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     try {
       const details = this.requireCurrentSession(interaction);
@@ -1448,8 +1843,9 @@ Write your GM response now.`.trim();
     }
   }
 
-  private async handleTurnCommand(interaction: ChatInputCommandInteraction): Promise<string | boolean> {
+  private async handleTurnCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const details = this.requireCurrentSession(interaction);
       this.assertPlayer(details, interaction.user.id);
       const action = interaction.options.getString('action', true).trim();
@@ -1465,15 +1861,50 @@ Write your GM response now.`.trim();
       const combat = this.manager.getCombatState(details.session.id);
       if (combat?.active) {
         try {
-          const result = this.manager.resolveCombatTurnAction(details.session.id, interaction.user.id, action);
+          const pendingBefore = this.safeGetPendingCombatActions(details.session.id);
+          const actorName = details.players.find(player => player.userId === interaction.user.id)?.characterName ?? 'A party member';
+          const actorIsFinalPending = Boolean(
+            pendingBefore
+            && pendingBefore.waitingOn.length === 1
+            && pendingBefore.waitingOn[0] === actorName,
+          );
+          if (actorIsFinalPending) {
+            await this.refreshPublicCombatStatusMessage(
+              interaction.channel,
+              details.session.id,
+              `${actorName} locked in an action for this round.`,
+              {
+                headline: 'GM resolving the round',
+                detail: 'All player actions are locked in. Enemy turns and narration are being resolved now.',
+                readyStatus: `${pendingBefore!.submitted.length + 1} / ${pendingBefore!.submitted.length + 1} locked in`,
+              },
+            );
+          }
+          const result = await this.manager.submitCombatAction(details.session.id, interaction.user.id, action, this.engine);
           await this.syncRagForSession(result.summary.session.id);
-          await interaction.reply({
+
+          if (result.status === 'waiting') {
+            await this.refreshPublicCombatStatusMessage(
+              interaction.channel,
+              result.summary.session.id,
+              `${actorName} locked in an action for this round.`,
+            );
+            await interaction.editReply({
+              content: `Action recorded. Waiting on: ${result.waitingOn.join(', ')}`,
+            });
+            return;
+          }
+
+          const mechanics = result.messages.join('\n') || 'Round resolved.';
+          const actions = result.roundNarrative.join('\n');
+          await interaction.editReply({
             embeds: [
               buildCombatEmbed(
                 result.summary.session,
                 result.summary.players,
                 result.combat,
-                result.messages.join('\n') || `${interaction.user} acted in combat.`,
+                mechanics,
+                actions,
               ),
             ],
             components: result.combat.active ? buildCombatActionRows(result.summary.session.id) : [],
@@ -1487,25 +1918,20 @@ Write your GM response now.`.trim();
               payload => interaction.followUp(payload as any),
             );
           }
-          return true;
+          return;
         } catch (error: any) {
           if (shouldFallbackToNarrativeCombat(error.message)) {
-            await interaction.reply({
+            await interaction.editReply({
               content: 'Treating that as an improvised combat action. The GM can call for a roll and adjudicate the outcome.',
-              flags: MessageFlags.Ephemeral,
             });
-            return action;
+            return;
           }
           throw error;
         }
       }
 
       const activeUserId = details.session.activePlayerUserId;
-      if (!activeUserId) {
-        throw new Error('There is no active player turn right now.');
-      }
-
-      if (activeUserId !== interaction.user.id) {
+      if (!combat?.active && activeUserId && activeUserId !== interaction.user.id) {
         const activeName = details.players.find(player => player.userId === activeUserId)?.characterName ?? 'another player';
         throw new Error(`It is currently ${activeName}'s turn.`);
       }
@@ -1515,15 +1941,11 @@ Write your GM response now.`.trim();
         throw new Error(gate.reason);
       }
 
-      await interaction.reply({
+      await interaction.editReply({
         content: 'Turn submitted to the GM.',
-        flags: MessageFlags.Ephemeral,
       });
-
-      return action;
     } catch (error: any) {
       await replyError(interaction, error.message);
-      return true;
     }
   }
 
@@ -1597,6 +2019,35 @@ Write your GM response now.`.trim();
         }
         default:
           await interaction.reply({ content: 'Unknown downtime command.', flags: MessageFlags.Ephemeral });
+      }
+    } catch (error: any) {
+      await replyError(interaction, error.message);
+    }
+  }
+
+  private async handleFleeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    try {
+      const details = this.requireCurrentSession(interaction);
+      this.assertPlayer(details, interaction.user.id);
+      const combat = this.manager.getCombatState(details.session.id);
+      if (!combat?.active) {
+        throw new Error('You can only flee while combat is active.');
+      }
+
+      const result = this.manager.fleeCombat(details.session.id, interaction.user.id);
+      await this.syncRagForSession(details.session.id);
+      await interaction.reply({
+        embeds: [buildCombatEmbed(result.summary.session, result.summary.players, result.combat, result.message, 'Flee attempt recorded.')],
+        components: result.combat.active ? buildCombatActionRows(result.summary.session.id) : [],
+      });
+      if (!result.combat.active) {
+        await this.postCombatResolution(
+          interaction.channelId,
+          details.session.id,
+          result.combat,
+          [result.message],
+          payload => interaction.followUp(payload as any),
+        );
       }
     } catch (error: any) {
       await replyError(interaction, error.message);
@@ -2021,7 +2472,7 @@ Write your GM response now.`.trim();
           );
           await this.syncRagForSession(result.summary.session.id);
           const message = await interaction.reply({
-            embeds: [buildCombatEmbed(result.summary.session, result.summary.players, result.combat, 'Combat started. Use `/turn action: ...` to attack, use skills, or consume items.')],
+            embeds: [buildCombatEmbed(result.summary.session, result.summary.players, result.combat, 'Combat started.', 'Use `/turn action: ...` to attack, use skills, or consume items.')],
             components: buildCombatActionRows(result.summary.session.id),
             fetchReply: true,
           });
@@ -2034,7 +2485,7 @@ Write your GM response now.`.trim();
             throw new Error('Combat is not active in this session.');
           }
           await interaction.reply({
-            embeds: [buildCombatEmbed(details.session, details.players, combat, 'Current combat order.')],
+            embeds: [buildCombatEmbed(details.session, details.players, combat, 'Order view requested.', 'Current combat order.')],
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -2081,14 +2532,12 @@ Write your GM response now.`.trim();
       const currentCombat = this.manager.getCombatState(details.session.id);
 
       if (currentCombat?.active) {
-        const next = this.manager.advanceCombatTurn(details.session.id, interaction.user.id);
+        const next = await this.manager.advanceCombatTurn(details.session.id, interaction.user.id, this.engine);
         await this.syncRagForSession(next.summary.session.id);
-        const combatSummary = next.messages.length > 0
-          ? next.messages.join('\n')
-          : `Turn advanced to ${activePlayerLabel(next.summary)}.`;
-
+        const mechanics = next.messages.join('\n') || `Turn advanced to ${activePlayerLabel(next.summary)}.`;
+        const actions = next.roundNarrative.join('\n');
         const message = await interaction.reply({
-          embeds: [buildCombatEmbed(next.summary.session, next.summary.players, next.combat, combatSummary)],
+          embeds: [buildCombatEmbed(next.summary.session, next.summary.players, next.combat, mechanics, actions)],
           components: next.combat.active ? buildCombatActionRows(next.summary.session.id) : [],
           fetchReply: true,
         });
@@ -2107,25 +2556,36 @@ Write your GM response now.`.trim();
         return;
       }
 
-      const updated = this.manager.advanceTurn(details.session.id, interaction.user.id);
+      const updated = await this.manager.advanceTurn(details.session.id, interaction.user.id, this.engine);
       await this.syncRagForSession(updated.session.id);
       const combat = parseCombatState(updated.session.combatStateJson);
 
       if (combat?.active) {
         const message = await interaction.reply({
-          embeds: [buildCombatEmbed(updated.session, updated.players, combat, `Turn advanced to ${activePlayerLabel(updated)}.`)],
+          embeds: [buildCombatEmbed(updated.session, updated.players, combat, 'Session turn advanced.', `Turn advanced to ${activePlayerLabel(updated)}.`)],
           components: buildCombatActionRows(updated.session.id),
           fetchReply: true,
         });
         this.manager.recordCombatActionMessage(updated.session.id, interaction.channelId, message.id);
       } else {
-        await interaction.reply({
-          embeds: [buildSessionEmbed(updated, `Turn advanced to ${activePlayerLabel(updated)}.`)],
+        const nextActivePlayer = updated.players.find(player => player.userId === updated.session.activePlayerUserId) ?? null;
+        const waitingMessage = await interaction.reply({
+          embeds: [buildGenerationStatusEmbed(updated, 'turn', nextActivePlayer)],
+          fetchReply: true,
         });
         const nextPrompt = await this.buildNarrativeTurnPrompt(updated.session.id, interaction.channelId);
-        await interaction.followUp({
-          embeds: [nextPrompt.embed],
+        const trackerEmbed = this.buildTurnTrackerEmbed(interaction.channelId);
+        const promptMessage = await interaction.editReply({
+          embeds: [nextPrompt.embed, ...(trackerEmbed ? [trackerEmbed] : [])],
           components: nextPrompt.components,
+        });
+        await this.recordCanonicalSceneState({
+          threadId: interaction.channelId,
+          sessionId: updated.session.id,
+          source: 'turnprompt',
+          title: nextPrompt.embed.data.title ?? null,
+          content: nextPrompt.content,
+          messageId: (promptMessage as any)?.id ?? (waitingMessage as any)?.id ?? null,
         });
       }
     } catch (error: any) {
@@ -2141,7 +2601,7 @@ Write your GM response now.`.trim();
     }
 
     try {
-      const result = this.manager.castVote(voteId, interaction.user.id, optionId);
+      const result = await this.manager.castVote(voteId, interaction.user.id, optionId, this.engine);
       const details = this.manager.getSessionById(result.vote.vote.sessionId);
       if (!details) {
         throw new Error('Session not found after vote.');
@@ -2183,33 +2643,27 @@ Write your GM response now.`.trim();
       if (!combat?.active) {
         throw new Error('Combat is no longer active.');
       }
-      const active = combat.order[combat.turnIndex];
-      if (active?.userId !== interaction.user.id) {
-        throw new Error(`It is currently ${active?.characterName ?? 'another player'}'s turn.`);
-      }
 
       if (action === 'endturn') {
-        const next = this.manager.advanceCombatTurn(sessionId, interaction.user.id);
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const next = await this.manager.advanceCombatTurn(sessionId, interaction.user.id, this.engine);
         await this.syncRagForSession(next.summary.session.id);
-        await interaction.reply({
-          content: `Turn ended. It is now **${next.combat.order[next.combat.turnIndex]?.characterName ?? 'Unknown'}**'s turn.`,
-          flags: MessageFlags.Ephemeral,
+        await interaction.editReply({
+          content: 'Round force-resolved by host.',
         });
 
         const channel = interaction.channel;
         if (channel?.isSendable()) {
-          const combatSummary = next.messages.length > 0
-            ? next.messages.join('\n')
-            : `${active.characterName} ended their turn.`;
+          const mechanics = next.messages.join('\n') || 'Round resolved.';
+          const actions = next.roundNarrative.join('\n');
           await channel.send({
-            embeds: [buildCombatEmbed(next.summary.session, next.summary.players, next.combat, combatSummary)],
+            embeds: [buildCombatEmbed(next.summary.session, next.summary.players, next.combat, mechanics, actions)],
             components: next.combat.active ? buildCombatActionRows(sessionId) : [],
           }).then((message: any) => {
             if (message?.id && next.combat.active) {
               this.manager.recordCombatActionMessage(sessionId, interaction.channelId, message.id);
             }
           }).catch(() => { });
-          // If combat is over, post exploration action choices
           if (!next.combat.active) {
             await this.postCombatResolution(
               interaction.channelId,
@@ -2225,11 +2679,51 @@ Write your GM response now.`.trim();
 
       if (action === 'attack') {
         try {
-          const result = this.manager.resolveCombatTurnAction(sessionId, interaction.user.id, 'attack');
+          const pendingBefore = this.safeGetPendingCombatActions(sessionId);
+          const actorName = details.players.find(player => player.userId === interaction.user.id)?.characterName ?? 'A party member';
+          const actorIsFinalPending = Boolean(
+            pendingBefore
+            && pendingBefore.waitingOn.length === 1
+            && pendingBefore.waitingOn[0] === actorName,
+          );
+          if (actorIsFinalPending) {
+            await this.refreshPublicCombatStatusMessage(
+              interaction.channel,
+              sessionId,
+              `${actorName} locked in a quick attack for this round.`,
+              {
+                headline: 'GM resolving the round',
+                detail: 'All player actions are locked in. Enemy turns and narration are being resolved now.',
+                readyStatus: `${pendingBefore!.submitted.length + 1} / ${pendingBefore!.submitted.length + 1} locked in`,
+              },
+            );
+          }
+          const result = await this.manager.submitCombatAction(sessionId, interaction.user.id, 'I attack the nearest enemy with my weapon', this.engine);
           await this.syncRagForSession(result.summary.session.id);
-          await interaction.reply({
-            embeds: [buildCombatEmbed(result.summary.session, result.summary.players, result.combat, result.messages.join('\n'))],
+
+          if (result.status === 'waiting') {
+            await this.refreshPublicCombatStatusMessage(
+              interaction.channel,
+              result.summary.session.id,
+              `${actorName} locked in a quick attack for this round.`,
+            );
+            await interaction.reply({
+              content: `Action recorded (Quick Attack). Waiting on: ${result.waitingOn.join(', ')}`,
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
+
+          const mechanics = result.messages.join('\n') || 'Round resolved.';
+          const actions = result.roundNarrative.join('\n');
+          const message = await interaction.reply({
+            embeds: [buildCombatEmbed(result.summary.session, result.summary.players, result.combat, mechanics, actions)],
+            components: result.combat.active ? buildCombatActionRows(result.summary.session.id) : [],
+            fetchReply: true,
           });
+          if ((message as any)?.id && result.combat.active) {
+            this.manager.recordCombatActionMessage(sessionId, interaction.channelId, (message as any).id);
+          }
           if (!result.combat.active) {
             await this.postCombatResolution(
               interaction.channelId,
@@ -2264,8 +2758,79 @@ Write your GM response now.`.trim();
     }
   }
 
+  private async refreshPublicCombatStatusMessage(
+    channel: any,
+    sessionId: string,
+    summaryText: string,
+    statusOverride?: { headline: string; detail: string; readyStatus?: string } | null,
+  ): Promise<void> {
+    if (!channel?.isSendable?.()) {
+      return;
+    }
+
+    const details = this.manager.getSessionById(sessionId);
+    const combat = this.manager.getCombatState(sessionId);
+    if (!details || !combat?.active) {
+      return;
+    }
+
+    const pending = this.safeGetPendingCombatActions(sessionId);
+    const pendingLine = pending
+      ? pending.waitingOn.length > 0
+        ? `Waiting on: ${pending.waitingOn.join(', ')}.`
+        : pending.submitted.length > 0
+          ? 'All player actions are locked in. The GM is resolving the round.'
+          : 'Round open. Everyone can lock in an action.'
+      : 'Combat status updated.';
+
+    const payload = {
+      embeds: [
+        buildCombatEmbed(
+          details.session,
+          details.players,
+          combat,
+          summaryText,
+          pendingLine,
+          statusOverride,
+        ),
+      ],
+      components: buildCombatActionRows(sessionId),
+    };
+
+    const lastMessageId = combat.lastActionMessageId;
+    if (lastMessageId && channel.messages?.fetch) {
+      try {
+        const message = await channel.messages.fetch(lastMessageId);
+        await message.edit(payload);
+        return;
+      } catch {
+        // Fall through and post a fresh status message.
+      }
+    }
+
+    try {
+      const sent = await channel.send(payload as any);
+      if (sent?.id) {
+        this.manager.recordCombatActionMessage(sessionId, channel.id, sent.id);
+      }
+    } catch {
+      // Ignore channel send failures during combat status refresh.
+    }
+  }
+
+  private safeGetPendingCombatActions(sessionId: string): { submitted: string[]; waitingOn: string[] } | null {
+    try {
+      const pending = this.manager.getPendingCombatActions(sessionId);
+      return {
+        submitted: pending.submitted,
+        waitingOn: pending.waitingOn,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   private async handleActionChoiceButton(interaction: ButtonInteraction): Promise<string | boolean> {
-    // CustomId format: dnd_action_<sessionId>_<activeUserId>_<index>
     const withoutPrefix = interaction.customId.slice(DND_ACTION_PREFIX.length);
     const firstUnderscore = withoutPrefix.indexOf('_');
     if (firstUnderscore === -1) {
@@ -2274,7 +2839,6 @@ Write your GM response now.`.trim();
     }
     const sessionId = withoutPrefix.slice(0, firstUnderscore);
     const rest = withoutPrefix.slice(firstUnderscore + 1);
-    // rest = <activeUserId>_<index>
     const lastUnderscore = rest.lastIndexOf('_');
     if (lastUnderscore === -1) {
       await interaction.reply({ content: 'That action button is invalid.', flags: MessageFlags.Ephemeral });
@@ -2283,8 +2847,8 @@ Write your GM response now.`.trim();
     const activeUserId = rest.slice(0, lastUnderscore);
     const label = (interaction.component as any)?.label ?? '';
 
-    // Enforce that only the active player can press this
-    if (interaction.user.id !== activeUserId) {
+    const combat = this.manager.getCombatState(sessionId);
+    if (!combat?.active && interaction.user.id !== activeUserId) {
       const details = this.manager.getSessionById(sessionId);
       const activeName = details?.players.find(p => p.userId === activeUserId)?.characterName ?? 'another player';
       await interaction.reply({
@@ -2294,15 +2858,12 @@ Write your GM response now.`.trim();
       return true;
     }
 
-    // Acknowledge the button immediately so Discord doesn't time out
     await interaction.deferUpdate();
 
-    // Disable the buttons on the original message so they can't be clicked again
     try {
       await interaction.editReply({ components: [] });
     } catch { /* ignore if message is gone */ }
 
-    // Return the label so the channel can process it through the engine
     return label;
   }
 
@@ -2321,23 +2882,42 @@ Write your GM response now.`.trim();
     }
 
     this.assertPlayer(details, interaction.user.id);
-    await interaction.reply({ content: 'Regenerating the scene...', flags: MessageFlags.Ephemeral });
+    await interaction.deferUpdate();
 
     if (kind === 'opening') {
-      await this.postOpeningScene(details.session.id, interaction.channelId);
+      const openingPlayer = activePlayerRecord(details);
+      await interaction.message.edit({
+        embeds: [buildGenerationStatusEmbed(details, 'regenerate', openingPlayer)],
+        components: [],
+      });
+      await this.postOpeningScene(details.session.id, interaction.channelId, interaction.message);
       return;
     }
 
     if (kind === 'turnprompt') {
+      const spotlight = activePlayerRecord(details);
+      await interaction.message.edit({
+        embeds: [buildGenerationStatusEmbed(details, 'regenerate', spotlight)],
+        components: [],
+      });
       const nextPrompt = await this.buildNarrativeTurnPrompt(details.session.id, interaction.channelId);
-      await interaction.followUp({
-        embeds: [nextPrompt.embed],
+      const trackerEmbed = this.buildTurnTrackerEmbed(interaction.channelId);
+      await interaction.message.edit({
+        embeds: [nextPrompt.embed, ...(trackerEmbed ? [trackerEmbed] : [])],
         components: nextPrompt.components,
+      });
+      await this.recordCanonicalSceneState({
+        threadId: interaction.channelId,
+        sessionId: details.session.id,
+        source: 'regenerate',
+        title: nextPrompt.embed.data.title ?? null,
+        content: nextPrompt.content,
+        messageId: interaction.message.id,
       });
       return;
     }
 
-    await interaction.followUp({ content: 'Unknown regenerate target.', flags: MessageFlags.Ephemeral });
+    await interaction.followUp({ content: 'Unknown regenerate target.', flags: MessageFlags.Ephemeral }).catch(() => undefined);
   }
 
   private async handleStart(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2532,7 +3112,7 @@ Write your GM response now.`.trim();
       race: interaction.options.getString('race'),
     });
     await this.syncRagForSession(summary.session.id);
-    
+
     const lobby = this.lobbies.get(sessionId);
     if (lobby) {
       await this.refreshLobby(summary.session.id);
@@ -2543,7 +3123,7 @@ Write your GM response now.`.trim();
 
     const joinedMidSession = before?.session.phase === 'active'
       && !before.players.some(player => player.userId === interaction.user.id);
-    
+
     if (lobby && joinedMidSession) {
       lobby.midSessionJoiners.add(interaction.user.id);
     }
@@ -2661,7 +3241,7 @@ Write your GM response now.`.trim();
 
   private async handleAvailability(interaction: ChatInputCommandInteraction, available: boolean): Promise<void> {
     const details = this.requireCurrentSession(interaction);
-    const summary = this.manager.setAvailability(details.session.id, interaction.user.id, available);
+    const summary = await this.manager.setAvailability(details.session.id, interaction.user.id, available, this.engine);
     await interaction.reply({
       content: available
         ? 'You are back in the turn order.'
@@ -2713,7 +3293,7 @@ Write your GM response now.`.trim();
     const delay = Math.max(0, expiresAt - Date.now());
     const timer = setTimeout(async () => {
       try {
-        const resolution = this.manager.resolveExpiredVote(voteId);
+        const resolution = await this.manager.resolveExpiredVote(voteId, this.engine);
         if (!resolution) return;
         const details = this.manager.getSessionById(resolution.session.id);
         if (details) {
@@ -2755,7 +3335,7 @@ Write your GM response now.`.trim();
   private async flushExpiredVotes(): Promise<void> {
     for (const vote of this.manager.listOpenVotes()) {
       if (vote.expiresAt > Date.now()) continue;
-      const resolution = this.manager.resolveExpiredVote(vote.id);
+      const resolution = await this.manager.resolveExpiredVote(vote.id, this.engine);
       if (!resolution) continue;
       const details = this.manager.getSessionById(resolution.session.id);
       if (details) {
@@ -2795,20 +3375,28 @@ Please wait while the GM weaves you into the current scene.
 Tip: ${pickLoadingTip(sessionId, userId ?? 'party', 'weave')}`;
       }
       return `${lead}
-Session is already in progress.`;
+The session is already moving. Please wait while the GM resolves the current beat and hands the spotlight around.
+
+Tip: ${pickLoadingTip(sessionId, userId ?? 'party', 'startup')}`;
     }
 
     if (lobby.countdownSeconds !== null) {
       return `${lead}
-Game starting in ${lobby.countdownSeconds}s...`;
+Game starting in ${lobby.countdownSeconds}s...
+
+Tip: ${pickLoadingTip(sessionId, userId ?? 'party', 'startup')}`;
     }
 
     if (lobby.worldLore) {
       return readyCount === playerCount
         ? `${lead}
-All players are ready. Countdown is about to begin...`
+All players are ready. Countdown is about to begin...
+
+Tip: ${pickLoadingTip(sessionId, userId ?? 'party', 'startup')}`
         : `${lead}
-World is ready. Waiting for the rest of the party.`;
+World is ready. Waiting for the rest of the party.
+
+Tip: ${pickLoadingTip(sessionId, userId ?? 'party', 'startup')}`;
     }
 
     const worldStatus = lobby.worldGenError
@@ -2849,7 +3437,7 @@ ${worldStatus}`;
 
       const description = details.session.phase === 'lobby'
         ? 'Lobby in progress. Ready up to start.'
-        : 'Session is now active.';
+        : (lobby.startupStatusText ?? 'Session is now active. The GM is preparing the next beat.');
 
       await message.edit({
         embeds: [buildSessionEmbed(details, description, lobby)],
@@ -3077,8 +3665,7 @@ ${worldStatus}`;
         // ignore missing prompt file
       }
 
-      const rawText = await this.generateGMNarrative(systemPrompt, prompt);
-      const processed = await this.processStructuredNarrativeResponse(channelId, rawText);
+      const processed = await this.generateValidatedNarrative(channelId, sessionId, systemPrompt, prompt);
       return {
         combatEnd,
         aftermath: {
@@ -3116,7 +3703,7 @@ ${worldStatus}`;
   private async buildNarrativeTurnPrompt(
     sessionId: string,
     channelId: string,
-  ): Promise<{ embed: EmbedBuilder; components: ActionRowBuilder<ButtonBuilder>[] }> {
+  ): Promise<{ embed: EmbedBuilder; components: ActionRowBuilder<ButtonBuilder>[]; content: string }> {
     const details = this.manager.getSessionById(sessionId);
     if (!details) {
       throw new Error('Session not found while building next-turn prompt.');
@@ -3133,13 +3720,7 @@ ${worldStatus}`;
     try {
       await this.syncRagForSession(sessionId);
       await this.ensureWorldRagReady(details.session);
-      const ragContext = await buildRagQuestionContext({
-        rag: this.rag,
-        embeddings: this.embeddings,
-        sessionId,
-        question: `next turn prompt for ${activePlayer.characterName}`,
-        extraScopeIds: this.getWorldScopeIds(details.session),
-      });
+      const ragContext = await this.buildNarrativeRagContext(channelId, `next turn prompt for ${activePlayer.characterName}`);
 
       const prompt = this.buildTableTalkPrompt(
         channelId,
@@ -3158,12 +3739,13 @@ ${worldStatus}`;
         // fallback to empty system prompt
       }
 
-      const rawText = await this.generateGMNarrative(systemPrompt, prompt);
-      const processed = await this.processStructuredNarrativeResponse(channelId, rawText);
+      const processed = await this.generateValidatedNarrative(channelId, details.session.id, systemPrompt, prompt);
       const embed = new EmbedBuilder()
         .setTitle(`Your Turn - ${activePlayer.characterName}`)
         .setColor(0x8e44ad)
-        .setDescription(processed.content.slice(0, 4096));
+        .setDescription(processed.content.slice(0, 4096))
+        .setFooter({ text: 'Only the active player can take the next spotlight action outside combat.' });
+      applyPlayerPortrait(embed, activePlayer, `Spotlight: ${activePlayer.characterName}`);
       const actionRows = processed.actionComponents && processed.actionComponents.length > 0
         ? processed.actionComponents
         : buildActionChoiceRows(
@@ -3172,22 +3754,25 @@ ${worldStatus}`;
           buildSceneSpecificFallbackChoices(processed.content, null),
         );
       const components = [...actionRows, ...buildRegenerateRows(details.session.id, 'turnprompt')].slice(0, 5);
-      return { embed, components };
+      return { embed, components, content: processed.content };
     } catch (error: any) {
       log.warn({ sessionId, channelId, error: error.message }, 'Failed to generate bespoke turn prompt');
+      const fallbackContent = `${activePlayer.characterName}, the spotlight is on you. What do you do next?`;
       const embed = new EmbedBuilder()
         .setTitle(`Your Turn - ${activePlayer.characterName}`)
         .setColor(0x8e44ad)
-        .setDescription(`${activePlayer.characterName}, the spotlight is on you. What do you do next?`);
+        .setDescription(fallbackContent)
+        .setFooter({ text: 'Only the active player can take the next spotlight action outside combat.' });
+      applyPlayerPortrait(embed, activePlayer, `Spotlight: ${activePlayer.characterName}`);
       const components = [
         ...buildActionChoiceRows(
-        details.session.id,
-        activePlayer.userId,
-        buildSceneSpecificFallbackChoices(embed.data.description ?? '', null),
-      ),
+          details.session.id,
+          activePlayer.userId,
+          buildSceneSpecificFallbackChoices(embed.data.description ?? '', null),
+        ),
         ...buildRegenerateRows(details.session.id, 'turnprompt'),
       ].slice(0, 5);
-      return { embed, components };
+      return { embed, components, content: fallbackContent };
     }
   }
 
@@ -3218,7 +3803,7 @@ ${worldStatus}`;
     session: DndSessionRecord,
     player: DndPlayerRecord,
     sheet: DndCharacterSheet,
-  defaultKit: { skillIds: string[]; items: StarterItemTemplate[]; equippedWeaponName: string | null },
+    defaultKit: { skillIds: string[]; items: StarterItemTemplate[]; equippedWeaponName: string | null },
   ): Promise<{ skillIds: string[]; items: StarterItemTemplate[]; equippedWeaponName: string | null; source: string }> {
     const classId = player.className?.toLowerCase() ?? player.onboardingState?.selectedClassId ?? null;
     const allowedSkills = Object.values(SKILL_DEFINITIONS).filter(skill => skill.classIds.includes(classId ?? ''));
@@ -3378,7 +3963,7 @@ ${worldStatus}`;
     }
   }
 
-  private async postOpeningScene(sessionId: string, channelId: string): Promise<void> {
+  private async postOpeningScene(sessionId: string, channelId: string, targetMessage?: any): Promise<void> {
     const details = this.manager.getSessionById(sessionId);
     if (!details) {
       throw new Error('Session not found while generating opening scene.');
@@ -3388,6 +3973,17 @@ ${worldStatus}`;
     if (!channel?.isTextBased()) {
       throw new Error('Opening scene channel is unavailable.');
     }
+
+    const openingPlayer = details.players.find(player => player.userId === details.session.activePlayerUserId) ?? null;
+    const waitingMessage = targetMessage
+      ? await targetMessage.edit({
+        content: null,
+        embeds: [buildGenerationStatusEmbed(details, 'opening', openingPlayer)],
+        components: [],
+      })
+      : await (channel as any).send({
+        embeds: [buildGenerationStatusEmbed(details, 'opening', openingPlayer)],
+      });
 
     await this.syncRagForSession(sessionId);
     await this.ensureWorldRagReady(details.session);
@@ -3419,17 +4015,30 @@ ${worldStatus}`;
     }
 
     try {
-      const rawText = await this.generateGMNarrative(systemPrompt, prompt);
-      const processed = await this.processStructuredNarrativeResponse(channelId, rawText);
+      const processed = await this.generateValidatedNarrative(channelId, details.session.id, systemPrompt, prompt);
       const narrativeEmbed = new EmbedBuilder()
         .setTitle('Opening Scene')
         .setColor(0x8e44ad)
         .setDescription(processed.content.slice(0, 4096));
+      applyPlayerPortrait(narrativeEmbed, openingPlayer, openingPlayer ? `Spotlight: ${openingPlayer.characterName}` : null);
       const trackerEmbed = this.buildTurnTrackerEmbed(channelId);
+      const openingComponents = [
+        ...(processed.actionComponents || []),
+        ...buildRegenerateRows(details.session.id, 'opening'),
+      ].slice(0, 5);
 
-      await (channel as any).send({
+      const sceneMessage = await waitingMessage.edit({
+        content: null,
         embeds: [narrativeEmbed, ...(trackerEmbed ? [trackerEmbed] : [])],
-        components: buildRegenerateRows(details.session.id, 'opening'),
+        components: openingComponents,
+      });
+      await this.recordCanonicalSceneState({
+        threadId: channelId,
+        sessionId: details.session.id,
+        source: targetMessage ? 'regenerate' : 'opening',
+        title: narrativeEmbed.data.title ?? null,
+        content: processed.content,
+        messageId: sceneMessage?.id ?? targetMessage?.id ?? null,
       });
 
       for (const embed of processed.shopEmbeds) {
@@ -3446,29 +4055,35 @@ ${worldStatus}`;
           components: processed.combatComponents,
         });
       }
-
-      if (processed.actionComponents && processed.actionComponents.length > 0) {
-        await (channel as any).send({
-          content: '**What do you do?**',
-          components: processed.actionComponents,
-        });
-      }
     } catch (err: any) {
       log.error({ sessionId, channelId, error: err.message }, 'Failed to generate opening scene via GM pipeline');
-      await (channel as any).send({
-        content: `🎬 **Opening Scene**\n\nThe adventure **${details.session.title}** begins. **${activePlayerLabel(details)}**, what do you do?`,
-      });
       const defaultChoices = buildSceneSpecificFallbackChoices(
         `The adventure **${details.session.title}** begins. ${details.session.worldInfo ?? ''}`,
         null,
       );
-      const actionComponents = buildActionChoiceRows(details.session.id, details.session.activePlayerUserId ?? '', defaultChoices);
-      if (actionComponents.length > 0) {
-        await (channel as any).send({
-          content: '**Choose an action:**',
-          components: actionComponents,
-        });
-      }
+      const openingComponents = [
+        ...buildActionChoiceRows(details.session.id, details.session.activePlayerUserId ?? '', defaultChoices),
+        ...buildRegenerateRows(details.session.id, 'opening'),
+      ].slice(0, 5);
+      const fallbackEmbed = new EmbedBuilder()
+        .setTitle('Opening Scene')
+        .setColor(0x8e44ad)
+        .setDescription(`The adventure **${details.session.title}** begins. **${activePlayerLabel(details)}**, what do you do?`.slice(0, 4096));
+      applyPlayerPortrait(fallbackEmbed, openingPlayer, openingPlayer ? `Spotlight: ${openingPlayer.characterName}` : null);
+      const trackerEmbed = this.buildTurnTrackerEmbed(channelId);
+      const sceneMessage = await waitingMessage.edit({
+        content: null,
+        embeds: [fallbackEmbed, ...(trackerEmbed ? [trackerEmbed] : [])],
+        components: openingComponents,
+      });
+      await this.recordCanonicalSceneState({
+        threadId: channelId,
+        sessionId: details.session.id,
+        source: targetMessage ? 'regenerate' : 'opening',
+        title: fallbackEmbed.data.title ?? null,
+        content: fallbackEmbed.data.description ?? '',
+        messageId: sceneMessage?.id ?? targetMessage?.id ?? null,
+      });
     }
   }
 
@@ -3484,31 +4099,33 @@ ${worldStatus}`;
     const channel = targetChannelId
       ? await this.client.channels.fetch(targetChannelId).catch(() => null)
       : null;
-    
+
     if (!channel?.isTextBased()) return;
+
+    const waitingMessage = await (channel as any).send({
+      embeds: [buildGenerationStatusEmbed(details, 'weave', player)],
+    }).catch(() => null);
 
     try {
       const loadout = await this.ensurePlayerCombatLoadout(details, player);
       await this.syncRagForSession(sessionId);
       await this.ensureWorldRagReady(details.session);
       const sceneSnapshot = await this.buildRecentSceneSnapshot(channel);
-      const ragContext = await buildRagQuestionContext({
-        rag: this.rag,
-        embeddings: this.embeddings,
-        sessionId,
-        question: `weaving in new character ${player.characterName}`,
-        extraScopeIds: this.getWorldScopeIds(details.session),
-      });
+      const ragContext = await this.buildNarrativeRagContext(channel.id, `weaving in new character ${player.characterName}`);
 
       const prompt = this.buildTableTalkPrompt(
         channel.id,
         details.session.hostUserId,
-        `[SYSTEM: A new player has joined midway. Their character is ${player.characterName}, a ${player.race || ''} ${player.className || ''}. Weave them into the CURRENT ongoing scene naturally.${details.session.worldKey ? ' Keep them inside the established shared world lore; do not invent a replacement setting or contradict the lorebook.' : ''} Do not start a new opening scene. Do not skip time. Do not relocate the party. Do not hard cut to a different room, district, or hour unless the recent scene snapshot already shows that change happened. The new character must enter through something immediately plausible in the exact current moment. Use the recent scene snapshot to anchor continuity.\n\n<recent_scene_snapshot>\n${sceneSnapshot || 'No recent scene snapshot available.'}\n</recent_scene_snapshot>\n\nEnd with a prompt for the party to interact.]`,
+        `[SYSTEM: A new player has joined midway. Their character is ${player.characterName}, a ${player.race || ''} ${player.className || ''}. Weave them into the CURRENT ongoing scene naturally.${details.session.worldKey ? ' Keep them inside the established shared world lore; do not invent a replacement setting or contradict the lorebook.' : ''} Do not start a new opening scene. Do not skip time. Do not relocate the party. Do not hard cut to a different room, district, or hour unless the recent scene snapshot already shows that change happened. The new character must enter through something immediately plausible in the exact current moment. Use the recent scene snapshot to anchor continuity.
+
+<recent_scene_snapshot>
+${sceneSnapshot || 'No recent scene snapshot available.'}
+</recent_scene_snapshot>
+
+End with a prompt for the party to interact.]`,
         ragContext,
       );
 
-      // We'll use the common LLM call pattern (similar to startCountdown)
-      // but targeting the existing session thread.
       const { readFileSync } = await import('fs');
       const { resolve } = await import('path');
       const gmPromptPath = resolve(process.cwd(), 'config/dnd_gm_prompt.md');
@@ -3519,25 +4136,32 @@ ${worldStatus}`;
         // Fallback
       }
 
-      let rawText = '';
-      try {
-        rawText = await this.generateGMNarrative(systemPrompt, prompt);
-      } catch (err: any) {
-        log.warn({ error: err.message }, 'Failed to generate weave-in narrative, using fallback');
-        rawText = buildFallbackOpeningScene(details.session.title, details.session.tone, details.session.worldInfo);
-      }
-
-      const processed = await this.processStructuredNarrativeResponse(channel.id, rawText);
+      const processed = await this.generateValidatedNarrative(channel.id, sessionId, systemPrompt, prompt);
 
       const weaveEmbed = new EmbedBuilder()
-        .setTitle('🤝 A New Arrival')
+        .setTitle('A New Arrival')
         .setColor(0x3498db)
         .setDescription(processed.content.slice(0, 4096))
         .setFooter({ text: `${player.characterName} joins the fray.` });
+      applyPlayerPortrait(weaveEmbed, player, `${player.characterName} enters the scene`);
 
-      await (channel as any).send({ 
-        embeds: [weaveEmbed, ...processed.shopEmbeds, ...processed.combatEmbeds],
-        components: processed.combatComponents ?? processed.actionComponents,
+      const weaveMessage = waitingMessage
+        ? await waitingMessage.edit({
+            content: null,
+            embeds: [weaveEmbed, ...processed.shopEmbeds, ...processed.combatEmbeds],
+            components: processed.combatComponents ?? processed.actionComponents,
+          })
+        : await (channel as any).send({
+            embeds: [weaveEmbed, ...processed.shopEmbeds, ...processed.combatEmbeds],
+            components: processed.combatComponents ?? processed.actionComponents,
+          });
+      await this.recordCanonicalSceneState({
+        threadId: channel.id,
+        sessionId,
+        source: 'weave',
+        title: weaveEmbed.data.title ?? null,
+        content: processed.content,
+        messageId: weaveMessage?.id ?? null,
       });
       await (channel as any).send({
         embeds: [
@@ -3547,14 +4171,22 @@ ${worldStatus}`;
             .setDescription(loadout.summary.slice(0, 4096)),
         ],
       });
-
     } catch (err: any) {
       log.error({ sessionId, userId, error: err.message }, 'Failed to trigger mid-session weave-in');
-      await (channel as any).send({
-        content: `👋 **${player.characterName}** joins the party! GM, please weave them into the scene.`,
-      });
+      if (waitingMessage) {
+        await waitingMessage.edit({
+          content: `**${player.characterName}** joins the party. Please give the GM a moment to anchor them to the current scene.`,
+          embeds: [],
+          components: [],
+        }).catch(() => undefined);
+      } else {
+        await (channel as any).send({
+          content: `**${player.characterName}** joins the party. Please give the GM a moment to anchor them to the current scene.`,
+        });
+      }
     }
   }
+
 }
 
 function parseJsonObject(raw: string): any {
@@ -3658,11 +4290,11 @@ function buildSceneSpecificFallbackChoices(content: string, existingChoices: str
   const lower = content.toLowerCase();
   const environmentChoice =
     lower.includes('cellar') ? 'Search the cellar shadows'
-    : lower.includes('alley') ? 'Sweep the alley for clues'
-    : lower.includes('bridge') ? 'Inspect the damaged bridge'
-    : lower.includes('wagon') ? 'Check the overturned wagon'
-    : lower.includes('door') ? 'Examine the sealed door'
-    : 'Inspect the scene closely';
+      : lower.includes('alley') ? 'Sweep the alley for clues'
+        : lower.includes('bridge') ? 'Inspect the damaged bridge'
+          : lower.includes('wagon') ? 'Check the overturned wagon'
+            : lower.includes('door') ? 'Examine the sealed door'
+              : 'Inspect the scene closely';
 
   const socialChoice = npcName
     ? `Question ${npcName} immediately`
@@ -4138,7 +4770,7 @@ function parseStructuredNarrative(content: string): {
       // like single quotes or missing brackets
       if (!rawJson.startsWith('[')) rawJson = '[' + rawJson;
       if (!rawJson.endsWith(']')) rawJson = rawJson + ']';
-      
+
       // Attempt a "relaxed" JSON parse if standard fails
       let parsed;
       try {
@@ -4291,7 +4923,7 @@ function parseStructuredNarrative(content: string): {
 
   // Safety net: strip any remaining raw XML-like tags that should never reach players.
   // We use a whitelist approach: keep content of narrative tags, but strip content of system tags.
-  
+
   // 1. Strip content of known system/data tags ENTIRELY
   const systemTags = 'world_lore|world_state|system_role|formatting_rules|session_state|player_input|dnd_actions|dnd_shop|dnd_combat|dnd_roll|system_note|think|thought|thinking|reasoning|internal_monologue|world_context|observation|task|plan|replan|thought_process';
   finalContent = finalContent
@@ -4346,6 +4978,7 @@ function buildSessionEmbed(summary: SessionSummary | DndSessionDetails, descript
   const session = summary.session;
   const players = summary.players;
   const combat = parseCombatState(session.combatStateJson);
+  const spotlight = activePlayerRecord(summary);
 
   const embed = new EmbedBuilder()
     .setTitle(`LiteClaw DnD - ${session.title}`)
@@ -4397,6 +5030,15 @@ function buildSessionEmbed(summary: SessionSummary | DndSessionDetails, descript
     embed.addFields({ name: 'Players', value: formatPlayers(players), inline: false });
   }
 
+  applyPlayerPortrait(
+    embed,
+    spotlight,
+    spotlight
+      ? `Spotlight: ${spotlight.characterName}`
+      : players[0]?.characterName
+        ? `Party Lead: ${players[0].characterName}`
+        : null,
+  );
   return embed.setTimestamp(new Date(session.updatedAt));
 }
 
@@ -4404,6 +5046,7 @@ function buildTurnTrackerEmbed(summary: SessionSummary | DndSessionDetails): Emb
   const session = summary.session;
   const players = summary.players;
   const combat = parseCombatState(session.combatStateJson);
+  const spotlight = activePlayerRecord(summary);
   const party = players.map(player => {
     const sheet = parseCharacterSheet(player.characterSheetJson);
     const status = player.userId === session.activePlayerUserId ? '->' : player.status === 'unavailable' ? 'ZZ' : 'OK';
@@ -4416,9 +5059,14 @@ function buildTurnTrackerEmbed(summary: SessionSummary | DndSessionDetails): Emb
     ? `Round ${combat.round} · ${combat.order[combat.turnIndex]?.characterName ?? 'Unknown'} acting`
     : 'Inactive';
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle('Turn Tracker')
     .setColor(combat?.active ? 0xc0392b : 0x2e86ab)
+    .setDescription(
+      combat?.active
+        ? 'Track the board here while combat resolves.'
+        : `Outside combat, the spotlight currently belongs to **${spotlight?.characterName ?? activePlayerLabel(summary)}**.`,
+    )
     .addFields(
       { name: 'Session', value: session.id, inline: true },
       { name: 'Turn', value: `${session.roundNumber}.${session.turnNumber}`, inline: true },
@@ -4428,6 +5076,8 @@ function buildTurnTrackerEmbed(summary: SessionSummary | DndSessionDetails): Emb
     )
     .setFooter({ text: session.title })
     .setTimestamp(new Date(session.updatedAt));
+
+  return applyPlayerPortrait(embed, spotlight, spotlight ? `Spotlight: ${spotlight.characterName}` : null);
 }
 
 function buildLobbyButtons(sessionId: string): ActionRowBuilder<ButtonBuilder> {
@@ -4461,37 +5111,43 @@ function buildStatsEmbed(
 
   const conditionsLine = sheet.conditions.length > 0
     ? formatConditions(sheet.conditions)
-    : '—';
+    : '-';
 
   const exhaustionLine = sheet.exhaustion > 0
     ? exhaustionDisplay(sheet.exhaustion)
-    : '—';
+    : '-';
 
-  const inspirationIcon = sheet.inspiration ? '⭐ Yes' : '—';
+  const inspirationIcon = sheet.inspiration ? 'Yes' : '-';
   const knownSkillsLine = formatKnownSkillsDetailed(sheet);
+  const spellLine = formatSpellsDetailed(sheet);
   const loadoutLine = formatEquippedLoadout(sheet, inventory);
+  const encumbranceLine = summarizeEncumbrance(sheet, inventory);
 
-  return new EmbedBuilder()
-    .setTitle(`📋 ${player.characterName}`)
+  const embed = new EmbedBuilder()
+    .setTitle(`Character Sheet - ${player.characterName}`)
     .setColor(0x2e86ab)
     .setDescription(`*${player.className ?? 'Unknown Class'} · ${player.race ?? 'Unknown Race'} · Level ${sheet.level}*`)
     .addFields(
-      { name: '❤️ Hit Points', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: '🛡️ AC', value: `${sheet.ac}`, inline: true },
-      { name: '🏃 Speed', value: `${sheet.speed} ft`, inline: true },
-      { name: '🎯 Prof.', value: `+${sheet.proficiencyBonus}`, inline: true },
-      { name: '⚡ XP', value: xpLine, inline: true },
-      { name: '👁️ Passive', value: `${sheet.passivePerception}`, inline: true },
-      { name: '⭐ Inspiration', value: inspirationIcon, inline: true },
-      { name: '📊 Abilities', value: formatAbilityScoresDetailed(sheet), inline: false },
+      { name: 'HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
+      { name: 'AC', value: `${sheet.ac}`, inline: true },
+      { name: 'Speed', value: `${sheet.speed} ft`, inline: true },
+      { name: 'Prof.', value: `+${sheet.proficiencyBonus}`, inline: true },
+      { name: 'XP', value: xpLine, inline: true },
+      { name: 'Passive', value: `${sheet.passivePerception}`, inline: true },
+      { name: 'Inspiration', value: inspirationIcon, inline: true },
+      { name: 'Abilities', value: formatAbilityScoresDetailed(sheet), inline: false },
       { name: 'Equipped Loadout', value: loadoutLine, inline: false },
-      { name: '✨ Known Skills', value: knownSkillsLine, inline: false },
-      { name: '🔥 Conditions', value: conditionsLine, inline: true },
-      { name: '😰 Exhaustion', value: exhaustionLine, inline: true },
-      { name: '📜 Notes', value: sheet.notes || '—', inline: false },
-      { name: '🏆 Recent Rewards', value: rewards, inline: false },
+      { name: 'Encumbrance', value: encumbranceLine, inline: true },
+      { name: 'Known Skills', value: knownSkillsLine, inline: false },
+      { name: 'Spells / Magical Abilities', value: spellLine, inline: false },
+      { name: 'Conditions', value: conditionsLine, inline: true },
+      { name: 'Exhaustion', value: exhaustionLine, inline: true },
+      { name: 'Notes', value: sheet.notes || '-', inline: false },
+      { name: 'Recent Rewards', value: rewards, inline: false },
     )
     .setFooter({ text: `Session: ${session.title} · ${session.id}` });
+
+  return applyPlayerPortrait(embed, player, `${player.characterName} - character sheet`);
 }
 
 function buildVoteEmbed(
@@ -4561,28 +5217,112 @@ function buildCombatEmbed(
   session: DndSessionRecord,
   players: DndPlayerRecord[],
   combat: DndCombatState,
-  description: string,
+  mechanics: string,
+  actions?: string,
+  statusOverride?: { headline: string; detail: string; readyStatus?: string } | null,
 ): EmbedBuilder {
   const order = combat.order.map((entry, index) => {
     const active = index === combat.turnIndex ? ' <- active' : '';
     const side = entry.side === 'enemy' ? 'Enemy' : 'Player';
     return `${index + 1}. ${entry.characterName} (${side}, ${entry.initiative})${active}`;
   }).join('\n');
-  const partyStatus = formatCombatPartyStatus(players);
+  const partyStatus = formatCombatPartyStatus(players, combat);
   const enemyStatus = formatCombatEnemyStatus(combat);
 
-  return new EmbedBuilder()
+  const gmNarrative = combat.lastRoundNarrative ? `\n\n**GM:** ${combat.lastRoundNarrative}` : '';
+  const actionSummary = actions ? `${actions}` : '';
+
+  let description = actionSummary;
+  if (gmNarrative) {
+    description += gmNarrative;
+  } else if (!actionSummary) {
+    description = mechanics || 'Round resolved.';
+  }
+
+  const tableStatus = describeCombatTableStatus(players, combat, statusOverride ?? undefined);
+
+  const embed = new EmbedBuilder()
     .setTitle(`Combat - ${session.title}`)
     .setColor(0xc0392b)
-    .setDescription(description)
+    .setDescription(description || 'Combat in progress...')
     .addFields(
       { name: 'Round', value: `${combat.round}`, inline: true },
-      { name: 'Active Turn', value: combat.order[combat.turnIndex]?.characterName ?? 'Unknown', inline: true },
+      { name: 'Ready Status', value: tableStatus.readyStatus, inline: true },
       { name: 'Participants', value: `${players.filter(player => player.status !== 'left').length} players / ${combat.enemies.filter(enemy => enemy.hp > 0).length} enemies`, inline: true },
+      { name: 'Table Status', value: `**${tableStatus.headline}**\n${tableStatus.detail}`, inline: false },
       { name: 'Initiative Order', value: order, inline: false },
-      { name: 'Party Status', value: partyStatus, inline: false },
-      { name: 'Enemy Status', value: enemyStatus, inline: false },
     );
+
+  // If we have a GM narrative or separate action intent, put the mechanical log in a field to avoid duplication
+  if ((gmNarrative || actionSummary) && mechanics && mechanics !== 'Round resolved.') {
+    embed.addFields({ name: 'Mechanical Log', value: mechanics.slice(0, 1024), inline: false });
+  }
+
+  embed.addFields(
+    { name: 'Party Status', value: partyStatus, inline: false },
+    { name: 'Enemy Status', value: enemyStatus, inline: false },
+  );
+
+  const activePlayer = players.find(player => player.userId === session.activePlayerUserId) ?? null;
+  return applyPlayerPortrait(embed, activePlayer, activePlayer ? `Active Turn: ${activePlayer.characterName}` : null);
+}
+
+function describeCombatTableStatus(
+  players: DndPlayerRecord[],
+  combat: DndCombatState,
+  statusOverride?: { headline: string; detail: string; readyStatus?: string },
+): { headline: string; detail: string; readyStatus: string } {
+  const livingPlayers = players.filter(player => {
+    const sheet = parseCharacterSheet(player.characterSheetJson);
+    return sheet.hp > 0 && player.status !== 'left';
+  });
+  const submitted = livingPlayers
+    .filter(player => combat.pendingPlayerActions[player.userId])
+    .map(player => player.characterName);
+  const waitingOn = livingPlayers
+    .filter(player => !combat.pendingPlayerActions[player.userId])
+    .map(player => player.characterName);
+  const total = livingPlayers.length;
+
+  if (statusOverride) {
+    return {
+      headline: statusOverride.headline,
+      detail: statusOverride.detail,
+      readyStatus: statusOverride.readyStatus ?? `${submitted.length} / ${total} locked in`,
+    };
+  }
+
+  if (total === 0) {
+    return {
+      headline: 'Combat resolving',
+      detail: 'No living party members are available to submit actions.',
+      readyStatus: '0 / 0 locked in',
+    };
+  }
+
+  if (submitted.length === 0) {
+    return {
+      headline: 'Waiting on player actions',
+      detail: waitingOn.length === 1
+        ? `${waitingOn[0]} has the floor. The GM is waiting for that action.`
+        : `${waitingOn.join(', ')} can lock in actions now.`,
+      readyStatus: `0 / ${total} locked in`,
+    };
+  }
+
+  if (waitingOn.length > 0) {
+    return {
+      headline: 'Waiting on the rest of the table',
+      detail: `Ready: ${submitted.join(', ')}. Waiting: ${waitingOn.join(', ')}.`,
+      readyStatus: `${submitted.length} / ${total} locked in`,
+    };
+  }
+
+  return {
+    headline: 'GM resolving the round',
+    detail: `All player actions are locked in. Enemy turns and narration are being resolved.`,
+    readyStatus: `${submitted.length} / ${total} locked in`,
+  };
 }
 
 function buildCombatEndEmbed(
@@ -4602,7 +5342,7 @@ function buildCombatEndEmbed(
     );
 }
 
-function formatCombatPartyStatus(players: DndPlayerRecord[]): string {
+function formatCombatPartyStatus(players: DndPlayerRecord[], combat?: DndCombatState): string {
   return players
     .filter(player => player.status !== 'left')
     .map(player => {
@@ -4900,6 +5640,64 @@ function activePlayerLabel(summary: SessionSummary | DndSessionDetails): string 
   return active ? active.characterName : 'None';
 }
 
+function activePlayerRecord(summary: SessionSummary | DndSessionDetails): DndPlayerRecord | null {
+  return summary.players.find(player => player.userId === summary.session.activePlayerUserId) ?? null;
+}
+
+function applyPlayerPortrait(
+  embed: EmbedBuilder,
+  player: DndPlayerRecord | null | undefined,
+  label?: string | null,
+): EmbedBuilder {
+  const avatarUrl = player?.avatarUrl?.trim();
+  if (!avatarUrl) return embed;
+  embed.setThumbnail(avatarUrl);
+  if (label) {
+    embed.setAuthor({ name: label, iconURL: avatarUrl });
+  }
+  return embed;
+}
+
+function buildGenerationStatusEmbed(
+  summary: SessionSummary | DndSessionDetails,
+  mode: 'opening' | 'turn' | 'weave' | 'regenerate',
+  player?: DndPlayerRecord | null,
+): EmbedBuilder {
+  const session = summary.session;
+  const spotlight = player ?? activePlayerRecord(summary);
+  const tipMode = mode === 'weave' ? 'weave' : 'startup';
+  const tip = pickLoadingTip(session.id, spotlight?.userId ?? 'party', tipMode);
+  const title = mode === 'opening'
+    ? 'GM is Preparing the Opening Scene'
+    : mode === 'weave'
+      ? 'GM is Weaving a New Arrival'
+      : mode === 'regenerate'
+        ? 'GM is Reworking the Scene'
+        : 'GM is Framing the Next Beat';
+  const description = mode === 'opening'
+    ? 'The table is ready. Give the GM a moment to stitch the world, the party, and the first hook together.'
+    : mode === 'weave'
+      ? `Give the GM a moment to thread ${spotlight?.characterName ?? 'the new character'} into the exact current situation.`
+      : mode === 'regenerate'
+        ? `The GM is rebuilding this beat in place. Give it a moment to come back sharper and cleaner.`
+        : `The spotlight is moving to **${spotlight?.characterName ?? activePlayerLabel(summary)}**. Give the GM a moment to frame what happens next.`;
+
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(mode === 'weave' ? 0x3498db : 0x6b4fa0)
+    .setDescription(description)
+    .addFields(
+      { name: 'Session', value: session.id, inline: true },
+      { name: 'Turn', value: `${session.roundNumber}.${session.turnNumber}`, inline: true },
+      { name: 'Spotlight', value: spotlight?.characterName ?? activePlayerLabel(summary), inline: true },
+      { name: 'Tip', value: tip, inline: false },
+    )
+    .setFooter({ text: session.title })
+    .setTimestamp(new Date(session.updatedAt));
+
+  return applyPlayerPortrait(embed, spotlight, spotlight ? `Spotlight: ${spotlight.characterName}` : null);
+}
+
 function buildResumeNotice(summary: SessionSummary, partialParty: boolean): string {
   if (!partialParty) {
     return `${summary.session.title} resumed with the saved party state.`;
@@ -5054,6 +5852,101 @@ function formatKnownSkillsDetailed(sheet: DndCharacterSheet): string {
     })
     .join('\n')
     .slice(0, 1024);
+}
+
+function isSpellLikeSkill(skillId: string): boolean {
+  const skill = SKILL_DEFINITIONS[skillId];
+  if (!skill) return false;
+  if (skill.resourceKind === 'spell') return true;
+  return ['wizard', 'sorcerer', 'warlock', 'cleric', 'druid', 'bard', 'paladin', 'ranger'].some(classId =>
+    skill.classIds.includes(classId)
+  );
+}
+
+function formatSpellsDetailed(sheet: DndCharacterSheet): string {
+  const spellIds = (sheet.knownSkillIds ?? []).filter(isSpellLikeSkill);
+  if (spellIds.length === 0) {
+    return 'No spell-like abilities prepared.';
+  }
+
+  return spellIds.map(skillId => {
+    const skill = SKILL_DEFINITIONS[skillId];
+    if (!skill) return `• ${skillId}`;
+    const usage = skill.usesPerCombat === null ? 'at will' : `${skill.usesPerCombat}/combat`;
+    const effect = skill.kind === 'heal'
+      ? `restores ${skill.healNotation ?? 'special'}`
+      : `hits for ${skill.damageNotation ?? 'special'}`;
+    return `• **${skill.name}** — ${effect}, ${usage}`;
+  }).join('\n').slice(0, 1024);
+}
+
+function deriveStructuredSceneState(content: string): Pick<DndSceneState, 'location' | 'timeOfDay' | 'weather' | 'activeNpcs' | 'currentConflict' | 'currentObjective' | 'currentRisks' | 'partySituation'> {
+  const locationMatch = content.match(/\b(?:in|inside|beneath|at|within) the ([A-Z][A-Za-z' -]{2,60})/);
+  const weatherMatch = content.match(/\b(rain|storm|drizzle|snow|fog|mist|wind|heat|cold|sun|lightning)\b/i);
+  const timeMatch = content.match(/\b(dawn|morning|midday|afternoon|evening|night|midnight|sunset|sunrise)\b/i);
+  const npcMatches = Array.from(content.matchAll(/\b([A-Z][a-z]+) says,/g)).map(match => match[1]);
+  const riskMatches = Array.from(content.matchAll(/\b(fire|blood|guards?|storm|shadow|monster|collapse|alarm|combat|danger|hiss|growl|threat)\b/gi)).map(match => match[1].toLowerCase());
+
+  return {
+    location: locationMatch?.[1]?.trim() ?? null,
+    timeOfDay: timeMatch?.[1]?.toLowerCase() ?? null,
+    weather: weatherMatch?.[1]?.toLowerCase() ?? null,
+    activeNpcs: Array.from(new Set(npcMatches)).slice(0, 8),
+    currentConflict: riskMatches.length > 0 ? `Immediate pressure involving ${Array.from(new Set(riskMatches)).slice(0, 2).join(' and ')}` : null,
+    currentObjective: /\bmust|need to|have to|tasked to|brought here to\b/i.test(content) ? summarizeSentence(content) : null,
+    currentRisks: Array.from(new Set(riskMatches)).slice(0, 6),
+    partySituation: summarizeSentence(content),
+  };
+}
+
+function summarizeSentence(content: string): string {
+  const sentence = content
+    .replace(/\s+/g, ' ')
+    .split(/(?<=[.!?])\s+/)
+    .find(Boolean)
+    ?? content.trim();
+  return sentence.slice(0, 220);
+}
+
+function inferItemWeight(item: DndInventoryItemRecord): number {
+  if (typeof item.weight === 'number' && Number.isFinite(item.weight)) {
+    return item.weight;
+  }
+  const metadata = parseInventoryMetadata(item);
+  if (metadata?.weaponId) {
+    const weaponWeights: Record<string, number> = {
+      greataxe: 7,
+      longsword: 3,
+      warhammer: 2,
+      mace: 4,
+      quarterstaff: 4,
+      shortsword: 2,
+      dagger: 1,
+      shortbow: 2,
+      wand: 1,
+      focus: 1,
+      lute: 2,
+    };
+    return weaponWeights[metadata.weaponId] ?? 1;
+  }
+  if (metadata?.consumableId) {
+    const consumableWeights: Record<string, number> = {
+      health_potion: 0.5,
+      fire_bomb: 1,
+    };
+    return consumableWeights[metadata.consumableId] ?? 0.5;
+  }
+  return 1;
+}
+
+function summarizeEncumbrance(sheet: DndCharacterSheet, items: DndInventoryItemRecord[]): string {
+  const carried = items
+    .filter(item => !parseInventoryMetadata(item)?.confiscated)
+    .reduce((sum, item) => sum + inferItemWeight(item) * Math.max(1, item.quantity), 0);
+  const capacity = Math.max(30, sheet.abilities.str * 15);
+  const ratio = carried / capacity;
+  const status = ratio >= 1 ? 'Overburdened' : ratio >= 0.66 ? 'Heavy' : ratio >= 0.33 ? 'Comfortable' : 'Light';
+  return `${carried.toFixed(1)} / ${capacity} lb (${status})`;
 }
 
 // ─── New Embed Builders ─────────────────────────────────────────────
@@ -5290,6 +6183,7 @@ function buildInventoryEmbed(
   const sheet = parseCharacterSheet(player.characterSheetJson);
   const accessibleItems = items.filter(item => !parseInventoryMetadata(item)?.confiscated);
   const confiscatedItems = items.filter(item => parseInventoryMetadata(item)?.confiscated);
+  const encumbrance = summarizeEncumbrance(sheet, items);
   const lines = accessibleItems.length > 0
     ? accessibleItems.slice(0, 20).map(item => {
       const metadata = parseInventoryMetadata(item);
@@ -5298,12 +6192,13 @@ function buildInventoryEmbed(
       const category = item.category ? ` - ${item.category}` : '';
       const notes = item.notes ? ` - ${item.notes}` : '';
       const consumable = item.consumable ? ' - consumable' : '';
+      const weight = ` - ${inferItemWeight(item) * Math.max(1, item.quantity)} lb`;
       const detail = weapon
         ? ` - ${weapon.attackAbility.toUpperCase()} to hit - ${weapon.damageNotation}`
         : metadata?.consumableId
           ? ` - ${metadata.consumableId.replace(/_/g, ' ')}`
           : '';
-      return `\`${item.id}\` **${item.name}** x${item.quantity}${equipped}${category}${consumable}${detail}${notes}`;
+      return `\`${item.id}\` **${item.name}** x${item.quantity}${equipped}${category}${consumable}${detail}${weight}${notes}`;
     }).join('\n')
     : 'No accessible items right now.';
   const confiscated = confiscatedItems.length > 0
@@ -5314,17 +6209,70 @@ function buildInventoryEmbed(
     }).join('\n')
     : 'None.';
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle(`Inventory - ${player.characterName}`)
     .setColor(0x27ae60)
     .addFields(
       { name: 'Gold', value: `${gold} gp`, inline: true },
       { name: 'Item Count', value: `${items.length}`, inline: true },
+      { name: 'Encumbrance', value: encumbrance, inline: true },
       { name: 'Equipped', value: formatEquippedLoadout(sheet, items), inline: false },
       { name: 'Accessible Items', value: lines, inline: false },
       { name: 'Confiscated / Stored', value: confiscated, inline: false },
     )
     .setFooter({ text: `Session: ${session.title}` });
+
+  return applyPlayerPortrait(embed, player, `${player.characterName} - inventory`);
+}
+
+function buildSkillsEmbed(
+  session: DndSessionRecord,
+  player: DndPlayerRecord,
+  sheet: DndCharacterSheet,
+): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(`Skills - ${player.characterName}`)
+    .setColor(0x2e86ab)
+    .setDescription(formatKnownSkillsDetailed(sheet))
+    .setFooter({ text: `Session: ${session.title}` });
+
+  return applyPlayerPortrait(embed, player, `${player.characterName} - skills`);
+}
+
+function buildSpellsEmbed(
+  session: DndSessionRecord,
+  player: DndPlayerRecord,
+  sheet: DndCharacterSheet,
+): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(`Spells - ${player.characterName}`)
+    .setColor(0x8e44ad)
+    .setDescription(formatSpellsDetailed(sheet))
+    .setFooter({ text: `Session: ${session.title}` });
+
+  return applyPlayerPortrait(embed, player, `${player.characterName} - magic`);
+}
+
+function buildAvatarEmbed(
+  session: DndSessionRecord,
+  player: DndPlayerRecord,
+  notice?: string,
+): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(`Portrait - ${player.characterName}`)
+    .setColor(0x3498db)
+    .setDescription(notice ?? 'Manage how your character appears to the table.')
+    .addFields(
+      { name: 'Source', value: player.avatarSource ?? 'class_default', inline: true },
+      { name: 'URL', value: player.avatarUrl ?? 'No custom portrait set.', inline: false },
+    )
+    .setFooter({ text: `Session: ${session.title}` });
+
+  if (player.avatarUrl) {
+    embed.setImage(player.avatarUrl);
+  }
+
+  return applyPlayerPortrait(embed, player, `${player.characterName} - portrait`);
 }
 
 function buildInventoryItemAddedEmbed(
