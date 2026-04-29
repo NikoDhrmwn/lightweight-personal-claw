@@ -1,6 +1,6 @@
 /**
  * LiteClaw — WhatsApp Channel
- * 
+ *
  * Uses @whiskeysockets/baileys (same as OpenClaw).
  * Handles QR pairing, session persistence, interactive buttons
  * for confirmations, and file/media sending.
@@ -18,13 +18,13 @@ import { Boom } from '@hapi/boom';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { join, basename, extname } from 'path';
 import { lookup } from 'mime-types';
-import { AgentEngine, AgentRequest } from '../core/engine.js';
+import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager } from '../core/confirmation.js';
 import { getConfig, getStateDir } from '../config.js';
 import { createLogger, createSilentLogger } from '../logger.js';
-import { printStepDone, printStepWarn } from '../logger.js';
+import { printStepDone, printStepWarn, printStepError } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
-import { sanitizeChannelContent, splitMessage } from './utils.js';
+import { sanitizeChannelContent, splitMessage, formatForWhatsApp } from './utils.js';
 
 const log = createLogger('whatsapp');
 const baileysLog = createSilentLogger('baileys');
@@ -35,12 +35,43 @@ interface MentionTarget {
   aliases: string[];
 }
 
+interface WhatsAppProgressState {
+  startedAt: number;
+  status: 'starting' | 'thinking' | 'planning' | 'working' | 'done' | 'error';
+  planSummary?: string;
+  tasks: Array<{
+    id: string;
+    title: string;
+    status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked' | 'skipped';
+    summary?: string;
+  }>;
+  recentTools: string[];
+  currentTaskLabel?: string;
+  error?: string;
+  messageKey?: any;
+  lastUpdateAt?: number;
+  isCreatingTracker?: boolean;
+}
+
+interface MessageQueueItem {
+  jid: string;
+  content: any;
+  options?: any;
+  retries: number;
+  resolve: (val: any) => void;
+  reject: (err: any) => void;
+}
+
 export class WhatsAppChannel {
   private sock: WASocket | null = null;
   private engine: AgentEngine;
   private confirmations: ConfirmationManager;
   private config: any;
   private sessionDir: string;
+  private progresses = new Map<string, WhatsAppProgressState>();
+  private messageQueue: MessageQueueItem[] = [];
+  private isProcessingQueue = false;
+  private isReconnecting = false;
 
   constructor(engine: AgentEngine, confirmations: ConfirmationManager) {
     this.engine = engine;
@@ -56,68 +87,140 @@ export class WhatsAppChannel {
   }
 
   async start(): Promise<void> {
-    const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
+    if (this.isReconnecting) return;
 
-    this.sock = makeWASocket({
-      version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, log as any),
-      },
-      logger: baileysLog as any,
-      generateHighQualityLinkPreview: false,
-      getMessage: async () => ({ conversation: '' }),
-    });
+    try {
+      const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
+      const { version } = await fetchLatestBaileysVersion();
 
-    // Save credentials on update
-    this.sock.ev.on('creds.update', saveCreds);
+      this.sock = makeWASocket({
+        version,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, baileysLog as any),
+        },
+        logger: baileysLog as any,
+        generateHighQualityLinkPreview: false,
+        getMessage: async () => ({ conversation: '' }),
+      });
 
-    // Handle connection events
-    this.sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      // Save credentials on update
+      this.sock.ev.on('creds.update', saveCreds);
 
-      if (qr) {
-        printStepWarn('WhatsApp not linked — scan QR code to pair');
-        // QR display handled by baileys internally
-      }
+      // Handle connection events
+      this.sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-      if (connection === 'close') {
-        const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = reason !== DisconnectReason.loggedOut;
-
-        log.info({ reason, shouldReconnect }, 'WhatsApp connection closed');
-
-        if (shouldReconnect) {
-          printStepWarn('WhatsApp disconnected, reconnecting...');
-          setTimeout(() => this.start(), 3000);
-        } else {
-          printStepWarn('WhatsApp logged out. Run: liteclaw channels login --channel whatsapp');
+        if (qr) {
+          printStepWarn('WhatsApp not linked — scan QR code to pair');
         }
-      }
 
-      if (connection === 'open') {
-        const me = (this.sock as any)?.authState?.creds?.me || {};
-        log.info({ 
-          id: this.sock?.user?.id, 
-          lid: (this.sock?.user as any)?.lid,
-          credsMe: me
-        }, 'WhatsApp connected - Identity Details');
-        printStepDone('WhatsApp connected');
-      }
-    });
+        if (connection === 'close') {
+          const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
+          const shouldReconnect = reason !== DisconnectReason.loggedOut;
 
-    // Handle incoming messages
-    this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+          log.info({ reason, shouldReconnect }, 'WhatsApp connection closed');
 
-      for (const msg of messages) {
-        const unwrapped = unwrapMessage(msg.message);
-        if (!unwrapped) continue;
+          if (shouldReconnect) {
+            this.isReconnecting = true;
+            printStepWarn(`WhatsApp disconnected (reason: ${reason}), reconnecting in 5s...`);
+            setTimeout(() => {
+              this.isReconnecting = false;
+              this.start();
+            }, 5000);
+          } else {
+            printStepError('WhatsApp logged out. Run: liteclaw channels login --channel whatsapp');
+          }
+        }
 
-        await this.handleMessage(msg, unwrapped);
-      }
-    });
+        if (connection === 'open') {
+          this.isReconnecting = false;
+          const me = (this.sock as any)?.authState?.creds?.me || {};
+          log.info({
+            id: this.sock?.user?.id,
+            lid: (this.sock?.user as any)?.lid,
+            credsMe: me
+          }, 'WhatsApp connected - Identity Details');
+          printStepDone('WhatsApp connected');
+        }
+      });
+
+      // Handle incoming messages
+      this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+
+        for (const msg of messages) {
+          const unwrapped = unwrapMessage(msg.message);
+          if (!unwrapped) continue;
+
+          // Check for text commands first
+          if (await this.handleTextCommand(msg, unwrapped)) continue;
+
+          await this.handleMessage(msg, unwrapped);
+        }
+      });
+    } catch (err: any) {
+      log.error({ error: err.message }, 'Failed to start WhatsApp channel');
+      this.isReconnecting = true;
+      setTimeout(() => {
+        this.isReconnecting = false;
+        this.start();
+      }, 10000);
+    }
+  }
+
+  private async handleTextCommand(msg: any, messageContent: any): Promise<boolean> {
+    const jid = msg.key.remoteJid!;
+    let text = '';
+
+    if (messageContent?.conversation) {
+      text = messageContent.conversation;
+    } else if (messageContent?.extendedTextMessage?.text) {
+      text = messageContent.extendedTextMessage.text;
+    }
+
+    text = text.trim();
+    if (!text.startsWith('/')) return false;
+
+    const [cmd, ...args] = text.slice(1).split(/\s+/);
+    const command = cmd.toLowerCase();
+    const sessionKey = `whatsapp:${jid}`;
+
+    log.info({ command, from: jid }, 'WhatsApp command received');
+
+    switch (command) {
+      case 'help':
+        await this.sendMessageWithRetry(jid, {
+          text: `*LiteClaw Commands*\n\n` +
+                `*/reset* - Clear conversation history\n` +
+                `*/status* - Show current status\n` +
+                `*/help* - Show this help message\n` +
+                `*/clear* - Alias for /reset`
+        });
+        return true;
+
+      case 'reset':
+      case 'clear':
+        this.engine.getMemory().clearSession(sessionKey);
+        await this.sendMessageWithRetry(jid, { text: '🗑 *History cleared.* Starting a fresh conversation.' });
+        return true;
+
+      case 'status':
+        const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
+        const uptime = process.uptime();
+        await this.sendMessageWithRetry(jid, {
+          text: `*LiteClaw Status*\n\n` +
+                `🤖 *Agent:* ${this.config.agent?.name || 'Molty'}\n` +
+                `⏳ *Uptime:* ${formatDurationShort(uptime * 1000)}\n` +
+                `💬 *Messages:* ${metrics.messageCount}\n` +
+                `🪙 *Tokens used:* ~${metrics.estimatedTokens}\n` +
+                `📅 *Last activity:* ${metrics.lastActivity ? new Date(metrics.lastActivity).toLocaleString() : 'never'}`
+        });
+        return true;
+
+      default:
+        return false;
+    }
   }
 
   private async handleMessage(msg: any, messageContent: any): Promise<void> {
@@ -193,23 +296,23 @@ export class WhatsAppChannel {
       const selfLid = (this.sock?.user as any)?.lid || (this.sock as any)?.authState?.creds?.me?.lid || '';
       const selfJid = selfJidRaw.split(':')[0] + '@s.whatsapp.net';
       const myName = this.config.agent?.name || this.sock?.user?.name || 'Molty';
-      
+
       const namePattern = new RegExp(`\\b${escapeRegex(myName)}\\b`, 'i');
-      const isMentioned = didMentionMe(messageContent, selfJid) || 
+      const isMentioned = didMentionMe(messageContent, selfJid) ||
                           didMentionMe(messageContent, selfJidRaw) ||
                           (selfLid && didMentionMe(messageContent, selfLid)) ||
                           content.toLowerCase().includes(`@${myName.toLowerCase()}`) ||
                           namePattern.test(content); // Handle informal mentions like "oi molty"
-                           
+
       const isReplyToMe = messageContent?.extendedTextMessage?.contextInfo?.participant === selfJid ||
                           messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw ||
                           (selfLid && normalizeJid(messageContent?.extendedTextMessage?.contextInfo?.participant || '') === normalizeJid(selfLid));
-      
-      log.info({ 
-        isGroupChat, isMentioned, isReplyToMe, 
+
+      log.info({
+        isGroupChat, isMentioned, isReplyToMe,
         selfJid, selfLid, myName,
         exactText: content,
-        mentionedJids: messageContent?.extendedTextMessage?.contextInfo?.mentionedJid 
+        mentionedJids: messageContent?.extendedTextMessage?.contextInfo?.mentionedJid
       }, 'WhatsApp group filter check VERY VERBOSE');
 
       if (!isMentioned && !isReplyToMe) {
@@ -236,60 +339,131 @@ export class WhatsAppChannel {
 
     // Process and accumulate response
     let fullContent = '';
-    const toolUpdates: string[] = [];
+    const showProgress = this.config.showToolProgress ?? true;
+    let progress: WhatsAppProgressState | undefined;
+
+    if (showProgress) {
+      progress = {
+        startedAt: Date.now(),
+        status: 'starting',
+        tasks: [],
+        recentTools: [],
+      };
+      this.progresses.set(sessionKey, progress);
+    }
 
     try {
       for await (const event of this.engine.processRequest(request)) {
+        if (progress) {
+          applyEventToWhatsAppProgress(progress, event);
+          await this.updateProgress(jid, progress);
+        }
+
         switch (event.type) {
           case 'content':
             fullContent += event.content ?? '';
             break;
-          case 'plan':
-            toolUpdates.push(`🗺 planned ${event.plan?.tasks?.length ?? 0} tasks`);
-            break;
-          case 'task_update': {
-            const prefix = event.taskIndex && event.taskTotal
-              ? `[${event.taskIndex}/${event.taskTotal}] `
-              : '';
-            if (event.taskStatus === 'in_progress') {
-              toolUpdates.push(`→ ${prefix}${event.taskTitle}`);
-            } else if (event.taskStatus) {
-              const icon = event.taskStatus === 'completed' ? '✓' : event.taskStatus === 'blocked' ? '⚠' : '✗';
-              toolUpdates.push(`${icon} ${prefix}${event.taskTitle}${event.taskSummary ? ` - ${event.taskSummary}` : ''}`);
-            }
-            break;
-          }
-          case 'tool_start':
-            toolUpdates.push(`⚙ _${event.toolName}_`);
-            break;
-          case 'tool_result':
-            const icon = event.toolResult?.success ? '✓' : '✗';
-            toolUpdates.push(`${icon} _${event.toolName}_`);
-            break;
           case 'error':
-            fullContent += `\n⚠ Error: ${event.error}`;
+            if (!progress) fullContent += `\n⚠ Error: ${event.error}`;
             break;
         }
       }
 
-      // Send response
-      await this.sendResponse(jid, fullContent, toolUpdates, mentionTargets);
+      // Final progress update
+      if (progress) {
+        progress.status = progress.status === 'error' ? 'error' : 'done';
+        // Final update to the tracker (Outcome will show a preview)
+        await this.updateProgress(jid, progress, fullContent);
+        this.progresses.delete(sessionKey);
+      }
+
+      // Always send the full response as a separate message for readability
+      if (fullContent.trim()) {
+        await this.sendResponse(jid, fullContent, [], mentionTargets);
+      }
 
       log.info({
         to: jid.replace('@s.whatsapp.net', ''),
         responseLength: fullContent.length,
-        tools: toolUpdates.length,
-      }, 'WhatsApp response sent');
+      }, 'WhatsApp turn completed');
 
     } catch (err: any) {
       log.error({ error: err.message }, 'WhatsApp message handling error');
-      await this.sock?.sendMessage(jid, { text: `⚠ Error: ${err.message}` });
+      await this.sendMessageWithRetry(jid, { text: `⚠ Error: ${err.message}` });
     } finally {
       clearInterval(typingInterval);
       // Clear composing state
       try {
         await this.sock?.sendPresenceUpdate('paused', jid);
       } catch { /* ignore */ }
+    }
+  }
+
+  private async updateProgress(jid: string, progress: WhatsAppProgressState, finalContent?: string): Promise<void> {
+    if (!this.sock) return;
+
+    // Throttle updates to avoid rate limits (max 1 update per 1.5s)
+    const now = Date.now();
+    const isFinal = progress.status === 'done' || progress.status === 'error';
+    if (!isFinal && progress.lastUpdateAt && now - progress.lastUpdateAt < 1500) {
+      return;
+    }
+    progress.lastUpdateAt = now;
+
+    const text = buildWhatsAppProgressMessage(progress, finalContent);
+
+    try {
+      if (!progress.messageKey) {
+        if (progress.isCreatingTracker) return;
+        progress.isCreatingTracker = true;
+
+        try {
+          const sent = await this.sendMessageWithRetry(jid, { text });
+          progress.messageKey = sent?.key;
+        } finally {
+          progress.isCreatingTracker = false;
+        }
+      } else {
+        await this.sendMessageWithRetry(jid, { edit: progress.messageKey, text });
+      }
+    } catch (err: any) {
+      log.warn({ error: err.message }, 'Failed to update WhatsApp progress');
+    }
+  }
+
+  private async sendMessageWithRetry(jid: string, content: any, options?: any): Promise<any> {
+    return new Promise((resolve, reject) => {
+      this.messageQueue.push({ jid, content, options, retries: 0, resolve, reject });
+      void this.processQueue();
+    });
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.isProcessingQueue || !this.sock || this.messageQueue.length === 0) return;
+    this.isProcessingQueue = true;
+
+    try {
+      while (this.messageQueue.length > 0) {
+        const item = this.messageQueue.shift()!;
+        try {
+          const result = await this.sock.sendMessage(item.jid, item.content, item.options);
+          item.resolve(result);
+        } catch (err: any) {
+          if (item.retries < 3) {
+            item.retries++;
+            log.warn({ error: err.message, retry: item.retries }, 'Message send failed, retrying...');
+            this.messageQueue.unshift(item);
+            await new Promise(r => setTimeout(r, 1000 * item.retries));
+          } else {
+            log.error({ error: err.message }, 'Message send failed after retries');
+            item.reject(err);
+          }
+        }
+        // Small delay between messages to be safe
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } finally {
+      this.isProcessingQueue = false;
     }
   }
 
@@ -335,12 +509,10 @@ export class WhatsAppChannel {
 
     for (const chunk of messages) {
       const resolved = resolveWhatsAppMentions(chunk, mentionTargets);
-      await this.sock.sendMessage(jid, {
+      await this.sendMessageWithRetry(jid, {
         text: resolved.content,
         mentions: resolved.jids,
       });
-      // Small delay between chunks
-      await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
 
@@ -489,7 +661,7 @@ export class WhatsAppChannel {
 
       try {
         // Try interactive buttons first
-        await this.sock.sendMessage(jid, {
+        await this.sendMessageWithRetry(jid, {
           text: `⚠️ *Confirmation Required*\n\n${conf.description}\n\n_Tool: \`${conf.toolName}\`_\n_Timeout: ${conf.timeoutMs / 1000}s_\n\nReply *yes* to confirm or *no* to cancel.`,
         } as any);
 
@@ -504,11 +676,11 @@ export class WhatsAppChannel {
             if (['yes', 'y', 'confirm', '✅'].includes(text)) {
               this.confirmations.resolveConfirmation(conf.id, true);
               this.sock?.ev.off('messages.upsert', handler);
-              await this.sock?.sendMessage(jid, { text: '✅ Confirmed.' });
+              await this.sendMessageWithRetry(jid, { text: '✅ Confirmed.' });
             } else if (['no', 'n', 'cancel', '❌'].includes(text)) {
               this.confirmations.resolveConfirmation(conf.id, false);
               this.sock?.ev.off('messages.upsert', handler);
-              await this.sock?.sendMessage(jid, { text: '❌ Cancelled.' });
+              await this.sendMessageWithRetry(jid, { text: '❌ Cancelled.' });
             }
           }
         };
@@ -575,7 +747,7 @@ function formatReplyContext(author: string, content: string): string {
   return `[Reply context]\n${author}: ${content}\n[/Reply context]`;
 }
 
-// Normalize JIDs: strip device suffix (e.g., "123:10") 
+// Normalize JIDs: strip device suffix (e.g., "123:10")
 // and handle @s.whatsapp.net, @c.us, and @lid consistently
 function normalizeJid(id: string): string {
   if (!id) return '';
@@ -585,7 +757,7 @@ function normalizeJid(id: string): string {
 
 function didMentionMe(messageContent: any, selfId?: string): boolean {
   if (!selfId) return false;
-  
+
   const contextInfo =
     messageContent?.extendedTextMessage?.contextInfo ??
     messageContent?.imageMessage?.contextInfo ??
@@ -593,18 +765,18 @@ function didMentionMe(messageContent: any, selfId?: string): boolean {
     messageContent?.documentMessage?.contextInfo;
 
   const mentioned: string[] = contextInfo?.mentionedJid ?? [];
-  
+
   const normalizedSelf = normalizeJid(selfId);
   const matched = mentioned.some(m => normalizeJid(m) === normalizedSelf);
-  
+
   if (!matched && mentioned.length > 0) {
-    log.debug({ 
-      selfId, 
-      normalizedSelf, 
-      mentioned: mentioned.map(m => `${m} -> ${normalizeJid(m)}`) 
+    log.debug({
+      selfId,
+      normalizedSelf,
+      mentioned: mentioned.map(m => `${m} -> ${normalizeJid(m)}`)
     }, 'No ID match in mentions');
   }
-  
+
   return matched;
 }
 
@@ -613,12 +785,12 @@ function didMentionMe(messageContent: any, selfId?: string): boolean {
  */
 function unwrapMessage(msg: any): any {
   if (!msg) return null;
-  
+
   if (msg.ephemeralMessage) return unwrapMessage(msg.ephemeralMessage.message);
   if (msg.viewOnceMessage) return unwrapMessage(msg.viewOnceMessage.message);
   if (msg.viewOnceMessageV2) return unwrapMessage(msg.viewOnceMessageV2.message);
   if (msg.viewOnceMessageV2Extension) return unwrapMessage(msg.viewOnceMessageV2Extension.message);
-  
+
   return msg;
 }
 
@@ -689,7 +861,8 @@ function buildOutgoingMessages(
   options: { replyStyle: 'single' | 'rapid'; showToolProgress: boolean },
   maxLen: number
 ): string[] {
-  const cleanedContent = sanitizeChannelContent(content).trim();
+  const sanitized = sanitizeChannelContent(content).trim();
+  const cleanedContent = formatForWhatsApp(sanitized);
   const toolSummary = options.showToolProgress && toolUpdates.length > 0
     ? toolUpdates.join('\n').trim()
     : '';
@@ -744,4 +917,157 @@ function splitRapidMessages(text: string, maxLen: number): string[] {
   }
 
   return bursts.length > 0 ? bursts : ['(No response)'];
+}
+
+function applyEventToWhatsAppProgress(progress: WhatsAppProgressState, event: AgentStreamEvent): void {
+  switch (event.type) {
+    case 'thinking':
+      if (progress.status === 'starting') progress.status = 'thinking';
+      break;
+    case 'plan':
+      progress.status = 'planning';
+      progress.planSummary = event.plan?.summary ?? progress.planSummary;
+      progress.tasks = (event.plan?.tasks ?? []).map((task, index) => ({
+        id: task.id || `task_${index + 1}`,
+        title: task.title || `Task ${index + 1}`,
+        status: task.status || 'pending',
+        summary: task.summary,
+      }));
+      break;
+    case 'task_update': {
+      progress.status = event.taskStatus === 'in_progress' ? 'working' : progress.status;
+      if (event.plan?.summary) progress.planSummary = event.plan.summary;
+
+      const taskId = event.taskId || event.taskTitle || `task_${event.taskIndex ?? progress.tasks.length + 1}`;
+      const title = event.taskTitle || 'Task';
+      const existing = progress.tasks.find((task) => task.id === taskId);
+      if (existing) {
+        existing.title = title;
+        existing.status = event.taskStatus || existing.status;
+        existing.summary = event.taskSummary || existing.summary;
+      } else {
+        progress.tasks.push({
+          id: taskId,
+          title,
+          status: event.taskStatus || 'pending',
+          summary: event.taskSummary,
+        });
+      }
+
+      if (event.taskIndex && event.taskTotal) {
+        progress.currentTaskLabel = `[${event.taskIndex}/${event.taskTotal}] ${title}`;
+      } else {
+        progress.currentTaskLabel = title;
+      }
+      break;
+    }
+    case 'tool_start':
+      progress.status = 'working';
+      pushRecentToolUpdate(progress, `⚙ _${event.toolName ?? 'tool'}_...`);
+      break;
+    case 'tool_result':
+      pushRecentToolUpdate(
+        progress,
+        `${event.toolResult?.success ? '✓' : '✗'} _${event.toolName ?? 'tool'}_`
+      );
+      break;
+    case 'error':
+      progress.status = 'error';
+      progress.error = event.error;
+      break;
+    case 'done':
+      if (progress.status !== 'error') progress.status = 'done';
+      break;
+  }
+}
+
+function pushRecentToolUpdate(progress: WhatsAppProgressState, text: string): void {
+  progress.recentTools.push(text);
+  if (progress.recentTools.length > 5) {
+    progress.recentTools = progress.recentTools.slice(-5);
+  }
+}
+
+function buildWhatsAppProgressMessage(progress: WhatsAppProgressState, finalContent?: string): string {
+  const elapsedMs = Date.now() - progress.startedAt;
+  const completed = progress.tasks.filter((task) => task.status === 'completed').length;
+  const active = progress.tasks.filter((task) => task.status === 'in_progress').length;
+  const total = progress.tasks.length;
+  const pending = Math.max(0, total - completed - active);
+  const failed = progress.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
+
+  const lines = [
+    `*LiteClaw · ${whatsappProgressStatusLabel(progress.status).toUpperCase()}*`,
+    '',
+    `📊 *Overview*`,
+    `${whatsappProgressStatusLabel(progress.status)}  •  ${formatDurationShort(elapsedMs)}`,
+    `${whatsappTaskStatusIcon('completed')} ${completed}/${total || 0} done  •  ${whatsappTaskStatusIcon('in_progress')} ${active} active`,
+    `${whatsappTaskStatusIcon('pending')} ${pending} pending${failed ? `  •  ${whatsappTaskStatusIcon('failed')} ${failed} issue${failed === 1 ? '' : 's'}` : ''}`,
+  ];
+
+  if (progress.planSummary) {
+    lines.push('', `🗺 *Plan*`, progress.planSummary);
+  }
+
+  if (progress.tasks.length > 0) {
+    lines.push('', `📋 *Tasks*`);
+    progress.tasks.slice(0, 10).forEach((task, i) => {
+      lines.push(`${i + 1}. ${whatsappTaskStatusIcon(task.status)} ${task.title}${task.summary ? ` - ${task.summary}` : ''}`);
+    });
+  }
+
+  if (progress.recentTools.length > 0 || progress.currentTaskLabel || progress.error) {
+    lines.push('', `⚙ *Activity*`);
+    if (progress.currentTaskLabel && progress.status !== 'done') {
+      lines.push(`Focus: ${progress.currentTaskLabel}`);
+    }
+    progress.recentTools.forEach(tool => lines.push(`- ${tool}`));
+    if (progress.error) {
+      lines.push(`⚠ *Error:* ${progress.error}`);
+    }
+  }
+
+  if (finalContent || progress.status === 'done' || progress.status === 'error') {
+    lines.push('', `🏁 *Outcome*`);
+    if (progress.status === 'error') {
+      lines.push('_Failed to complete task._');
+    } else {
+      const sanitized = sanitizeChannelContent(finalContent || '');
+      const formatted = formatForWhatsApp(sanitized).slice(0, 500);
+      lines.push(formatted ? `${formatted}${formatted.length >= 500 ? '...' : ''}` : '_Response sent below._');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function whatsappProgressStatusLabel(status: WhatsAppProgressState['status']): string {
+  switch (status) {
+    case 'thinking': return '🧠 Thinking';
+    case 'planning': return '🗺 Planning';
+    case 'working': return '⚙ Working';
+    case 'done': return '✅ Complete';
+    case 'error': return '❌ Error';
+    case 'starting':
+    default:
+      return '👀 Starting';
+  }
+}
+
+function whatsappTaskStatusIcon(status: string): string {
+  switch (status) {
+    case 'completed': return '✅';
+    case 'in_progress': return '🟡';
+    case 'failed': return '❌';
+    case 'blocked': return '⚠';
+    case 'skipped': return '⏭';
+    default: return '⏳';
+  }
+}
+
+function formatDurationShort(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }

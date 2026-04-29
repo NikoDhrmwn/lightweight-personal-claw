@@ -1,6 +1,6 @@
 /**
  * LiteClaw — Express + WebSocket Gateway
- * 
+ *
  * Serves the Web UI, handles WebSocket streaming,
  * and provides REST endpoints for channels and CLI.
  */
@@ -222,12 +222,13 @@ export class GatewayServer {
       res.json(this.getEditableConfig());
     });
 
-    this.app.patch('/api/config', (req, res) => {
+    this.app.patch('/api/config', async (req, res) => {
       try {
         const current = getConfig();
         const next = applyConfigPatch(current, req.body ?? {});
         saveConfig(next);
         reloadConfig();
+        await this.engine.getLLMClient().refreshProvidersAsync();
         const payload = this.getEditableConfig();
         this.broadcast({ type: 'config_reloaded', config: payload, health: this.getWebUIState() });
         res.json({ success: true, config: payload });
@@ -321,7 +322,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.6.3',
+      version: '0.7.0',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
       uptime: process.uptime(),
@@ -361,22 +362,39 @@ export class GatewayServer {
 
   private getEditableConfig(): Record<string, any> {
     const config = getConfig();
-    const providers = config.llm?.providers ?? {};
-    const availableModels = Object.entries(providers).flatMap(([providerId, provider]: [string, any]) =>
-      (provider.models ?? []).map((model: any) => ({
-        id: `${providerId}/${model.id}`,
-        provider: providerId,
-        label: `${providerId}/${model.id}`,
-        contextWindow: model.contextWindow ?? null,
-        maxTokens: model.maxTokens ?? null,
-        vision: !!model.vision,
-        reasoning: !!model.reasoning,
-      }))
-    );
+    const llmClient = this.engine.getLLMClient();
+    const allProviders = llmClient.getAllProviders();
+
+    let availableModels: any[] = [];
+    if (allProviders.length > 0) {
+      availableModels = allProviders.map(p => ({
+        id: p.id,
+        provider: p.id.split('/')[0],
+        label: p.id,
+        contextWindow: p.contextWindow,
+        maxTokens: p.maxTokens,
+        vision: p.supportsVision,
+        reasoning: p.supportsReasoning,
+      }));
+    } else {
+      // Fallback to static config if no providers detected yet
+      const providers = config.llm?.providers ?? {};
+      availableModels = Object.entries(providers).flatMap(([providerId, provider]: [string, any]) =>
+        (provider.models ?? []).map((model: any) => ({
+          id: `${providerId}/${model.id}`,
+          provider: providerId,
+          label: `${providerId}/${model.id}`,
+          contextWindow: model.contextWindow ?? null,
+          maxTokens: model.maxTokens ?? null,
+          vision: !!model.vision,
+          reasoning: !!model.reasoning,
+        }))
+      );
+    }
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.6.3',
+        version: config.meta?.version ?? '0.7.0',
       },
       paths: {
         stateDir: getStateDir(),
@@ -387,7 +405,14 @@ export class GatewayServer {
         primary: config.llm?.defaults?.primary ?? '',
         temperature: config.llm?.defaults?.temperature ?? 1.0,
         topP: config.llm?.defaults?.topP ?? 1.0,
+        topK: config.llm?.defaults?.topK ?? 45,
         maxOutputTokens: config.llm?.defaults?.maxOutputTokens ?? 8192,
+        defaults: {
+          temperature: config.llm?.defaults?.temperature ?? 1.0,
+          topP: config.llm?.defaults?.topP ?? 1.0,
+          topK: config.llm?.defaults?.topK ?? 45,
+          maxOutputTokens: config.llm?.defaults?.maxOutputTokens ?? 8192,
+        },
         availableModels,
       },
       agent: {
@@ -542,9 +567,9 @@ export class GatewayServer {
     const images: string[] = [];
     const fileContents: string[] = [];
 
-    log.info({ 
-      hasContent: !!msg.content, 
-      attachmentsCount: msg.attachments?.length || 0 
+    log.info({
+      hasContent: !!msg.content,
+      attachmentsCount: msg.attachments?.length || 0
     }, 'Processing WebUI message');
 
     if (msg.attachments) {
@@ -669,6 +694,9 @@ export class GatewayServer {
         if (curr.mtimeMs === prev.mtimeMs) return;
         try {
           reloadConfig();
+          this.engine.getLLMClient().refreshProvidersAsync().catch(err => {
+            log.error({ error: err.message }, 'Failed to refresh LLM providers after file change');
+          });
           const payload = this.getEditableConfig();
           log.info({ path }, 'Reloaded config after file change');
           this.broadcast({

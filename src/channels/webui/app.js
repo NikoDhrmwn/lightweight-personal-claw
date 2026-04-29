@@ -4,6 +4,7 @@
   let isStreaming = false;
   let currentAssistantEl = null;
   let currentContent = "";
+  let lastThinkingChunk = "";
   let currentSessionKey = "webui:default";
   let currentFilter = "";
   let currentConfig = {};
@@ -375,15 +376,16 @@
   function hydrateSettings(config) {
     const models = config.llm?.availableModels || [];
     const currentPrimary = config.llm?.primary || "";
+    const llmDefaults = config.llm?.defaults || config.llm || {};
     refs.settingModel.innerHTML = models.length
       ? models.map((model) => `<option value="${escapeHtml(model.id)}"${model.id === currentPrimary ? " selected" : ""}>${escapeHtml(model.label)}</option>`).join("")
       : `<option value="${escapeHtml(currentPrimary)}">${escapeHtml(currentPrimary || "unknown")}</option>`;
 
     refs.settingThinking.value = config.agent?.thinkingDefault || "medium";
-    refs.settingTemperature.value = config.llm?.defaults?.temperature ?? 1.0;
-    refs.settingTopP.value = config.llm?.defaults?.topP ?? 1.0;
-    refs.settingTopK.value = config.llm?.defaults?.topK ?? 45;
-    refs.settingMaxOutputTokens.value = config.llm?.defaults?.maxOutputTokens ?? 8192;
+    refs.settingTemperature.value = llmDefaults.temperature ?? 1.0;
+    refs.settingTopP.value = llmDefaults.topP ?? 1.0;
+    refs.settingTopK.value = llmDefaults.topK ?? 45;
+    refs.settingMaxOutputTokens.value = llmDefaults.maxOutputTokens ?? 8192;
     updateLlmParamsVisibility();
 
     refs.settingWorkspace.value = config.agent?.workspace || "";
@@ -422,9 +424,8 @@
   }
 
   function updateLlmParamsVisibility() {
-    const isLocal = refs.settingModel.value.startsWith("local/");
     if (refs.llmParamsGroup) {
-      refs.llmParamsGroup.style.display = isLocal ? "none" : "grid";
+      refs.llmParamsGroup.style.display = "grid";
     }
   }
 
@@ -704,24 +705,56 @@
     isStreaming = true;
   }
 
+  function splitVisibleAndThinking(text) {
+    let visible = String(text || "");
+    const thinking = [];
+
+    visible = visible.replace(/<(think|thought|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, content) => {
+      const entry = String(content || "");
+      if (entry) thinking.push(entry);
+      return "";
+    });
+
+    visible = visible
+      .replace(/<\/?(think|thought|thinking)>/gi, "")
+      .replace(/<[|｜]DSML[|｜]tool_calls[\s\S]*?<\/[|｜]DSML[|｜]tool_calls>/gi, "");
+
+    const prefixMatch = visible.match(/^\s*(?:think|thoughts?|thinking)\s*\n([\s\S]*)$/i);
+    if (prefixMatch && /\b(the user|i should|i need to|according to|first|let me|i'll|i will)\b/i.test(prefixMatch[1] || "")) {
+      const trimmed = String(prefixMatch[1] || "").trim();
+      if (trimmed) thinking.push(trimmed);
+      visible = "";
+    }
+
+    return {
+      visible: visible,
+      thinking,
+    };
+  }
+
   function renderAssistantContent() {
     if (!currentAssistantEl) return;
     const contentEl = currentAssistantEl.querySelector(".message-content");
-    contentEl.innerHTML = renderMarkdown(currentContent) + (isStreaming ? '<span class="streaming-cursor"></span>' : "");
+    const visibleContent = dedupeRepeatedParagraphs(splitVisibleAndThinking(currentContent).visible);
+    contentEl.innerHTML = renderMarkdown(visibleContent) + (isStreaming ? '<span class="streaming-cursor"></span>' : "");
     addCopyButtons(contentEl);
     scrollToBottom();
   }
 
   function appendThinking(text) {
+    const chunk = String(text || "");
+    if (!chunk) return;
+    if (chunk === lastThinkingChunk) return;
+
     ensureAssistantMessage();
     const body = currentAssistantEl.querySelector(".message-body");
     const wrappers = body.querySelectorAll(".thinking-wrapper");
     let wrapper = wrappers[wrappers.length - 1];
-    
+
     if (!wrapper || wrapper.dataset.closed === "true") {
       wrapper = document.createElement("div");
-      wrapper.className = "thinking-wrapper"; // Collapsed by default
-      
+      wrapper.className = "thinking-wrapper expanded"; // Show by default during streaming
+
       const header = document.createElement("button");
       header.className = "thinking-header";
       header.type = "button";
@@ -729,17 +762,24 @@
         <span class="thinking-toggle-icon"></span>
         <span class="thinking-label pulsing">Thinking...</span>
       `;
-      
+
       const content = document.createElement("div");
       content.className = "thinking-content";
-      
+
       wrapper.appendChild(header);
       wrapper.appendChild(content);
       body.insertBefore(wrapper, body.querySelector(".message-content"));
     }
 
     const contentEl = wrapper.querySelector(".thinking-content");
-    contentEl.textContent += text || "";
+    const existing = contentEl._rawText || "";
+    const merged = existing + chunk;
+    contentEl._rawText = merged;
+
+    // Render as Markdown for headers, lists, etc.
+    contentEl.innerHTML = renderMarkdown(merged);
+
+    lastThinkingChunk = chunk;
     scrollToBottom();
   }
 
@@ -829,6 +869,8 @@
 
   function finishStreaming(metrics) {
     isStreaming = false;
+    const finalized = splitVisibleAndThinking(currentContent);
+    currentContent = dedupeRepeatedParagraphs(finalized.visible || "");
     renderAssistantContent();
 
     if (metrics && currentAssistantEl) {
@@ -860,6 +902,7 @@
     });
     currentAssistantEl = null;
     currentContent = "";
+    lastThinkingChunk = "";
     inputEl.disabled = false;
     sendBtn.disabled = inputEl.value.trim().length === 0 && attachedImages.length === 0;
     inputEl.focus();
@@ -880,7 +923,11 @@
         break;
       case "content":
         ensureAssistantMessage();
-        currentContent += msg.content || "";
+        {
+          const parsed = splitVisibleAndThinking(msg.content || "");
+          parsed.thinking.forEach((entry) => appendThinking(entry));
+          currentContent += parsed.visible || "";
+        }
         renderAssistantContent();
         break;
       case "plan":
@@ -988,10 +1035,10 @@
   function renderMarkdown(text) {
     const codeBlocks = [];
     const thinkBlocks = [];
-    let working = String(text || "");
+    let working = normalizeMarkdownForDisplay(dedupeRepeatedParagraphs(String(text || "")));
 
     // Isolate thinking blocks so they don't get wrapped inside <p> tags.
-    working = working.replace(/<think>([\s\S]*?)(?:<\/think>|$)/g, (_, content) => {
+    working = working.replace(/<(think|thought|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, content) => {
       const token = `@@THINK${thinkBlocks.length}@@`;
       thinkBlocks.push(`
         <div class="thinking-wrapper">
@@ -1021,9 +1068,13 @@
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
     html = html.split(/\n{2,}/).map((chunk) => {
-      const trimmed = chunk.trim();
+      // Don't trim the end during streaming to avoid stripping the space the model just typed
+      const trimmed = isStreaming ? chunk.trimStart() : chunk.trim();
       if (!trimmed) return "";
       if (/^@@CODE\d+@@$/.test(trimmed) || /^@@THINK\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
+      if (looksLikeMarkdownTable(trimmed)) {
+        return renderMarkdownTable(trimmed);
+      }
       if (/^[-*] /m.test(trimmed)) {
         const items = trimmed.split("\n").filter(Boolean).map((line) => {
           if (/^[-*] /.test(line)) return `<li>${line.slice(2)}</li>`;
@@ -1047,6 +1098,129 @@
     });
 
     return html;
+  }
+
+  function normalizeMarkdownForDisplay(text) {
+    let normalized = String(text || "").replace(/\r\n/g, "\n");
+
+    normalized = normalized
+      .replace(/([^\n])\s*(#{1,3}\s+)/g, "$1\n\n$2")
+      .replace(/([^\n])\s*(\|[^\n]+\|\s*\n\|[-:| ]+\|)/g, "$1\n\n$2")
+      .replace(/([^\n])\s*(?:-\s+)/g, (match, prefix) => `${prefix}\n- `)
+      .replace(/([^\n])\s*(\d+\.\s+)/g, "$1\n$2")
+      .replace(/(#{1,6}[^\n#|]+)(?=#{1,6}\s)/g, "$1\n\n")
+      .replace(/(\|\|)(?=[A-Za-z#])/g, "||\n")
+      .replace(/([a-z0-9])(?=#{1,6}[A-Z])/g, "$1\n\n")
+      .replace(/([.!?])\s+(?=[A-Z][a-z].{0,40}:)/g, "$1\n")
+      .replace(/\|\|/g, "|\n|")
+      .replace(/([a-z0-9)])(\*\*[A-Z])/g, "$1\n\n$2")
+      .replace(/([a-z0-9)])(#{1,6}\s)/g, "$1\n\n$2")
+      .replace(/([a-z])([A-Z][a-z]+:)/g, "$1\n$2");
+
+    return repairCompressedVisibleText(normalized);
+  }
+
+  function repairCompressedVisibleText(text) {
+    return String(text || "")
+      .split("\n")
+      .map((line) => repairCompressedVisibleLine(line))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n");
+  }
+
+  function repairCompressedVisibleLine(line) {
+    return line; // Disabled aggressive repair that was stripping/mangling whitespace
+  }
+
+  function dedupeRepeatedParagraphs(text) {
+    const parts = String(text || "")
+      .replace(/\r\n/g, "\n")
+      .split(/\n{2,}/)
+      .filter(Boolean);
+
+    const deduped = [];
+    let previous = "";
+    for (const part of parts) {
+      if (part === previous) continue;
+      if (deduped.includes(part) && part.length > 120) continue;
+      deduped.push(part);
+      previous = part;
+    }
+
+    return deduped.join("\n\n");
+  }
+
+  function normalizeThinkingForDisplay(text) {
+    return String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\t/g, "  ")
+      .split("\n")
+      .map((line) => repairCompressedThinkingLine(line))
+      .join("\n")
+      .replace(/([.!?])\s+(?=[A-Z][a-z])/g, "$1\n")
+      .replace(/(:)\s+(?=(?:First|Second|Third|Next|Then|Finally|The user|I need|I should|I'll|I will|Let me)\b)/g, "$1\n")
+      .replace(/\n{3,}/g, "\n\n");
+  }
+
+  function repairCompressedThinkingLine(line) {
+    return line; // Disabled aggressive repair
+  }
+
+  function normalizeThinkingForComparison(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\p{L}\p{N} ]/gu, "")
+      .trim();
+  }
+
+  function isNearDuplicateThinkingChunk(existing, chunk) {
+    if (!chunk || chunk.trim().length < 40) return false;
+    if (!existing) return false;
+
+    const normalizedChunk = normalizeThinkingForComparison(chunk);
+    const normalizedExisting = normalizeThinkingForComparison(existing);
+
+    if (!normalizedChunk) return false;
+    if (normalizedExisting.includes(normalizedChunk)) return true;
+    if (normalizedChunk.length > 120 && normalizedExisting.includes(normalizedChunk.slice(0, 120))) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function mergeThinkingChunks(existing, chunk) {
+    return existing + chunk;
+  }
+
+  function looksLikeMarkdownTable(text) {
+    const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) return false;
+    if (!lines[0].includes("|")) return false;
+    return /^\|?[\s:-]+\|[\s|:-]*$/.test(lines[1]);
+  }
+
+  function renderMarkdownTable(text) {
+    const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) return `<p>${text}</p>`;
+
+    const parseRow = (line) => line
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+
+    const headers = parseRow(lines[0]);
+    const rows = lines.slice(2).map(parseRow);
+
+    const headHtml = headers.map((cell) => `<th>${cell}</th>`).join("");
+    const bodyHtml = rows.map((row) => {
+      const cells = headers.map((_, index) => `<td>${row[index] ?? ""}</td>`).join("");
+      return `<tr>${cells}</tr>`;
+    }).join("");
+
+    return `<div class="table-wrap"><table><thead><tr>${headHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`;
   }
 
   function escapeHtml(text) {
@@ -1296,7 +1470,7 @@
     fileList.forEach((file) => {
       const reader = new FileReader();
       const isImage = file.type.startsWith("image/");
-      
+
       reader.onload = () => {
         const dataUrl = String(reader.result);
         const item = { name: file.name, dataUrl };

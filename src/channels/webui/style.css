@@ -874,6 +874,8 @@ button {
   color: var(--muted);
   line-height: 1.6;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   border-top: 1px solid var(--line);
   background: rgba(0, 0, 0, 0.2);
 }

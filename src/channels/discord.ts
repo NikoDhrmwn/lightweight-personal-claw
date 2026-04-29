@@ -36,6 +36,7 @@ import {
   Partials,
 } from 'discord.js';
 import { existsSync } from 'fs';
+import { lookup } from 'dns/promises';
 import { basename, extname } from 'path';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager } from '../core/confirmation.js';
@@ -121,7 +122,7 @@ const STATUS_MESSAGES = {
     'All systems nominal.',
     'Resting...',
     'On standby.',
-    'Powered by Gemma 4.',
+    'Powered by {{MODEL}}.',
     'Let me know if you need anything.',
     'Watching the world go by...',
     'Zen mode 🧘',
@@ -214,6 +215,31 @@ function pickRandom(arr: readonly string[]): string {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function redactDiscordDebug(message: string): string {
+  return String(message ?? '')
+    .replace(/(Provided token:\s*)(\S+)/gi, (_whole, prefix, token) => `${prefix}${maskToken(token)}`)
+    .replace(/([A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{20,})/g, token => maskToken(token));
+}
+
+function maskToken(token: string): string {
+  if (!token) return token;
+  if (token.length <= 10) return '*'.repeat(token.length);
+  return `${token.slice(0, 6)}${'*'.repeat(Math.max(4, token.length - 10))}${token.slice(-4)}`;
+}
+
+function isDiscordDnsFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /\bENOTFOUND\b/i.test(message) || /\bgetaddrinfo\b/i.test(message);
+}
+
+async function ensureDiscordGatewayReachable(): Promise<void> {
+  try {
+    await lookup('gateway.discord.gg');
+  } catch (error: any) {
+    throw new Error(`Could not resolve gateway.discord.gg (${error?.code ?? error?.message ?? 'lookup failed'})`);
+  }
+}
+
 // ─── Slash Command Definitions ───────────────────────────────────────
 
 const SLASH_COMMANDS = [
@@ -301,9 +327,21 @@ export class DiscordChannel {
       ],
     });
 
-    this.client.on('debug', m => console.log('[DISCORD_DEBUG]', m));
+    this.client.on('debug', m => console.log('[DISCORD_DEBUG]', redactDiscordDebug(m)));
     this.client.on('warn', m => console.warn('[DISCORD_WARN]', m));
     this.client.on('error', m => console.error('[DISCORD_ERROR]', m));
+    this.client.on('shardError', (error, shardId) => {
+      log.warn({ shardId, error: error.message }, 'Discord shard websocket error');
+    });
+    this.client.on('shardDisconnect', (event, shardId) => {
+      log.warn({ shardId, code: event.code, reason: event.reason?.toString?.() ?? '' }, 'Discord shard disconnected');
+    });
+    this.client.on('shardReconnecting', shardId => {
+      log.info({ shardId }, 'Discord shard reconnecting');
+    });
+    this.client.on('invalidated', () => {
+      log.error('Discord session invalidated');
+    });
     this.client.on('raw', (p: any) => {
       // Workaround for discord.js dropping uncached DMs
       if (p.t === 'MESSAGE_CREATE' && !p.d.guild_id && p.d.channel_id) {
@@ -374,7 +412,18 @@ export class DiscordChannel {
 
   private setStatus(state: keyof typeof STATUS_MESSAGES): void {
     this.currentState = state;
-    const statusText = pickRandom(STATUS_MESSAGES[state]);
+    let statusText = pickRandom(STATUS_MESSAGES[state]);
+
+    if (statusText.includes('{{MODEL}}')) {
+      const modelId = this.engine.getLLMClient().getModelId();
+      const modelName = modelId.split('/').pop() || modelId;
+      // Format: deepseek-v4 -> Deepseek V4, gemma-4-e4b -> Gemma 4 E4b
+      const formatted = modelName
+        .split(/[-_]/)
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+      statusText = statusText.replace('{{MODEL}}', formatted);
+    }
 
     const statusMap: Record<string, 'online' | 'idle' | 'dnd' | 'invisible'> = {
       idle: 'online',
@@ -498,8 +547,8 @@ export class DiscordChannel {
       if (guildIds.length > 0) {
         // Clear stale global commands so Discord does not show duplicate
         // entries when this bot has previously registered globally.
-        await rest.put(Routes.applicationCommands(clientId), { body: [] });
-        log.info('Cleared global slash commands before guild registration');
+        await rest.put(Routes.applicationCommands(clientId), { body: commandData });
+        log.info({ count: commandData.length }, 'Registered global slash commands');
 
         for (const guildId of guildIds) {
           await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commandData });
@@ -739,6 +788,15 @@ export class DiscordChannel {
             ...(structuredNarrative.rollComponents || []),
           ].slice(0, 5),
         });
+        const replyMessage = await interaction.fetchReply().catch(() => null);
+        await this.dnd.recordCanonicalSceneState({
+          threadId: interaction.channelId,
+          sessionId: dndSession.session.id,
+          source: 'narrative',
+          title: narrativeEmbed.data.title ?? null,
+          content: structuredNarrative.content,
+          messageId: (replyMessage as any)?.id ?? null,
+        });
       } else {
         // Non-DnD: standard text output
         const messages = buildOutgoingMessages(
@@ -852,7 +910,8 @@ export class DiscordChannel {
 
     const config = getConfig();
     const maxTokens = config.agent?.contextTokens ?? 64000;
-    const threshold = config.agent?.compaction?.softThresholdTokens ?? 48000;
+    const budgetPct = (config.agent?.contextBudgetPct ?? 80) / 100;
+    const threshold = config.agent?.compaction?.softThresholdTokens ?? Math.floor(maxTokens * (budgetPct * 0.9));
 
     const currentTokens = metrics.estimatedTokens;
 
@@ -1369,6 +1428,7 @@ export class DiscordChannel {
       progress.status = progress.error ? 'error' : 'done';
 
       if (shouldTreatAsDndTableTalk) {
+        const dndDetails = this.dnd.getSessionForThread(channel.id);
         this.dnd.markNarrativeTurnSpent(channel.id, author.id);
 
         // For DnD narrative responses, send as a rich embed for best markdown rendering
@@ -1407,6 +1467,16 @@ export class DiscordChannel {
               repliedUser: false,
             },
           });
+          if (dndDetails) {
+            await this.dnd.recordCanonicalSceneState({
+              threadId: channel.id,
+              sessionId: dndDetails.session.id,
+              source: 'narrative',
+              title: narrativeEmbed.data.title ?? null,
+              content: structuredNarrative.content,
+              messageId: progressMessage.id,
+            });
+          }
         } else {
           const components = [
             ...(structuredNarrative.combatComponents || []),
@@ -1414,7 +1484,7 @@ export class DiscordChannel {
             ...(structuredNarrative.rollComponents || []),
           ].slice(0, 5);
 
-          await (channel as any).send({
+          const sentMessage = await (channel as any).send({
             embeds: [
               narrativeEmbed,
               ...(trackerEmbed ? [trackerEmbed] : []),
@@ -1424,6 +1494,16 @@ export class DiscordChannel {
             components,
             allowedMentions: { users: resolvedContent.userIds },
           });
+          if (dndDetails) {
+            await this.dnd.recordCanonicalSceneState({
+              threadId: channel.id,
+              sessionId: dndDetails.session.id,
+              source: 'narrative',
+              title: narrativeEmbed.data.title ?? null,
+              content: structuredNarrative.content,
+              messageId: sentMessage?.id ?? null,
+            });
+          }
         }
       } else {
         // Non-DnD responses: standard text output
@@ -1678,9 +1758,25 @@ export class DiscordChannel {
     const channel = interaction.channel;
     if (!channel || !channel.isTextBased()) return;
 
+    if (this.dnd.shouldQueueNarrativeActions(channel.id)) {
+      const queued = this.dnd.queueNarrativeAction(channel.id, interaction.user.id, actionText);
+      await (channel as any).send({
+        content: `${interaction.user} **->** ${actionText}`,
+      });
+      if (!queued.shouldResolve || !queued.combinedActionText) {
+        await (channel as any).send({
+          content: queued.waitingOn.length > 0
+            ? `Waiting on: **${queued.waitingOn.join(', ')}** before resolving the shared scene.`
+            : 'Queued action recorded.',
+        });
+        return;
+      }
+      actionText = queued.combinedActionText;
+    }
+
     // Post the action as a visible message so the table sees what was chosen
     await (channel as any).send({
-      content: `${interaction.user} **→** ${actionText}`,
+      content: `${interaction.user} **->** ${actionText}`,
     });
 
     // Build the engine request
@@ -1786,7 +1882,27 @@ export class DiscordChannel {
       throw new Error('Discord token not configured. Set DISCORD_TOKEN in .env or config.yaml');
     }
 
-    await this.client.login(token);
+    await ensureDiscordGatewayReachable();
+
+    let retries = 0;
+    const maxRetries = 5;
+    while (retries < maxRetries) {
+      try {
+        await this.client.login(token);
+        return;
+      } catch (err: any) {
+        retries++;
+        const delay = Math.min(1000 * Math.pow(2, retries), 30000);
+        log.warn({ error: err.message, retry: retries, nextRetryDelay: delay }, 'Discord login failed, retrying...');
+        if (isDiscordDnsFailure(err)) {
+          throw new Error(`Discord gateway DNS lookup failed: ${err.message}`);
+        }
+        if (retries >= maxRetries) {
+          throw new Error(`Failed to login to Discord after ${maxRetries} attempts: ${err.message}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
   }
 
   stop(): void {

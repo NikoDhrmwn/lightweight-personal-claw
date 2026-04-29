@@ -18,7 +18,7 @@ import { loadConfig, getConfig, getStateDir, saveConfig, getDefaultConfig } from
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 
-const VERSION = '0.6.3';
+const VERSION = '0.7.0';
 
 const program = new Command();
 
@@ -130,6 +130,30 @@ channels
       console.log(chalk.gray('  DISCORD_TOKEN=your_token_here'));
     } else {
       console.log(chalk.red('Specify a channel: --channel whatsapp or --channel discord'));
+    }
+  });
+
+channels
+  .command('logout')
+  .description('Log out and clear session for a channel')
+  .option('--channel <channel>', 'Channel to logout (whatsapp)')
+  .action(async (options) => {
+    const channel = options.channel;
+    if (channel === 'whatsapp') {
+      const { rmSync } = await import('fs');
+      const sessionDir = join(getStateDir(), 'whatsapp-session');
+      if (existsSync(sessionDir)) {
+        try {
+          rmSync(sessionDir, { recursive: true, force: true });
+          console.log(chalk.green('✓ WhatsApp session cleared. You will need to scan the QR code again on next start.'));
+        } catch (err: any) {
+          console.log(chalk.red(`✗ Failed to clear WhatsApp session: ${err.message}`));
+        }
+      } else {
+        console.log(chalk.gray('No WhatsApp session found to clear.'));
+      }
+    } else {
+      console.log(chalk.red('Logout currently only supports WhatsApp. For Discord, remove your DISCORD_TOKEN from .env.'));
     }
   });
 
