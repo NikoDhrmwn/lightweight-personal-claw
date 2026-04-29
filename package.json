@@ -1,6 +1,6 @@
 {
   "name": "liteclaw",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Lightweight agent runtime for local LLMs — WebUI, Discord, WhatsApp",
   "type": "module",
   "main": "dist/index.js",
@@ -28,6 +28,7 @@
   "license": "MIT",
   "dependencies": {
     "@hapi/boom": "^10.0.1",
+    "@inquirer/prompts": "^8.4.2",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "better-sqlite3": "^12.9.0",
     "chalk": "^5.6.2",

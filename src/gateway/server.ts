@@ -66,21 +66,36 @@ export class GatewayServer {
   }
 
   private setupRoutes(): void {
-    // Auth middleware — only protect external API endpoints, not session endpoints
-    // used by the built-in WebUI client
+    // Auth middleware — tightened for 0.8: if bind is non-loopback,
+    // ALL /api/* routes require auth. On loopback, session/status/config
+    // endpoints used by the built-in WebUI remain open.
     this.app.use('/api', (req, res, next) => {
       const config = getConfig();
       const authToken = config.gateway?.auth?.token ?? process.env.GATEWAY_TOKEN;
-      if (!authToken) return next();
-      // Skip auth for session/config endpoints and health used by WebUI
-      if (
-        req.path.startsWith('/sessions') ||
-        req.path === '/status' ||
-        req.path === '/config' ||
-        req.path === '/workspace'
-      ) {
+      const isNonLoopback = config.gateway?.bind && config.gateway.bind !== 'loopback';
+
+      if (!authToken) {
+        // If no token configured but network-exposed, reject all API calls
+        if (isNonLoopback) {
+          res.status(403).json({ error: 'Auth token required for non-loopback bind. Set gateway.auth.token in config.' });
+          return;
+        }
         return next();
       }
+
+      // On loopback, skip auth for WebUI-internal endpoints
+      if (!isNonLoopback) {
+        if (
+          req.path.startsWith('/sessions') ||
+          req.path === '/status' ||
+          req.path === '/config' ||
+          req.path === '/workspace'
+        ) {
+          return next();
+        }
+      }
+
+      // All other cases: require Bearer token
       const token = req.headers.authorization?.replace('Bearer ', '');
       if (token !== authToken) {
         res.status(401).json({ error: 'Unauthorized' });
@@ -322,7 +337,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.7.0',
+      version: '0.7.1',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
       uptime: process.uptime(),
@@ -394,7 +409,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.7.0',
+        version: config.meta?.version ?? '0.7.1',
       },
       paths: {
         stateDir: getStateDir(),
@@ -573,7 +588,21 @@ export class GatewayServer {
     }, 'Processing WebUI message');
 
     if (msg.attachments) {
+      if (msg.attachments.length > 10) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'error', content: 'Too many attachments. Maximum is 10 per message.' }));
+          ws.send(JSON.stringify({ type: 'done' }));
+        }
+        return;
+      }
+
       for (const attachment of msg.attachments) {
+        // Enforce 20MB limit (approx 27MB in base64 encoding)
+        if (attachment.dataUrl.length > 27_000_000) {
+          log.warn({ name: attachment.name }, 'Attachment exceeds 20MB limit');
+          fileContents.push(`--- FILE ERROR: ${attachment.name} ---\nFile exceeds maximum allowed size of 20MB.\n--- END FILE ---`);
+          continue;
+        }
         try {
           const processed = await processFile(attachment.name, attachment.dataUrl);
           log.info({ name: attachment.name, type: processed.type }, 'Processed attachment');

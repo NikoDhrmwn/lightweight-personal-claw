@@ -34,6 +34,8 @@ export interface LiteClawConfig {
     name?: string;
     systemPromptFile?: string;
     workspace?: string;
+    /** Allow tools to access absolute paths outside workspace (default: false) */
+    allowAbsolutePaths?: boolean;
     contextTokens?: number;
     maxTurns?: number;
     historyMessageLimit?: number;
@@ -149,7 +151,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.7.0' },
+    meta: { version: '0.7.1' },
     llm: {
       providers: {
         local: {
@@ -284,7 +286,6 @@ export function loadSystemPrompt(): string {
     // Search order: state dir → personality dir → workspace dir
     const candidates = [
       join(stateDir, 'personality', file),
-      join(personalityDir, file),
     ];
 
     // Also check any configured workspace directory
@@ -292,6 +293,8 @@ export function loadSystemPrompt(): string {
     if (workspace) {
       candidates.push(join(workspace, file));
     }
+
+    candidates.push(join(personalityDir, file.replace(/\.md$/, '.template.md')));
 
     for (const p of candidates) {
       if (existsSync(p)) {

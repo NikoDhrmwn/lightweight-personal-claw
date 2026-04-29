@@ -11,6 +11,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.7.1] - 2026-04-29
+
+#### Added
+
+- **CLI Onboarding UX Overhaul**: Replaced readline-based prompts with modern `@inquirer/prompts` interactive wizards for `setup` and `init`.
+- **Prompt Customization**: Added comprehensive prompt management CLI commands (`prompts list`, `doctor`, `reset`, `edit`, `export`, `import`).
+- **Neutral Defaults**: Migrated default system prompts and personality templates to a structured, neutral config repository.
+
 ### [0.7.0] - 2026-04-29
 
 #### Added
@@ -28,21 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Context Thresholds**: Derived default compaction thresholds from configured context size and budget.
 - **Repository Hygiene**: Ignored `scratch/` and stopped `.gitignore` from ignoring itself.
 - **Version Consistency**: Normalized package, CLI, runtime, gateway, migration, and default config version reporting to `0.7.0`.
-
-### [0.6.3] - 2026-04-24
-
-#### Added
-
-- **The World of Elyndor**: Integrated a new high-fantasy preconfigured world with deep lore, regional factions, and RAG-assisted narrative generation.
-- **Advanced D&D Combat Engine**: Implemented a stateful combat system with initiative tracking, persistent HP/AC management, and dynamic action menus.
-- **Inventory & Skill Systems**: Added starter kits, weapon requirements, and class-specific skills with persistent usage tracking.
-- **RAG Document Ingestion**: Added support for multi-format document ingestion (PDF, MD, TXT, DOCX) for session-aware knowledge retrieval.
-- **Onboarding Improvements**: Streamlined player join flows and character profile initialization with persistent state.
-
-#### Fixed
-
-- **Git Tracking**: Added `brain/` directory to `.gitignore` to prevent generated session data and research logs from being tracked.
-- **Version Consistency**: Normalized version reporting to `0.6.3` across all modules.
 
 ## Features
 
@@ -78,8 +71,8 @@ LiteClaw now includes a lightweight DnD session subsystem for Discord:
 ### DnD RAG Notes
 
 - LiteClaw stores DnD retrieval data in its state directory and uses a local embedding server for session-aware GM answers.
-- On this machine, the embedding bootstrap script is stored at `E:\Qwen3.6\start-embed-liteclaw.bat`.
-- Starting or refreshing a DnD session automatically ensures the embedding server is running before syncing session context.
+- Configure any local embedding bootstrap command in your LiteClaw state/config files instead of hardcoding machine-specific paths.
+- Starting or refreshing a DnD session can ensure the configured embedding server is running before syncing session context.
 
 ## Quick Start
 
@@ -92,6 +85,12 @@ npx tsx src/cli.ts gateway run
 ```
 
 Open `http://localhost:7860` for the Web UI.
+
+For guided first-time setup with recommendations for local 4B-9B models:
+
+```bash
+npx tsx src/cli.ts setup --interactive
+```
 
 ## Windows Setup
 
@@ -135,6 +134,12 @@ Initialize the local state directory:
 npx tsx src/cli.ts setup
 ```
 
+Or run the guided onboarding wizard:
+
+```bash
+npx tsx src/cli.ts init
+```
+
 This creates your LiteClaw state under:
 
 - Windows: `%USERPROFILE%\.liteclaw`
@@ -157,6 +162,26 @@ LLM_MODEL=gemma-4-e4b-heretic
 ```
 
 You can use the project-root [.env.example](.env.example) as a reference.
+
+## Prompt and Personality Customization
+
+LiteClaw ships neutral, universal prompt templates by default. User-editable prompt files live in:
+
+```text
+%USERPROFILE%\.liteclaw\personality\
+```
+
+Recommended prompt commands:
+
+```bash
+npx tsx src/cli.ts prompts list
+npx tsx src/cli.ts prompts doctor
+npx tsx src/cli.ts prompts edit system
+npx tsx src/cli.ts prompts edit behavior
+npx tsx src/cli.ts prompts reset --profile neutral
+```
+
+Use `prompts doctor` after edits. It flags oversized prompts, personal machine paths, unsafe instructions, and reliability issues that commonly hurt smaller local models.
 
 ## Running LiteClaw
 
@@ -199,7 +224,7 @@ This attempts to import from the default OpenClaw directory:
 ### Custom migration path
 
 ```powershell
-npx tsx src/cli.ts migrate --openclaw-dir "C:\Users\yourname\.openclaw"
+npx tsx src/cli.ts migrate --openclaw-dir "/path/to/.openclaw"
 ```
 
 Migration can bring over:
@@ -220,11 +245,16 @@ After migrating, review:
 
 ```bash
 liteclaw gateway run
+liteclaw init
 liteclaw channels login --channel discord
 liteclaw channels login --channel whatsapp
 liteclaw channels status
 liteclaw status
 liteclaw doctor
+liteclaw prompts list
+liteclaw prompts doctor
+liteclaw prompts edit system
+liteclaw prompts edit behavior
 liteclaw config get <key>
 liteclaw models list
 liteclaw message "hello"

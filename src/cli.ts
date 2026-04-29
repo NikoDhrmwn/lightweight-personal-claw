@@ -14,11 +14,27 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { loadConfig, getConfig, getStateDir, saveConfig, getDefaultConfig } from './config.js';
-import { existsSync, mkdirSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadConfig, getConfig, getStateDir, saveConfig, getDefaultConfig, type LiteClawConfig } from './config.js';
+import { existsSync, mkdirSync } from 'fs';
+import { join, resolve } from 'path';
+import { spawnSync } from 'child_process';
+import {
+  tuiSelect, tuiConfirm, tuiInput, tuiNumber,
+  printBanner, printSection, printSuccess, printInfo,
+  printHint, printDone, printKeyValue, printWarning,
+} from './tui.js';
+import {
+  doctorPrompts,
+  ensureNeutralPrompts,
+  exportPrompts,
+  importPrompts,
+  listPromptFiles,
+  promptFileDisplayName,
+  resolvePromptTarget,
+  writeMinimalPromptSet,
+} from './prompt_manager.js';
 
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 
 const program = new Command();
 
@@ -177,6 +193,121 @@ channels
       console.log(chalk.red('Gateway not running. Start it first: liteclaw gateway run'));
     }
     console.log();
+  });
+
+// ─── Prompt Commands ─────────────────────────────────────────────────
+
+const prompts = program
+  .command('prompts')
+  .description('Manage LiteClaw system prompt and personality files');
+
+prompts
+  .command('list')
+  .description('List editable prompt files in the LiteClaw state directory')
+  .action(() => {
+    ensureNeutralPrompts();
+    console.log(chalk.bold('\nPrompt Files:\n'));
+    for (const info of listPromptFiles()) {
+      const status = info.exists ? chalk.green('exists') : chalk.yellow('missing');
+      console.log(`  ${chalk.bold(info.name.padEnd(8))} ${status}  ${info.estimatedTokens.toLocaleString()} tokens  ${info.path}`);
+    }
+    console.log();
+  });
+
+prompts
+  .command('doctor')
+  .description('Check prompt files for reliability and safety recommendations')
+  .action(() => {
+    ensureNeutralPrompts();
+    const issues = doctorPrompts();
+    console.log(chalk.bold('\nPrompt Doctor:\n'));
+    for (const issue of issues) {
+      const marker = issue.severity === 'error'
+        ? chalk.red('error')
+        : issue.severity === 'warn'
+          ? chalk.yellow('warn ')
+          : chalk.gray('info ');
+      console.log(`  ${marker}  ${chalk.bold(issue.file)}  ${issue.message}`);
+    }
+    console.log();
+    if (issues.some(issue => issue.severity === 'error')) {
+      process.exitCode = 1;
+    }
+  });
+
+prompts
+  .command('reset')
+  .description('Create or reset prompt files from built-in profiles')
+  .option('--profile <profile>', 'Prompt profile (neutral|minimal)', 'neutral')
+  .option('--force', 'Overwrite existing prompt files')
+  .action((options) => {
+    const profile = String(options.profile ?? 'neutral').toLowerCase();
+    let changed: string[];
+    if (profile === 'minimal') {
+      if (!options.force && listPromptFiles().some(info => info.exists)) {
+        console.log(chalk.yellow('Prompt files already exist. Re-run with --force to overwrite them.'));
+        return;
+      }
+      changed = writeMinimalPromptSet();
+    } else if (profile === 'neutral') {
+      changed = ensureNeutralPrompts({ overwrite: !!options.force });
+    } else {
+      console.log(chalk.red('Unknown profile. Use: neutral or minimal'));
+      process.exitCode = 1;
+      return;
+    }
+
+    if (changed.length === 0) {
+      console.log(chalk.gray('Prompt files already exist; nothing changed.'));
+      return;
+    }
+    console.log(chalk.green(`✓ Wrote ${changed.length} prompt file(s):`));
+    for (const path of changed) console.log(chalk.gray(`  ${path}`));
+  });
+
+prompts
+  .command('edit <target>')
+  .description('Open a prompt file for editing (system|behavior|identity|user|workspace|tools|style)')
+  .action((target: string) => {
+    ensureNeutralPrompts();
+    try {
+      const resolved = resolvePromptTarget(target);
+      openEditor(resolved.path);
+    } catch (err: any) {
+      console.log(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+prompts
+  .command('export')
+  .description('Export current prompt files to a directory')
+  .requiredOption('--dir <path>', 'Target directory')
+  .action((options) => {
+    ensureNeutralPrompts();
+    const copied = exportPrompts(resolve(String(options.dir)));
+    console.log(chalk.green(`✓ Exported ${copied.length} prompt file(s):`));
+    for (const path of copied) console.log(chalk.gray(`  ${path}`));
+  });
+
+prompts
+  .command('import')
+  .description('Import prompt files from a directory')
+  .requiredOption('--dir <path>', 'Source directory')
+  .option('--force', 'Overwrite existing prompt files')
+  .action((options) => {
+    try {
+      const imported = importPrompts(resolve(String(options.dir)), { overwrite: !!options.force });
+      if (imported.length === 0) {
+        console.log(chalk.gray('No prompt files imported. Existing files are preserved unless --force is used.'));
+        return;
+      }
+      console.log(chalk.green(`✓ Imported ${imported.length} prompt file(s):`));
+      for (const path of imported) console.log(chalk.gray(`  ${path}`));
+    } catch (err: any) {
+      console.log(chalk.red(`Import failed: ${err.message}`));
+      process.exitCode = 1;
+    }
   });
 
 // ─── Config Commands ─────────────────────────────────────────────────
@@ -391,7 +522,13 @@ program
 program
   .command('setup')
   .description('Initialize local config and workspace')
-  .action(() => {
+  .option('--interactive', 'Run guided onboarding wizard')
+  .action(async (options) => {
+    if (options.interactive) {
+      await runInteractiveSetup();
+      return;
+    }
+
     const stateDir = getStateDir();
     if (!existsSync(stateDir)) {
       mkdirSync(stateDir, { recursive: true });
@@ -406,9 +543,21 @@ program
     }
 
     console.log(chalk.green('\n✓ Setup complete! Next steps:'));
+    const promptsCreated = ensureNeutralPrompts();
+    if (promptsCreated.length > 0) {
+      console.log(chalk.green(`Created ${promptsCreated.length} neutral prompt file(s)`));
+    }
+
     console.log(chalk.gray('  1. Edit ~/.liteclaw/config.yaml'));
     console.log(chalk.gray('  2. Create ~/.liteclaw/.env with your secrets'));
     console.log(chalk.gray('  3. Run: liteclaw gateway run'));
+  });
+
+program
+  .command('init')
+  .description('Run guided LiteClaw onboarding')
+  .action(async () => {
+    await runInteractiveSetup();
   });
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -428,5 +577,240 @@ function setNestedValue(obj: any, path: string, value: any): void {
 }
 
 // ─── Parse & Execute ─────────────────────────────────────────────────
+
+async function runInteractiveSetup(): Promise<void> {
+  const STEPS = 6;
+  const stateDir = getStateDir();
+  if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true });
+
+  const configPath = join(stateDir, 'config.yaml');
+  const isUpdate = existsSync(configPath);
+  const config: LiteClawConfig = isUpdate ? getConfig() : getDefaultConfig();
+
+  printBanner(VERSION);
+  printInfo(isUpdate ? `Updating existing config: ${configPath}` : `Creating new config: ${configPath}`);
+  printHint('Use arrow keys to navigate, Enter to select. Press Ctrl+C to abort.\n');
+
+  // ── Step 1: LLM Provider ────────────────────────────────────────
+  printSection('Model & Provider', 1, STEPS);
+
+  const providerChoice = await tuiSelect({
+    message: 'LLM provider',
+    choices: [
+      { value: 'local' as const, name: 'Local OpenAI-compatible server', description: 'llama.cpp, LM Studio, vLLM, etc.' },
+      { value: 'ollama' as const, name: 'Ollama', description: 'Ollama REST API' },
+      { value: 'custom' as const, name: 'Custom endpoint', description: 'Any OpenAI-compatible server' },
+    ],
+    default: 'local',
+  });
+
+  const currentLocal = (config.llm?.providers?.local as any) ?? {};
+  const currentModel = currentLocal.models?.[0] ?? {};
+  const providerId = providerChoice === 'custom' ? 'local' : providerChoice;
+  const defaultBase = providerChoice === 'ollama'
+    ? 'http://localhost:11434/v1'
+    : (currentLocal.baseUrl ?? process.env.LLM_BASE_URL ?? 'http://localhost:8080/v1');
+
+  const baseUrl = await tuiInput({ message: 'Base URL', default: defaultBase });
+  const apiKey = await tuiInput({
+    message: 'API key',
+    default: providerChoice === 'ollama' ? 'ollama' : (currentLocal.apiKey ?? process.env.LLM_API_KEY ?? 'sk-local'),
+  });
+  const modelId = await tuiInput({
+    message: 'Model ID',
+    default: process.env.LLM_MODEL ?? currentModel.id ?? config.llm?.defaults?.primary?.split('/').pop() ?? 'gemma-4-e4b-heretic',
+  });
+  const contextWindow = await tuiNumber({ message: 'Context window (tokens)', default: Number(currentModel.contextWindow ?? 65536), min: 1024 });
+  const maxTokens = await tuiNumber({ message: 'Max output tokens', default: Number(config.llm?.defaults?.maxOutputTokens ?? currentModel.maxTokens ?? 4096), min: 256 });
+  const supportsVision = await tuiConfirm({ message: 'Vision support?', default: !!(currentModel.vision ?? false) });
+  const supportsReasoning = await tuiConfirm({ message: 'Reasoning/thinking hints?', default: !!(currentModel.reasoning ?? true) });
+
+  // ── Step 2: Sampling ────────────────────────────────────────────
+  printSection('Sampling Parameters', 2, STEPS);
+  printHint('Tip: lower temperature + top-p give more deterministic output for small models.\n');
+
+  const temperature = await tuiNumber({ message: 'Temperature', default: Number(config.llm?.defaults?.temperature ?? 0.7), min: 0, max: 2 });
+  const topP = await tuiNumber({ message: 'Top-p', default: Number(config.llm?.defaults?.topP ?? 0.9), min: 0, max: 1 });
+  const topK = await tuiNumber({ message: 'Top-k', default: Number(config.llm?.defaults?.topK ?? 40), min: 1 });
+
+  config.llm = {
+    providers: {
+      [providerId]: {
+        baseUrl, apiKey,
+        models: [{ id: modelId, contextWindow, maxTokens, vision: supportsVision, reasoning: supportsReasoning, tools: true }],
+      },
+    },
+    defaults: { primary: `${providerId}/${modelId}`, fallbacks: [], temperature, topP, topK, maxOutputTokens: maxTokens },
+  };
+
+  // ── Step 3: Agent ───────────────────────────────────────────────
+  printSection('Agent Behavior', 3, STEPS);
+
+  config.agent ??= {};
+  config.agent.workspace = await tuiInput({ message: 'Workspace path', default: config.agent.workspace ?? process.cwd() });
+  config.agent.contextTokens = await tuiNumber({ message: 'Agent context tokens', default: Number(config.agent.contextTokens ?? contextWindow), min: 1024 });
+  config.agent.contextBudgetPct = await tuiNumber({ message: 'Context budget %', default: Number(config.agent.contextBudgetPct ?? 80), min: 10, max: 100 });
+  config.agent.historyMessageLimit = await tuiNumber({ message: 'History message limit', default: Number(config.agent.historyMessageLimit ?? 20), min: 1 });
+  config.agent.maxTurns = await tuiNumber({ message: 'Max tool turns per request', default: Number(config.agent.maxTurns ?? 20), min: 1 });
+
+  config.agent.toolLoading = await tuiSelect({
+    message: 'Tool loading mode',
+    choices: [
+      { value: 'lazy' as const, name: 'Lazy', description: 'Load tools on demand (recommended for small models)' },
+      { value: 'all' as const, name: 'All', description: 'Inject all tools into every turn' },
+    ],
+    default: (config.agent.toolLoading ?? 'lazy') as 'lazy',
+  }) as 'lazy' | 'all';
+
+  config.agent.thinkingDefault = await tuiSelect({
+    message: 'Thinking budget',
+    choices: [
+      { value: 'low', name: 'Low', description: 'Fastest — best for small models' },
+      { value: 'medium', name: 'Medium', description: 'Balanced' },
+      { value: 'off', name: 'Off', description: 'No thinking tokens' },
+      { value: 'high', name: 'High', description: 'Thorough — uses more context' },
+    ],
+    default: String(config.agent.thinkingDefault ?? 'low'),
+  });
+
+  const plannerEnabled = await tuiConfirm({ message: 'Enable task planner?', default: config.agent.planner?.enabled ?? true });
+  config.agent.planner = {
+    enabled: plannerEnabled,
+    mode: plannerEnabled ? await tuiSelect({
+      message: 'Planner mode',
+      choices: [
+        { value: 'auto' as const, name: 'Auto', description: 'Plan only for multi-step tasks' },
+        { value: 'always' as const, name: 'Always', description: 'Always create a plan' },
+        { value: 'off' as const, name: 'Off', description: 'Never plan' },
+      ],
+      default: (config.agent.planner?.mode ?? 'auto') as 'auto',
+    }) as 'auto' | 'always' | 'off' : 'off',
+    maxReplans: plannerEnabled ? await tuiNumber({ message: 'Max replans', default: Number(config.agent.planner?.maxReplans ?? 2), min: 0 }) : 0,
+  };
+
+  const skillsEnabled = await tuiConfirm({ message: 'Enable skills?', default: config.agent.skills?.enabled ?? true });
+  config.agent.skills = {
+    enabled: skillsEnabled,
+    maxInjected: skillsEnabled ? await tuiNumber({ message: 'Max injected skills', default: Number(config.agent.skills?.maxInjected ?? 2), min: 0 }) : 0,
+    directories: config.agent.skills?.directories ?? [],
+  };
+
+  // ── Step 4: Gateway & Channels ──────────────────────────────────
+  printSection('Gateway & Channels', 4, STEPS);
+
+  config.gateway ??= {};
+  config.gateway.port = await tuiNumber({ message: 'Gateway port', default: Number(config.gateway.port ?? 7860), min: 1, max: 65535 });
+  config.gateway.bind = await tuiSelect({
+    message: 'Gateway bind address',
+    choices: [
+      { value: 'loopback', name: 'Loopback only', description: '127.0.0.1 — most secure' },
+      { value: '0.0.0.0', name: 'All interfaces', description: 'Network visible — requires auth' },
+    ],
+    default: config.gateway.bind ?? 'loopback',
+  });
+  config.gateway.auth ??= { mode: 'token' };
+
+  config.channels ??= {};
+  config.channels.web = { enabled: true, port: config.gateway.port };
+
+  const discordEnabled = await tuiConfirm({ message: 'Enable Discord channel?', default: !!config.channels.discord?.enabled });
+  config.channels.discord = {
+    ...(config.channels.discord ?? {}),
+    enabled: discordEnabled,
+    replyStyle: discordEnabled ? await tuiSelect({
+      message: 'Discord reply style',
+      choices: [
+        { value: 'single' as const, name: 'Single response', description: 'One complete message' },
+        { value: 'rapid' as const, name: 'Rapid messages', description: 'Stream short bursts' },
+      ],
+      default: (config.channels.discord?.replyStyle ?? 'single') as 'single',
+    }) as 'single' | 'rapid' : (config.channels.discord?.replyStyle ?? 'single') as 'single' | 'rapid',
+    showToolProgress: discordEnabled ? await tuiConfirm({ message: 'Show tool progress in Discord?', default: !!config.channels.discord?.showToolProgress }) : false,
+  };
+
+  const whatsappEnabled = await tuiConfirm({ message: 'Enable WhatsApp channel?', default: !!config.channels.whatsapp?.enabled });
+  config.channels.whatsapp = {
+    ...(config.channels.whatsapp ?? {}),
+    enabled: whatsappEnabled,
+    replyStyle: whatsappEnabled ? await tuiSelect({
+      message: 'WhatsApp reply style',
+      choices: [
+        { value: 'single' as const, name: 'Single response', description: 'One complete message' },
+        { value: 'rapid' as const, name: 'Rapid messages', description: 'Stream short bursts' },
+      ],
+      default: (config.channels.whatsapp?.replyStyle ?? 'single') as 'single',
+    }) as 'single' | 'rapid' : (config.channels.whatsapp?.replyStyle ?? 'single') as 'single' | 'rapid',
+    showToolProgress: whatsappEnabled ? await tuiConfirm({ message: 'Show tool progress in WhatsApp?', default: !!config.channels.whatsapp?.showToolProgress }) : false,
+  };
+
+  // ── Step 5: Tools & Safety ──────────────────────────────────────
+  printSection('Tools & Safety', 5, STEPS);
+
+  const defaults = getDefaultConfig();
+  config.tools ??= {};
+  config.tools.exec = {
+    ...(config.tools.exec ?? {}),
+    enabled: await tuiConfirm({ message: 'Enable exec tool?', default: config.tools.exec?.enabled ?? true }),
+    confirmDestructive: await tuiConfirm({ message: 'Confirm destructive commands?', default: config.tools.exec?.confirmDestructive ?? true }),
+    safeBins: config.tools.exec?.safeBins ?? defaults.tools?.exec?.safeBins,
+  };
+  config.tools.filesystem = {
+    ...(config.tools.filesystem ?? {}),
+    enabled: await tuiConfirm({ message: 'Enable filesystem tools?', default: config.tools.filesystem?.enabled ?? true }),
+    confirmDelete: await tuiConfirm({ message: 'Confirm file deletion?', default: config.tools.filesystem?.confirmDelete ?? true }),
+  };
+  config.tools.web = config.tools.web ?? defaults.tools?.web;
+  config.tools.vision = config.tools.vision ?? defaults.tools?.vision;
+
+  // ── Step 6: Prompts ─────────────────────────────────────────────
+  printSection('Prompt Profile', 6, STEPS);
+
+  const promptProfile = await tuiSelect({
+    message: 'Prompt profile',
+    choices: [
+      { value: 'neutral', name: 'Neutral', description: 'Universal safe defaults — recommended' },
+      { value: 'minimal', name: 'Minimal', description: 'Bare-minimum behavior prompt' },
+      { value: 'custom', name: 'Custom', description: 'Start from neutral, then open editor' },
+    ],
+    default: 'neutral',
+  });
+
+  const promptFiles = promptProfile === 'minimal'
+    ? writeMinimalPromptSet()
+    : ensureNeutralPrompts();
+
+  saveConfig(config, configPath);
+
+  if (promptProfile === 'custom') {
+    printInfo('Opening behavior prompt for editing...');
+    printHint('You can also run: liteclaw prompts edit system');
+    openEditor(resolvePromptTarget('soul').path);
+  }
+
+  // ── Summary ─────────────────────────────────────────────────────
+  printDone([
+    `Config   ${configPath}`,
+    `Prompts  ${join(getStateDir(), 'personality')}`,
+    `Files    ${promptFiles.length} prompt file(s) created/updated`,
+    '',
+    'Next steps:',
+    '  liteclaw prompts doctor   Check prompts for issues',
+    '  liteclaw doctor           Verify connectivity',
+    '  liteclaw gateway run      Start the agent',
+  ]);
+}
+
+
+
+
+function openEditor(filePath: string): void {
+  const editor = process.env.EDITOR || process.env.VISUAL || (process.platform === 'win32' ? 'notepad' : 'vi');
+  console.log(chalk.gray(`Opening ${promptFileDisplayName(filePath)} with ${editor}`));
+  const result = spawnSync(editor, [filePath], { stdio: 'inherit', shell: true });
+  if (result.error) {
+    console.log(chalk.yellow(`Could not open editor: ${result.error.message}`));
+    console.log(chalk.gray(`Edit this file manually: ${filePath}`));
+  }
+}
 
 program.parse();
