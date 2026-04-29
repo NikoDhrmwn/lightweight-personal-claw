@@ -11,6 +11,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.8.0] - 2026-04-29
+
+#### Added
+
+- **Gateway Auth Hardening**: Mandated Bearer tokens on all `/api/*` routes when bound to non-loopback interfaces.
+- **Resource Limits**: Implemented 10-file and 20MB attachment limits per request in the WebUI gateway.
+- **Extraction Timeouts**: Added a 30-second processing timeout and 500,000-character extraction cap to document ingestion.
+- **Structured Exec Mode**: Refactored the `exec` tool to use `bin` and `args` parameters by default instead of vulnerable shell strings.
+- **Tool Enforcement**: Implemented granular enablement checks to prevent disabled tool categories from being accessed or lazy-loaded.
+
 ### [0.7.2] - 2026-04-29
 
 #### Added
@@ -18,13 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Workspace Path Safety**: Implemented a centralized `workspace.ts` path resolver with absolute path opt-in and path traversal (`../`) blocking to contain execution within the project root.
 - **Tool Path Validation**: All filesystem operations (`read_file`, `write_file`, etc.) and `exec` cwd arguments now enforce secure workspace containment.
 
-### [0.7.1] - 2026-04-29
-
-#### Added
-
-- **CLI Onboarding UX Overhaul**: Replaced readline-based prompts with modern `@inquirer/prompts` interactive wizards for `setup` and `init`.
-- **Prompt Customization**: Added comprehensive prompt management CLI commands (`prompts list`, `doctor`, `reset`, `edit`, `export`, `import`).
-- **Neutral Defaults**: Migrated default system prompts and personality templates to a structured, neutral config repository.
 
 ## Features
 

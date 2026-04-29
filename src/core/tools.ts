@@ -7,6 +7,7 @@
 
 import { createLogger } from '../logger.js';
 import { LLMToolDef, LLMToolCall } from './llm.js';
+import { getConfig } from '../config.js';
 
 const log = createLogger('tools');
 
@@ -74,6 +75,26 @@ export interface ToolResult {
   confirmationMessage?: string;
 }
 
+// ─── Category Enablement ─────────────────────────────────────────────
+
+const CATEGORY_CONFIG_KEY: Record<string, string> = {
+  filesystem: 'filesystem',
+  exec: 'exec',
+  web: 'web',
+  vision: 'vision',
+  channel: 'filesystem', // channel tools (send_file) follow filesystem enablement
+  utility: 'exec',       // utility tools follow exec enablement
+};
+
+function isToolCategoryEnabled(category: string): boolean {
+  const config = getConfig();
+  const configKey = CATEGORY_CONFIG_KEY[category] ?? category;
+  const toolConfig = (config.tools as any)?.[configKey];
+  // Default to enabled if not explicitly set
+  if (!toolConfig || toolConfig.enabled === undefined) return true;
+  return !!toolConfig.enabled;
+}
+
 // ─── Tool Registry ───────────────────────────────────────────────────
 
 class ToolRegistry {
@@ -89,7 +110,7 @@ class ToolRegistry {
   }
 
   getAll(): ToolDefinition[] {
-    return Array.from(this.tools.values());
+    return Array.from(this.tools.values()).filter(t => isToolCategoryEnabled(t.category));
   }
 
   /**
@@ -107,6 +128,9 @@ class ToolRegistry {
     const scored: { tool: ToolDefinition; score: number }[] = [];
 
     for (const tool of this.tools.values()) {
+      // Skip disabled tool categories
+      if (!isToolCategoryEnabled(tool.category)) continue;
+
       let score = 0;
 
       // Keyword matching
@@ -257,6 +281,14 @@ class ToolRegistry {
       return {
         success: false,
         output: `Unknown tool: ${toolCall.function.name}`,
+      };
+    }
+
+    // Enforce tools.*.enabled centrally
+    if (!isToolCategoryEnabled(tool.category)) {
+      return {
+        success: false,
+        output: `Tool "${tool.name}" is disabled (category "${tool.category}" is disabled in config).`,
       };
     }
 

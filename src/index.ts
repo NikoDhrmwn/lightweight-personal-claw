@@ -29,7 +29,7 @@ import './tools/web.js';
 import './tools/vision.js';
 import './tools/channel.js';
 
-const VERSION = '0.7.2';
+const VERSION = '0.8.0';
 const log = createLogger('main');
 
 export async function startGateway(portOverride?: number): Promise<void> {
