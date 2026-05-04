@@ -765,7 +765,7 @@ export class AgentEngine extends EventEmitter {
 
       const deduped: LLMToolCall[] = [];
       for (const tc of toolCalls) {
-        const sig = `${tc.function.name}:${tc.function.arguments}`;
+        const sig = `${tc.function.name}:${tc.function.arguments}:${JSON.stringify(tc.extra_content ?? {})}`;
         if (toolCallHistory.has(sig)) continue;
         toolCallHistory.add(sig);
         deduped.push(tc);
@@ -819,6 +819,7 @@ export class AgentEngine extends EventEmitter {
         messages.push({
           role: 'tool',
           tool_call_id: tc.id,
+          name: tc.function.name,
           content: formatToolResultForModel(tc.function.name, result),
         });
       }
@@ -1115,7 +1116,7 @@ Do not expose the internal plan outside tags.`;
 
       const deduped: LLMToolCall[] = [];
       for (const call of toolCalls) {
-        const signature = `${call.function.name}:${call.function.arguments}`;
+        const signature = `${call.function.name}:${call.function.arguments}:${JSON.stringify(call.extra_content ?? {})}`;
         if (toolCallHistory.has(signature)) continue;
         toolCallHistory.add(signature);
         deduped.push(call);
@@ -1172,6 +1173,7 @@ Do not expose the internal plan outside tags.`;
         messages.push({
           role: 'tool',
           tool_call_id: call.id,
+          name: call.function.name,
           content: formatToolResultForModel(call.function.name, result),
         });
       }

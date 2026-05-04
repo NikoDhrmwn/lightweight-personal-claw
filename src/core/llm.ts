@@ -34,6 +34,7 @@ export interface LLMToolCall {
   id: string;
   type: 'function';
   function: { name: string; arguments: string };
+  extra_content?: Record<string, any>;
 }
 
 export interface LLMToolDef {
@@ -364,7 +365,7 @@ export class LLMClient extends EventEmitter {
         // Track tool call accumulation across chunks.
         // Some providers stream native tool_calls, while smaller/local models
         // may emit XML-ish tags inside plain text instead.
-        const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+        const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string; extra_content?: Record<string, any> }>();
         let isThinking = false;
         let isToolCalling = false;
         let isDsmlCalling = false;
@@ -386,6 +387,7 @@ export class LLMClient extends EventEmitter {
                   id: tc.id,
                   type: 'function',
                   function: { name: tc.name, arguments: tc.arguments },
+                  ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
                 },
               };
             }
@@ -597,11 +599,15 @@ export class LLMClient extends EventEmitter {
                   id: tc.id ?? `call_${idx}_${Date.now()}`,
                   name: tc.function?.name ?? '',
                   arguments: '',
+                  extra_content: tc.extra_content,
                 });
               }
               const pending = pendingToolCalls.get(idx)!;
               if (tc.function?.name) pending.name = tc.function.name;
               if (tc.function?.arguments) pending.arguments += tc.function.arguments;
+              if (tc.extra_content) {
+                pending.extra_content = mergeObjects(pending.extra_content ?? {}, tc.extra_content);
+              }
             }
           }
         }
@@ -614,6 +620,7 @@ export class LLMClient extends EventEmitter {
               id: tc.id,
               type: 'function',
               function: { name: tc.name, arguments: tc.arguments },
+              ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
             },
           };
         }
@@ -1078,6 +1085,8 @@ function normalizeMessagesForProvider(
       role = 'user';
       normalized.role = role;
       content = `[TOOL RESULT]\n${flattenMessageContent(message.content)}`.trim();
+    } else if (nativeToolsEnabled && strictProvider && message.role === 'tool') {
+      content = normalizeNativeToolResultContent(message.content);
     }
 
     if (nativeToolsEnabled && message.tool_calls?.length) {
@@ -1085,6 +1094,9 @@ function normalizeMessagesForProvider(
     }
     if (nativeToolsEnabled && message.tool_call_id) {
       normalized.tool_call_id = message.tool_call_id;
+    }
+    if (nativeToolsEnabled && strictProvider && message.role === 'tool' && message.name) {
+      normalized.name = message.name;
     }
     if (message.name) normalized.name = message.name;
 
@@ -1117,6 +1129,19 @@ function flattenMessageContent(content: string | LLMContentPart[] | null): strin
   return content
     .map(part => part.type === 'text' ? (part.text ?? '') : `[image:${part.image_url?.detail ?? 'auto'}]`)
     .join('\n');
+}
+
+function normalizeNativeToolResultContent(content: string | LLMContentPart[] | null): string {
+  const text = flattenMessageContent(content).trim();
+  if (!text) return '';
+
+  const withoutEnvelope = text
+    .replace(/^<tool_result>\s*[\s\S]*?<\/tool_result>\s*/i, '')
+    .replace(/\n?\[RECOVERY NUDGE:[\s\S]*$/i, '')
+    .replace(/\n?\[SYSTEM:[\s\S]*$/i, '')
+    .trim();
+
+  return withoutEnvelope || text;
 }
 
 function isGoogleProvider(provider: Pick<LLMProvider, 'id' | 'baseUrl'>): boolean {
