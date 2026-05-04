@@ -337,7 +337,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.8.0',
+      version: '0.8.1',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
       uptime: process.uptime(),
@@ -409,7 +409,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.8.0',
+        version: config.meta?.version ?? '0.8.1',
       },
       paths: {
         stateDir: getStateDir(),

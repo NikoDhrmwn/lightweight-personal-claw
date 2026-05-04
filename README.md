@@ -11,6 +11,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.8.1] - 2026-05-04
+
+#### Fixed
+
+- **Gemini Tool Calling**: Resolved issues where Gemini models would fail or behave inconsistently during tool interactions.
+    - Ensured the `name` field is explicitly included in tool result messages for native Google API compatibility.
+    - Implemented tool result content normalization to strip internal `<tool_result>` envelopes and recovery/system nudges before sending to the model.
+    - Improved tool call deduplication by including `extra_content` (parameters not in the core function schema) in the deduplication signature.
+
 ### [0.8.0] - 2026-04-29
 
 #### Added

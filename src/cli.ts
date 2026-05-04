@@ -34,7 +34,7 @@ import {
   writeMinimalPromptSet,
 } from './prompt_manager.js';
 
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 
 const program = new Command();
 
