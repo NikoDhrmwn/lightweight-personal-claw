@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GitHub MCP Preset**: Added `liteclaw mcp add github` and `liteclaw mcp login github` for quick setup of GitHub's remote MCP server using a token stored in the LiteClaw state `.env`.
 - **MCP Health & Reloading**: Gateway status now reports MCP server health, and MCP connections are reloaded automatically when config or `.env` changes.
 
+### [0.8.2] - 2026-05-05
+
+#### Added
+
+- **Model Context Protocol (MCP)**: Native client support for MCP servers.
+    - Automated tool discovery and registration from MCP servers.
+    - Added `mcp_list`, `mcp_get_resource`, and `mcp_call_tool` utilities.
+    - Integrated MCP session management into the core engine.
+    - Support for GitHub MCP via Copilot API.
+
 ### [0.8.1] - 2026-05-04
 
 #### Fixed

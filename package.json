@@ -1,6 +1,6 @@
 {
   "name": "liteclaw",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Lightweight agent runtime for local LLMs — WebUI, Discord, WhatsApp",
   "type": "module",
   "main": "dist/index.js",
