@@ -11,38 +11,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-### [0.7.0] - 2026-04-29
+
 
 #### Added
 
-- **Scene-Aware D&D Flow**: Added canonical scene state, narrative validation, queued group actions, rest safety, and continuity checks for session threads.
-- **Expanded D&D Character Tools**: Added avatar, skills, spells, inventory, dice, downtime, shop, death-save, inspiration, and richer stats/rest commands.
-- **Advanced Combat Resolution**: Added pending player actions, active effects, defensive/improvised actions, buff/debuff/control skills, item weights, and round-level combat narration.
-- **WhatsApp Progress UX**: Added command handling, progress tracker messages, send retries, reconnection behavior, and WhatsApp-specific markdown formatting.
-- **Provider Compatibility**: Added native tool prompting, DSML tool-call parsing, provider refresh after config edits, top-k sampling, reasoning-content memory, and WebUI formatting rules.
-- **Session Cleanup CLI**: Added `liteclaw channels logout --channel whatsapp` to clear the local WhatsApp pairing session.
+- **First-Class MCP Support**: LiteClaw can now connect to MCP servers over `stdio` and remote HTTP, expose MCP tools directly to the agent, and access MCP resources/prompts through built-in utility tools.
+- **GitHub MCP Preset**: Added `liteclaw mcp add github` and `liteclaw mcp login github` for quick setup of GitHub's remote MCP server using a token stored in the LiteClaw state `.env`.
+- **MCP Health & Reloading**: Gateway status now reports MCP server health, and MCP connections are reloaded automatically when config or `.env` changes.
 
-#### Fixed
-
-- **Discord Robustness**: Added gateway DNS checks, login retries, shard diagnostics, and debug token redaction.
-- **Context Thresholds**: Derived default compaction thresholds from configured context size and budget.
-- **Repository Hygiene**: Ignored `scratch/` and stopped `.gitignore` from ignoring itself.
-- **Version Consistency**: Normalized package, CLI, runtime, gateway, migration, and default config version reporting to `0.7.0`.
-
-### [0.6.3] - 2026-04-24
+### [0.8.2] - 2026-05-05
 
 #### Added
 
-- **The World of Elyndor**: Integrated a new high-fantasy preconfigured world with deep lore, regional factions, and RAG-assisted narrative generation.
-- **Advanced D&D Combat Engine**: Implemented a stateful combat system with initiative tracking, persistent HP/AC management, and dynamic action menus.
-- **Inventory & Skill Systems**: Added starter kits, weapon requirements, and class-specific skills with persistent usage tracking.
-- **RAG Document Ingestion**: Added support for multi-format document ingestion (PDF, MD, TXT, DOCX) for session-aware knowledge retrieval.
-- **Onboarding Improvements**: Streamlined player join flows and character profile initialization with persistent state.
+- **Model Context Protocol (MCP)**: Native client support for MCP servers.
+    - Automated tool discovery and registration from MCP servers.
+    - Added `mcp_list`, `mcp_get_resource`, and `mcp_call_tool` utilities.
+    - Integrated MCP session management into the core engine.
+    - Support for GitHub MCP via Copilot API.
+
+### [0.8.1] - 2026-05-04
 
 #### Fixed
 
-- **Git Tracking**: Added `brain/` directory to `.gitignore` to prevent generated session data and research logs from being tracked.
-- **Version Consistency**: Normalized version reporting to `0.6.3` across all modules.
+- **Gemini Tool Calling**: Resolved issues where Gemini models would fail or behave inconsistently during tool interactions.
+    - Ensured the `name` field is explicitly included in tool result messages for native Google API compatibility.
+    - Implemented tool result content normalization to strip internal `<tool_result>` envelopes and recovery/system nudges before sending to the model.
+    - Improved tool call deduplication by including `extra_content` (parameters not in the core function schema) in the deduplication signature.
+
+### [0.8.0] - 2026-04-29
+
+#### Added
+
+- **Gateway Auth Hardening**: Mandated Bearer tokens on all `/api/*` routes when bound to non-loopback interfaces.
+- **Resource Limits**: Implemented 10-file and 20MB attachment limits per request in the WebUI gateway.
+- **Extraction Timeouts**: Added a 30-second processing timeout and 500,000-character extraction cap to document ingestion.
+- **Structured Exec Mode**: Refactored the `exec` tool to use `bin` and `args` parameters by default instead of vulnerable shell strings.
+- **Tool Enforcement**: Implemented granular enablement checks to prevent disabled tool categories from being accessed or lazy-loaded.
+
+### [0.7.2] - 2026-04-29
+
+#### Added
+
+- **Workspace Path Safety**: Implemented a centralized `workspace.ts` path resolver with absolute path opt-in and path traversal (`../`) blocking to contain execution within the project root.
+- **Tool Path Validation**: All filesystem operations (`read_file`, `write_file`, etc.) and `exec` cwd arguments now enforce secure workspace containment.
+
 
 ## Features
 
@@ -51,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multi-Channel**: Native support for WebUI, Discord, and WhatsApp.
 - **Discord DnD Sessions**: New slash-command workflow for multiplayer session threads, persistent player rosters, join/resume flows, partial-party resumes, and vote-based turn skipping.
 - **Core Tools**: Filesystem access, command execution, web search/fetch, and native vision.
+- **MCP Integrations**: Connect external MCP servers and expose their tools, prompts, and resources to the agent.
 - **Safety First**: Cross-channel confirmations for destructive or sensitive actions.
 - **Skills System**: Project-level skills support with selective prompt injection.
 
@@ -78,8 +91,8 @@ LiteClaw now includes a lightweight DnD session subsystem for Discord:
 ### DnD RAG Notes
 
 - LiteClaw stores DnD retrieval data in its state directory and uses a local embedding server for session-aware GM answers.
-- On this machine, the embedding bootstrap script is stored at `E:\Qwen3.6\start-embed-liteclaw.bat`.
-- Starting or refreshing a DnD session automatically ensures the embedding server is running before syncing session context.
+- Configure any local embedding bootstrap command in your LiteClaw state/config files instead of hardcoding machine-specific paths.
+- Starting or refreshing a DnD session can ensure the configured embedding server is running before syncing session context.
 
 ## Quick Start
 
@@ -92,6 +105,12 @@ npx tsx src/cli.ts gateway run
 ```
 
 Open `http://localhost:7860` for the Web UI.
+
+For guided first-time setup with recommendations for local 4B-9B models:
+
+```bash
+npx tsx src/cli.ts setup --interactive
+```
 
 ## Windows Setup
 
@@ -135,6 +154,12 @@ Initialize the local state directory:
 npx tsx src/cli.ts setup
 ```
 
+Or run the guided onboarding wizard:
+
+```bash
+npx tsx src/cli.ts init
+```
+
 This creates your LiteClaw state under:
 
 - Windows: `%USERPROFILE%\.liteclaw`
@@ -151,12 +176,33 @@ Example values:
 DISCORD_TOKEN=
 GOOGLE_API_KEY=
 GATEWAY_TOKEN=
+GITHUB_PERSONAL_ACCESS_TOKEN=
 LLM_BASE_URL=http://localhost:8080/v1
 LLM_API_KEY=sk-local
 LLM_MODEL=gemma-4-e4b-heretic
 ```
 
 You can use the project-root [.env.example](.env.example) as a reference.
+
+## Prompt and Personality Customization
+
+LiteClaw ships neutral, universal prompt templates by default. User-editable prompt files live in:
+
+```text
+%USERPROFILE%\.liteclaw\personality\
+```
+
+Recommended prompt commands:
+
+```bash
+npx tsx src/cli.ts prompts list
+npx tsx src/cli.ts prompts doctor
+npx tsx src/cli.ts prompts edit system
+npx tsx src/cli.ts prompts edit behavior
+npx tsx src/cli.ts prompts reset --profile neutral
+```
+
+Use `prompts doctor` after edits. It flags oversized prompts, personal machine paths, unsafe instructions, and reliability issues that commonly hurt smaller local models.
 
 ## Running LiteClaw
 
@@ -177,10 +223,38 @@ Useful terminal commands:
 
 ```bash
 npx tsx src/cli.ts doctor
+npx tsx src/cli.ts mcp list
+npx tsx src/cli.ts mcp add github
 npx tsx src/cli.ts status
 npx tsx src/cli.ts channels status
 npx tsx src/cli.ts message "hello"
 ```
+
+## MCP Setup
+
+LiteClaw 0.8.2 adds native MCP client support. MCP tools are discovered at startup and injected into the agent like built-in tools, while MCP prompts and resources are available through `mcp_*` utility tools.
+
+### Quick GitHub setup
+
+```bash
+liteclaw mcp add github
+liteclaw mcp login github
+liteclaw mcp doctor
+```
+
+The GitHub preset uses the official remote GitHub MCP endpoint:
+
+```text
+https://api.githubcopilot.com/mcp/
+```
+
+Credentials are stored in your LiteClaw state `.env` as:
+
+```env
+GITHUB_PERSONAL_ACCESS_TOKEN=...
+```
+
+After setup, GitHub MCP tools will appear to the agent with a `github_` prefix, making tasks like pull requests, issue work, and repository review available through the normal tool-calling flow.
 
 ## Migrating From OpenClaw
 
@@ -199,7 +273,7 @@ This attempts to import from the default OpenClaw directory:
 ### Custom migration path
 
 ```powershell
-npx tsx src/cli.ts migrate --openclaw-dir "C:\Users\yourname\.openclaw"
+npx tsx src/cli.ts migrate --openclaw-dir "/path/to/.openclaw"
 ```
 
 Migration can bring over:
@@ -220,11 +294,19 @@ After migrating, review:
 
 ```bash
 liteclaw gateway run
+liteclaw init
 liteclaw channels login --channel discord
 liteclaw channels login --channel whatsapp
 liteclaw channels status
 liteclaw status
 liteclaw doctor
+liteclaw mcp list
+liteclaw mcp add github
+liteclaw mcp login github
+liteclaw prompts list
+liteclaw prompts doctor
+liteclaw prompts edit system
+liteclaw prompts edit behavior
 liteclaw config get <key>
 liteclaw models list
 liteclaw message "hello"
@@ -238,6 +320,7 @@ Examples:
 ```bash
 npx tsx src/cli.ts channels login --channel discord
 npx tsx src/cli.ts channels login --channel whatsapp
+npx tsx src/cli.ts mcp doctor
 npx tsx src/cli.ts config get gateway.port
 npx tsx src/cli.ts models list
 ```

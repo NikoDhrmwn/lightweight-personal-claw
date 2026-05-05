@@ -1,33 +1,21 @@
-# TOOLS.md - Local Notes
+# Tool Notes
 
-This file is for *your* specifics — the stuff that's unique to your setup.
+LiteClaw may provide filesystem, command execution, web, channel, and vision tools.
 
-## What Goes Here
+## General Guidance
 
-Things like:
+- Use tools only when they improve accuracy or are required for the task.
+- Prefer read-only tools before write or exec tools.
+- Keep tool arguments precise.
+- If a tool fails, use the error output to recover or explain the blocker.
 
-- Device nicknames
-- Preferred settings
-- Environment-specific notes
+## Files
 
----
+- Read target files before editing them.
+- Prefer targeted edits over rewriting full files.
+- Avoid reading binary files as text.
 
-Add whatever helps you do your job. This is your cheat sheet.
+## Web
 
----
-
-## My Brain
-
-### GIFs
-
-- There is a file called `GIFS.md`.
-- It has specific URLs for reaction GIFs.
-- **Check it before sending a random GIF.**
-
-### Search
-- Preferred Search: Google Grounding (native via web_search tool)
-- Use this whenever a grounded web search is required.
-
-### Vision
-- Preferred Vision: Native multimodal (images are passed inline to the model)
-- Just describe what you see — no external CLI needed.
+- Use web search for recent, changing, or source-sensitive facts.
+- Use web fetch when a specific URL is already known.

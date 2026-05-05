@@ -6,8 +6,9 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync } from 'fs';
-import { join, basename, resolve } from 'path';
+import { join, basename } from 'path';
 import { toolRegistry, ToolContext, ToolResult } from '../core/tools.js';
+import { resolveWorkspacePath, PathEscapeError } from '../core/workspace.js';
 
 // ─── read_file ───────────────────────────────────────────────────────
 
@@ -33,7 +34,13 @@ toolRegistry.register({
   ],
   keywords: ['read', 'file', 'open', 'show', 'content', 'view', 'cat', 'type', 'display', 'look', 'check'],
   handler: async (args, context): Promise<ToolResult> => {
-    const filePath = resolve(context.workingDir, args.path);
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(args.path, context.workingDir).absolute;
+    } catch (err) {
+      if (err instanceof PathEscapeError) return { success: false, output: err.message };
+      throw err;
+    }
 
     if (!existsSync(filePath)) {
       return { success: false, output: `File not found: ${filePath}` };
@@ -115,7 +122,13 @@ toolRegistry.register({
   ],
   keywords: ['write', 'create', 'save', 'file', 'output', 'generate', 'put'],
   handler: async (args, context): Promise<ToolResult> => {
-    const filePath = resolve(context.workingDir, args.path);
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(args.path, context.workingDir).absolute;
+    } catch (err) {
+      if (err instanceof PathEscapeError) return { success: false, output: err.message };
+      throw err;
+    }
 
     try {
       const existed = existsSync(filePath);
@@ -164,7 +177,13 @@ toolRegistry.register({
   ],
   keywords: ['edit', 'modify', 'replace', 'fix', 'update', 'change', 'patch'],
   handler: async (args, context): Promise<ToolResult> => {
-    const filePath = resolve(context.workingDir, args.path);
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(args.path, context.workingDir).absolute;
+    } catch (err) {
+      if (err instanceof PathEscapeError) return { success: false, output: err.message };
+      throw err;
+    }
 
     if (!existsSync(filePath)) {
       return { success: false, output: `File not found: ${filePath}` };
@@ -222,7 +241,13 @@ toolRegistry.register({
   keywords: ['delete', 'remove', 'rm', 'del', 'erase', 'destroy', 'clean'],
   requiresConfirmation: true,
   handler: async (args, context): Promise<ToolResult> => {
-    const filePath = resolve(context.workingDir, args.path);
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(args.path, context.workingDir).absolute;
+    } catch (err) {
+      if (err instanceof PathEscapeError) return { success: false, output: err.message };
+      throw err;
+    }
 
     if (!existsSync(filePath)) {
       return { success: false, output: `File not found: ${filePath}` };
@@ -256,7 +281,13 @@ toolRegistry.register({
   ],
   keywords: ['list', 'directory', 'folder', 'dir', 'ls', 'tree', 'files', 'contents', 'what'],
   handler: async (args, context): Promise<ToolResult> => {
-    const dirPath = resolve(context.workingDir, args.path || '.');
+    let dirPath: string;
+    try {
+      dirPath = resolveWorkspacePath(args.path || '.', context.workingDir).absolute;
+    } catch (err) {
+      if (err instanceof PathEscapeError) return { success: false, output: err.message };
+      throw err;
+    }
 
     if (!existsSync(dirPath)) {
       return { success: false, output: `Directory not found: ${dirPath}` };
@@ -311,7 +342,13 @@ toolRegistry.register({
   ],
   keywords: ['send', 'share', 'attach', 'upload', 'deliver', 'transfer', 'give'],
   handler: async (args, context): Promise<ToolResult> => {
-    const filePath = resolve(context.workingDir, args.path);
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(args.path, context.workingDir).absolute;
+    } catch (err) {
+      if (err instanceof PathEscapeError) return { success: false, output: err.message };
+      throw err;
+    }
 
     if (!existsSync(filePath)) {
       return { success: false, output: `File not found: ${filePath}` };

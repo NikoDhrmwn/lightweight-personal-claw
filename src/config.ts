@@ -15,6 +15,20 @@ const log = createLogger('config');
 
 // ─── Types ───────────────────────────────────────────────────────────
 
+export interface MCPServerConfig {
+  enabled?: boolean;
+  transport?: 'stdio' | 'http';
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  includeTools?: string[];
+  excludeTools?: string[];
+  prefixToolNames?: boolean;
+}
+
 export interface LiteClawConfig {
   meta?: { version?: string };
   llm?: {
@@ -34,6 +48,8 @@ export interface LiteClawConfig {
     name?: string;
     systemPromptFile?: string;
     workspace?: string;
+    /** Allow tools to access absolute paths outside workspace (default: false) */
+    allowAbsolutePaths?: boolean;
     contextTokens?: number;
     maxTurns?: number;
     historyMessageLimit?: number;
@@ -75,6 +91,11 @@ export interface LiteClawConfig {
     web?: Record<string, any>;
     filesystem?: Record<string, any>;
     vision?: Record<string, any>;
+    mcp?: Record<string, any>;
+  };
+  mcp?: {
+    enabled?: boolean;
+    servers?: Record<string, MCPServerConfig>;
   };
   gateway?: {
     port?: number;
@@ -149,7 +170,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.7.0' },
+    meta: { version: '0.8.2' },
     llm: {
       providers: {
         local: {
@@ -214,6 +235,11 @@ export function getDefaultConfig(): LiteClawConfig {
       },
       filesystem: { enabled: true, confirmDelete: true },
       vision: { enabled: true, maxDimensionPx: 1024 },
+      mcp: { enabled: true },
+    },
+    mcp: {
+      enabled: true,
+      servers: {},
     },
     gateway: {
       port: 7860,
@@ -284,7 +310,6 @@ export function loadSystemPrompt(): string {
     // Search order: state dir → personality dir → workspace dir
     const candidates = [
       join(stateDir, 'personality', file),
-      join(personalityDir, file),
     ];
 
     // Also check any configured workspace directory
@@ -292,6 +317,8 @@ export function loadSystemPrompt(): string {
     if (workspace) {
       candidates.push(join(workspace, file));
     }
+
+    candidates.push(join(personalityDir, file.replace(/\.md$/, '.template.md')));
 
     for (const p of candidates) {
       if (existsSync(p)) {
