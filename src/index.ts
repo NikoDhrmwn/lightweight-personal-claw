@@ -11,6 +11,7 @@ import { ConfirmationManager } from './core/confirmation.js';
 import { AgentEngine } from './core/engine.js';
 import { GatewayServer } from './gateway/server.js';
 import { loadConfig, getConfig } from './config.js';
+import { mcpManager } from './core/mcp.js';
 import {
   createLogger,
   printBanner,
@@ -28,8 +29,9 @@ import './tools/exec.js';
 import './tools/web.js';
 import './tools/vision.js';
 import './tools/channel.js';
+import './tools/mcp.js';
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.2';
 const log = createLogger('main');
 
 export async function startGateway(portOverride?: number): Promise<void> {
@@ -41,6 +43,9 @@ export async function startGateway(portOverride?: number): Promise<void> {
 
   // ── Core Services ──
   printSection('Core Services');
+
+  await mcpManager.reloadFromConfig(config);
+  printStepDone('MCP integrations initialized');
 
   const llm = new LLMClient();
   // Auto-detect models from running servers (non-blocking — falls back to config if offline)
@@ -118,6 +123,7 @@ export async function startGateway(portOverride?: number): Promise<void> {
     console.log('\n  Shutting down LiteClaw...');
     gateway.stop();
     memory.close();
+    mcpManager.closeAll().catch(() => undefined);
     confirmations.cancelAll();
     process.exit(0);
   };

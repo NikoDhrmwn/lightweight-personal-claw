@@ -7,6 +7,7 @@
 
 import { createLogger } from '../logger.js';
 import { LLMToolDef, LLMToolCall } from './llm.js';
+import { getConfig } from '../config.js';
 
 const log = createLogger('tools');
 
@@ -32,8 +33,10 @@ export interface InteractiveChoiceRequest {
 export interface ToolDefinition {
   name: string;
   description: string;
-  category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility';
+  category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility' | 'mcp';
   parameters: ToolParameter[];
+  /** Optional raw JSON schema for tools that don't fit LiteClaw's flat parameter shape */
+  inputSchema?: Record<string, any>;
   /** Compact retrieval-friendly guidance for weaker models */
   usageNotes?: string[];
   /** Short examples that can be surfaced when relevant */
@@ -74,6 +77,27 @@ export interface ToolResult {
   confirmationMessage?: string;
 }
 
+// ─── Category Enablement ─────────────────────────────────────────────
+
+const CATEGORY_CONFIG_KEY: Record<string, string> = {
+  filesystem: 'filesystem',
+  exec: 'exec',
+  web: 'web',
+  vision: 'vision',
+  channel: 'filesystem', // channel tools (send_file) follow filesystem enablement
+  utility: 'exec',       // utility tools follow exec enablement
+  mcp: 'mcp',
+};
+
+function isToolCategoryEnabled(category: string): boolean {
+  const config = getConfig();
+  const configKey = CATEGORY_CONFIG_KEY[category] ?? category;
+  const toolConfig = (config.tools as any)?.[configKey];
+  // Default to enabled if not explicitly set
+  if (!toolConfig || toolConfig.enabled === undefined) return true;
+  return !!toolConfig.enabled;
+}
+
 // ─── Tool Registry ───────────────────────────────────────────────────
 
 class ToolRegistry {
@@ -88,8 +112,12 @@ class ToolRegistry {
     return this.tools.get(name);
   }
 
+  unregister(name: string): void {
+    this.tools.delete(name);
+  }
+
   getAll(): ToolDefinition[] {
-    return Array.from(this.tools.values());
+    return Array.from(this.tools.values()).filter(t => isToolCategoryEnabled(t.category));
   }
 
   /**
@@ -107,6 +135,9 @@ class ToolRegistry {
     const scored: { tool: ToolDefinition; score: number }[] = [];
 
     for (const tool of this.tools.values()) {
+      // Skip disabled tool categories
+      if (!isToolCategoryEnabled(tool.category)) continue;
+
       let score = 0;
 
       // Keyword matching
@@ -224,7 +255,7 @@ class ToolRegistry {
       function: {
         name: tool.name,
         description: tool.description,
-        parameters: {
+        parameters: tool.inputSchema ?? {
           type: 'object',
           properties: Object.fromEntries(
             tool.parameters.map(p => [
@@ -257,6 +288,14 @@ class ToolRegistry {
       return {
         success: false,
         output: `Unknown tool: ${toolCall.function.name}`,
+      };
+    }
+
+    // Enforce tools.*.enabled centrally
+    if (!isToolCategoryEnabled(tool.category)) {
+      return {
+        success: false,
+        output: `Tool "${tool.name}" is disabled (category "${tool.category}" is disabled in config).`,
       };
     }
 

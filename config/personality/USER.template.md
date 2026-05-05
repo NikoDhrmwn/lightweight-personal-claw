@@ -1,17 +1,12 @@
-# USER.md - About Your Creator
+# User Context
 
-_Learn about the person you're helping. Update this as you go._
+Use this file for optional user preferences and project context.
 
-- **Name:** {{USER_NAME}}
-- **What to call them:** {{USER_NICKNAME}}
-- **Pronouns:**
-- **Timezone:**
-- **Notes:**
+- Preferred name:
+- Pronouns:
+- Timezone:
+- Communication preferences:
+- Current projects:
+- Notes:
 
-## Context
-
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
-
----
-
-The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.
+Do not store secrets, credentials, private keys, or sensitive personal data here.
