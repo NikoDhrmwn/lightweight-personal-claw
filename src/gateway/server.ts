@@ -13,6 +13,7 @@ import { join, dirname, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager, buildWebUIConfirmation } from '../core/confirmation.js';
+import { mcpManager } from '../core/mcp.js';
 import { MemoryStore } from '../core/memory.js';
 import { getConfig, getConfigPath, getStateDir, loadConfig, reloadConfig, saveConfig, type LiteClawConfig } from '../config.js';
 import { createLogger } from '../logger.js';
@@ -244,6 +245,7 @@ export class GatewayServer {
         saveConfig(next);
         reloadConfig();
         await this.engine.getLLMClient().refreshProvidersAsync();
+        await mcpManager.reloadFromConfig(getConfig());
         const payload = this.getEditableConfig();
         this.broadcast({ type: 'config_reloaded', config: payload, health: this.getWebUIState() });
         res.json({ success: true, config: payload });
@@ -371,6 +373,10 @@ export class GatewayServer {
               : 'awaiting_login',
         },
       },
+      mcp: {
+        enabled: config.mcp?.enabled !== false && config.tools?.mcp?.enabled !== false,
+        servers: mcpManager.getStatus(),
+      },
       config: this.getEditableConfig(),
     };
   }
@@ -476,6 +482,10 @@ export class GatewayServer {
         vision: {
           enabled: config.tools?.vision?.enabled ?? true,
           maxDimensionPx: config.tools?.vision?.maxDimensionPx ?? 1024,
+        },
+        mcp: {
+          enabled: config.tools?.mcp?.enabled ?? config.mcp?.enabled ?? true,
+          servers: mcpManager.getStatus(),
         },
       },
       gateway: {
@@ -726,6 +736,9 @@ export class GatewayServer {
           this.engine.getLLMClient().refreshProvidersAsync().catch(err => {
             log.error({ error: err.message }, 'Failed to refresh LLM providers after file change');
           });
+          mcpManager.reloadFromConfig(getConfig()).catch(err => {
+            log.error({ error: err.message }, 'Failed to refresh MCP servers after file change');
+          });
           const payload = this.getEditableConfig();
           log.info({ path }, 'Reloaded config after file change');
           this.broadcast({
@@ -872,6 +885,15 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
       if (patch.tools.vision.enabled !== undefined) next.tools.vision.enabled = !!patch.tools.vision.enabled;
       if (patch.tools.vision.maxDimensionPx !== undefined) next.tools.vision.maxDimensionPx = Number(patch.tools.vision.maxDimensionPx);
     }
+    if (patch.tools.mcp) {
+      next.tools.mcp ??= {};
+      if (patch.tools.mcp.enabled !== undefined) next.tools.mcp.enabled = !!patch.tools.mcp.enabled;
+    }
+  }
+
+  if (patch.mcp) {
+    next.mcp ??= {};
+    if (patch.mcp.enabled !== undefined) next.mcp.enabled = !!patch.mcp.enabled;
   }
 
   if (patch.gateway) {

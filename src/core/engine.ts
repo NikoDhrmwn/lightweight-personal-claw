@@ -28,6 +28,7 @@ import { ConfirmationManager } from './confirmation.js';
 import { getConfig, loadSystemPrompt } from '../config.js';
 import { createLogger } from '../logger.js';
 import { toolRegistry, ToolContext, ToolDefinition, ToolResult } from './tools.js';
+import { mcpManager } from './mcp.js';
 import { WEBUI_FORMATTING_RULES } from './webui_format.js';
 
 const log = createLogger('engine');
@@ -479,6 +480,11 @@ export class AgentEngine extends EventEmitter {
     // Inject WebUI-specific formatting rules if the request is coming from the WebUI
     if (request.channelType === 'webui') {
       systemPrompt += `\n\n${WEBUI_FORMATTING_RULES}`;
+    }
+
+    const mcpInstructions = mcpManager.getPromptAppendix();
+    if (mcpInstructions) {
+      systemPrompt += `\n\n# MCP Integrations\n${mcpInstructions}`;
     }
 
     const activeSkills = config.agent?.skills?.enabled === false

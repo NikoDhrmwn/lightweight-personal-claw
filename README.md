@@ -11,6 +11,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+
+#### Added
+
+- **First-Class MCP Support**: LiteClaw can now connect to MCP servers over `stdio` and remote HTTP, expose MCP tools directly to the agent, and access MCP resources/prompts through built-in utility tools.
+- **GitHub MCP Preset**: Added `liteclaw mcp add github` and `liteclaw mcp login github` for quick setup of GitHub's remote MCP server using a token stored in the LiteClaw state `.env`.
+- **MCP Health & Reloading**: Gateway status now reports MCP server health, and MCP connections are reloaded automatically when config or `.env` changes.
+
 ### [0.8.1] - 2026-05-04
 
 #### Fixed
@@ -45,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multi-Channel**: Native support for WebUI, Discord, and WhatsApp.
 - **Discord DnD Sessions**: New slash-command workflow for multiplayer session threads, persistent player rosters, join/resume flows, partial-party resumes, and vote-based turn skipping.
 - **Core Tools**: Filesystem access, command execution, web search/fetch, and native vision.
+- **MCP Integrations**: Connect external MCP servers and expose their tools, prompts, and resources to the agent.
 - **Safety First**: Cross-channel confirmations for destructive or sensitive actions.
 - **Skills System**: Project-level skills support with selective prompt injection.
 
@@ -157,6 +166,7 @@ Example values:
 DISCORD_TOKEN=
 GOOGLE_API_KEY=
 GATEWAY_TOKEN=
+GITHUB_PERSONAL_ACCESS_TOKEN=
 LLM_BASE_URL=http://localhost:8080/v1
 LLM_API_KEY=sk-local
 LLM_MODEL=gemma-4-e4b-heretic
@@ -203,10 +213,38 @@ Useful terminal commands:
 
 ```bash
 npx tsx src/cli.ts doctor
+npx tsx src/cli.ts mcp list
+npx tsx src/cli.ts mcp add github
 npx tsx src/cli.ts status
 npx tsx src/cli.ts channels status
 npx tsx src/cli.ts message "hello"
 ```
+
+## MCP Setup
+
+LiteClaw 0.8.2 adds native MCP client support. MCP tools are discovered at startup and injected into the agent like built-in tools, while MCP prompts and resources are available through `mcp_*` utility tools.
+
+### Quick GitHub setup
+
+```bash
+liteclaw mcp add github
+liteclaw mcp login github
+liteclaw mcp doctor
+```
+
+The GitHub preset uses the official remote GitHub MCP endpoint:
+
+```text
+https://api.githubcopilot.com/mcp/
+```
+
+Credentials are stored in your LiteClaw state `.env` as:
+
+```env
+GITHUB_PERSONAL_ACCESS_TOKEN=...
+```
+
+After setup, GitHub MCP tools will appear to the agent with a `github_` prefix, making tasks like pull requests, issue work, and repository review available through the normal tool-calling flow.
 
 ## Migrating From OpenClaw
 
@@ -252,6 +290,9 @@ liteclaw channels login --channel whatsapp
 liteclaw channels status
 liteclaw status
 liteclaw doctor
+liteclaw mcp list
+liteclaw mcp add github
+liteclaw mcp login github
 liteclaw prompts list
 liteclaw prompts doctor
 liteclaw prompts edit system
@@ -269,6 +310,7 @@ Examples:
 ```bash
 npx tsx src/cli.ts channels login --channel discord
 npx tsx src/cli.ts channels login --channel whatsapp
+npx tsx src/cli.ts mcp doctor
 npx tsx src/cli.ts config get gateway.port
 npx tsx src/cli.ts models list
 ```

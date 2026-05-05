@@ -15,6 +15,20 @@ const log = createLogger('config');
 
 // ─── Types ───────────────────────────────────────────────────────────
 
+export interface MCPServerConfig {
+  enabled?: boolean;
+  transport?: 'stdio' | 'http';
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  includeTools?: string[];
+  excludeTools?: string[];
+  prefixToolNames?: boolean;
+}
+
 export interface LiteClawConfig {
   meta?: { version?: string };
   llm?: {
@@ -77,6 +91,11 @@ export interface LiteClawConfig {
     web?: Record<string, any>;
     filesystem?: Record<string, any>;
     vision?: Record<string, any>;
+    mcp?: Record<string, any>;
+  };
+  mcp?: {
+    enabled?: boolean;
+    servers?: Record<string, MCPServerConfig>;
   };
   gateway?: {
     port?: number;
@@ -216,6 +235,11 @@ export function getDefaultConfig(): LiteClawConfig {
       },
       filesystem: { enabled: true, confirmDelete: true },
       vision: { enabled: true, maxDimensionPx: 1024 },
+      mcp: { enabled: true },
+    },
+    mcp: {
+      enabled: true,
+      servers: {},
     },
     gateway: {
       port: 7860,

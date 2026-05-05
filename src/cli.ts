@@ -15,9 +15,10 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { loadConfig, getConfig, getStateDir, saveConfig, getDefaultConfig, type LiteClawConfig } from './config.js';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { spawnSync } from 'child_process';
+import { mcpManager } from './core/mcp.js';
 import {
   tuiSelect, tuiConfirm, tuiInput, tuiNumber,
   printBanner, printSection, printSuccess, printInfo,
@@ -196,6 +197,140 @@ channels
   });
 
 // ─── Prompt Commands ─────────────────────────────────────────────────
+
+const mcp = program
+  .command('mcp')
+  .description('Manage MCP servers and credentials');
+
+mcp
+  .command('list')
+  .description('List configured MCP servers')
+  .action(async () => {
+    await mcpManager.reloadFromConfig(getConfig());
+    const servers = mcpManager.getStatus();
+    console.log(chalk.bold('\nMCP Servers:\n'));
+    if (servers.length === 0) {
+      console.log(chalk.gray('  No MCP servers configured.'));
+      console.log();
+      return;
+    }
+    for (const server of servers) {
+      const status = server.status === 'connected'
+        ? chalk.green('● connected')
+        : chalk.yellow('○ unavailable');
+      console.log(`  ${status}  ${chalk.bold(server.id)} (${server.transport})`);
+      console.log(chalk.gray(`    Tools: ${server.toolCount}  Resources: ${server.resourceCount}  Prompts: ${server.promptCount}`));
+      if (server.error) console.log(chalk.gray(`    Error: ${server.error}`));
+    }
+    console.log();
+    await mcpManager.closeAll();
+  });
+
+mcp
+  .command('doctor')
+  .description('Validate MCP configuration and try connecting to each enabled server')
+  .action(async () => {
+    console.log(chalk.bold('\nLiteClaw MCP Doctor\n'));
+    await mcpManager.reloadFromConfig(getConfig());
+    const servers = mcpManager.getStatus();
+    if (servers.length === 0) {
+      console.log(chalk.gray('  No MCP servers configured.'));
+      console.log(chalk.gray('  Add GitHub quickly with: liteclaw mcp add github'));
+      console.log();
+      return;
+    }
+    for (const server of servers) {
+      if (server.status === 'connected') {
+        console.log(chalk.green(`  ✓ ${server.id} connected (${server.toolCount} tools)`));
+      } else {
+        console.log(chalk.yellow(`  ⚠ ${server.id} unavailable: ${server.error ?? 'unknown error'}`));
+      }
+    }
+    console.log();
+    await mcpManager.closeAll();
+  });
+
+mcp
+  .command('add <preset>')
+  .description('Add a built-in MCP preset (currently: github)')
+  .option('--token <token>', 'GitHub personal access token')
+  .action(async (preset: string, options) => {
+    if (String(preset).toLowerCase() !== 'github') {
+      console.log(chalk.red('Unknown MCP preset. Supported presets: github'));
+      process.exitCode = 1;
+      return;
+    }
+
+    const config = getConfig();
+    config.tools ??= {};
+    config.tools.mcp ??= {};
+    config.tools.mcp.enabled = true;
+    config.mcp ??= { enabled: true, servers: {} };
+    config.mcp.enabled = true;
+    config.mcp.servers ??= {};
+    config.mcp.servers.github = {
+      enabled: true,
+      transport: 'http',
+      url: 'https://api.githubcopilot.com/mcp/',
+      headers: {
+        Authorization: 'Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}',
+      },
+      prefixToolNames: true,
+    };
+    saveConfig(config);
+
+    const token = options.token || await tuiInput({
+      message: 'GitHub personal access token (leave blank to configure later)',
+      default: '',
+    });
+    if (token) {
+      upsertStateEnvValue('GITHUB_PERSONAL_ACCESS_TOKEN', token);
+      console.log(chalk.green('✓ Saved GITHUB_PERSONAL_ACCESS_TOKEN to your LiteClaw state .env'));
+    }
+
+    console.log(chalk.green('\n✓ Added GitHub MCP preset'));
+    console.log(chalk.gray('  Server: https://api.githubcopilot.com/mcp/'));
+    console.log(chalk.gray('  Tool names will be exposed with the github_ prefix.'));
+    if (!token) {
+      console.log(chalk.gray('  Next: liteclaw mcp login github'));
+      console.log(chalk.gray('  Or add GITHUB_PERSONAL_ACCESS_TOKEN to ~/.liteclaw/.env'));
+    }
+  });
+
+mcp
+  .command('login <server>')
+  .description('Save credentials for an MCP server')
+  .option('--token <token>', 'Access token to store')
+  .action(async (server: string, options) => {
+    if (String(server).toLowerCase() !== 'github') {
+      console.log(chalk.red('Login is currently implemented for: github'));
+      process.exitCode = 1;
+      return;
+    }
+
+    const token = options.token || await tuiInput({
+      message: 'GitHub personal access token',
+      default: '',
+      validate: (value) => value.trim().length > 0 || 'Token is required',
+    });
+    upsertStateEnvValue('GITHUB_PERSONAL_ACCESS_TOKEN', token);
+    console.log(chalk.green('✓ Saved GitHub token to your LiteClaw state .env'));
+    console.log(chalk.gray('  Run: liteclaw mcp doctor'));
+  });
+
+mcp
+  .command('remove <server>')
+  .description('Remove an MCP server from config')
+  .action((server: string) => {
+    const config = getConfig();
+    if (!config.mcp?.servers?.[server]) {
+      console.log(chalk.yellow(`No MCP server named "${server}" is configured.`));
+      return;
+    }
+    delete config.mcp.servers[server];
+    saveConfig(config);
+    console.log(chalk.green(`✓ Removed MCP server "${server}"`));
+  });
 
 const prompts = program
   .command('prompts')
@@ -550,7 +685,8 @@ program
 
     console.log(chalk.gray('  1. Edit ~/.liteclaw/config.yaml'));
     console.log(chalk.gray('  2. Create ~/.liteclaw/.env with your secrets'));
-    console.log(chalk.gray('  3. Run: liteclaw gateway run'));
+    console.log(chalk.gray('  3. Optional: liteclaw mcp add github'));
+    console.log(chalk.gray('  4. Run: liteclaw gateway run'));
   });
 
 program
@@ -574,6 +710,23 @@ function setNestedValue(obj: any, path: string, value: any): void {
     return o[k];
   }, obj);
   target[last] = value;
+}
+
+function getStateEnvPath(): string {
+  const stateDir = getStateDir();
+  if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true });
+  return join(stateDir, '.env');
+}
+
+function upsertStateEnvValue(key: string, value: string): void {
+  const envPath = getStateEnvPath();
+  const existing = existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '';
+  const line = `${key}=${value}`;
+  const pattern = new RegExp(`^${key}=.*$`, 'm');
+  const next = pattern.test(existing)
+    ? existing.replace(pattern, line)
+    : `${existing.trimEnd()}${existing.trimEnd() ? '\n' : ''}${line}\n`;
+  writeFileSync(envPath, next, 'utf-8');
 }
 
 // ─── Parse & Execute ─────────────────────────────────────────────────
@@ -795,6 +948,7 @@ async function runInteractiveSetup(): Promise<void> {
     '',
     'Next steps:',
     '  liteclaw prompts doctor   Check prompts for issues',
+    '  liteclaw mcp add github   Connect GitHub MCP',
     '  liteclaw doctor           Verify connectivity',
     '  liteclaw gateway run      Start the agent',
   ]);

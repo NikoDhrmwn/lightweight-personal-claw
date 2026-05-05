@@ -33,8 +33,10 @@ export interface InteractiveChoiceRequest {
 export interface ToolDefinition {
   name: string;
   description: string;
-  category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility';
+  category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility' | 'mcp';
   parameters: ToolParameter[];
+  /** Optional raw JSON schema for tools that don't fit LiteClaw's flat parameter shape */
+  inputSchema?: Record<string, any>;
   /** Compact retrieval-friendly guidance for weaker models */
   usageNotes?: string[];
   /** Short examples that can be surfaced when relevant */
@@ -84,6 +86,7 @@ const CATEGORY_CONFIG_KEY: Record<string, string> = {
   vision: 'vision',
   channel: 'filesystem', // channel tools (send_file) follow filesystem enablement
   utility: 'exec',       // utility tools follow exec enablement
+  mcp: 'mcp',
 };
 
 function isToolCategoryEnabled(category: string): boolean {
@@ -107,6 +110,10 @@ class ToolRegistry {
 
   get(name: string): ToolDefinition | undefined {
     return this.tools.get(name);
+  }
+
+  unregister(name: string): void {
+    this.tools.delete(name);
   }
 
   getAll(): ToolDefinition[] {
@@ -248,7 +255,7 @@ class ToolRegistry {
       function: {
         name: tool.name,
         description: tool.description,
-        parameters: {
+        parameters: tool.inputSchema ?? {
           type: 'object',
           properties: Object.fromEntries(
             tool.parameters.map(p => [
