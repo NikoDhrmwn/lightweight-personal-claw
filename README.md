@@ -11,50 +11,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-
+### [0.8.3] - 2026-05-06
 
 #### Added
 
-- **First-Class MCP Support**: LiteClaw can now connect to MCP servers over `stdio` and remote HTTP, expose MCP tools directly to the agent, and access MCP resources/prompts through built-in utility tools.
-- **GitHub MCP Preset**: Added `liteclaw mcp add github` and `liteclaw mcp login github` for quick setup of GitHub's remote MCP server using a token stored in the LiteClaw state `.env`.
-- **MCP Health & Reloading**: Gateway status now reports MCP server health, and MCP connections are reloaded automatically when config or `.env` changes.
+- **WebUI Onboarding**: Added a first-time initialization modal to allow users to name their agent.
+- **Media Unfurling**: Native support for scraping and downloading media from URLs to ensure high-quality GIF and image previews in Discord.
+
+#### Changed
+
+- **Centralized Progress System**: Refactored Discord and WhatsApp channels to use a unified progress and status reporting system.
+- **Percentage-Based Compaction**: Replaced absolute token thresholds with percentage-based `softThresholdPct` for more resilient context management.
+- **D&D Session Polish**: Refined Discord embeds for a more compact and consistent visual style across all DnD commands.
 
 ### [0.8.2] - 2026-05-05
 
 #### Added
 
 - **Model Context Protocol (MCP)**: Native client support for MCP servers.
-    - Automated tool discovery and registration from MCP servers.
-    - Added `mcp_list`, `mcp_get_resource`, and `mcp_call_tool` utilities.
-    - Integrated MCP session management into the core engine.
-    - Support for GitHub MCP via Copilot API.
-
-### [0.8.1] - 2026-05-04
-
-#### Fixed
-
-- **Gemini Tool Calling**: Resolved issues where Gemini models would fail or behave inconsistently during tool interactions.
-    - Ensured the `name` field is explicitly included in tool result messages for native Google API compatibility.
-    - Implemented tool result content normalization to strip internal `<tool_result>` envelopes and recovery/system nudges before sending to the model.
-    - Improved tool call deduplication by including `extra_content` (parameters not in the core function schema) in the deduplication signature.
-
-### [0.8.0] - 2026-04-29
-
-#### Added
-
-- **Gateway Auth Hardening**: Mandated Bearer tokens on all `/api/*` routes when bound to non-loopback interfaces.
-- **Resource Limits**: Implemented 10-file and 20MB attachment limits per request in the WebUI gateway.
-- **Extraction Timeouts**: Added a 30-second processing timeout and 500,000-character extraction cap to document ingestion.
-- **Structured Exec Mode**: Refactored the `exec` tool to use `bin` and `args` parameters by default instead of vulnerable shell strings.
-- **Tool Enforcement**: Implemented granular enablement checks to prevent disabled tool categories from being accessed or lazy-loaded.
-
-### [0.7.2] - 2026-04-29
-
-#### Added
-
-- **Workspace Path Safety**: Implemented a centralized `workspace.ts` path resolver with absolute path opt-in and path traversal (`../`) blocking to contain execution within the project root.
-- **Tool Path Validation**: All filesystem operations (`read_file`, `write_file`, etc.) and `exec` cwd arguments now enforce secure workspace containment.
-
+  - Automated tool discovery and registration from MCP servers.
+  - Added `mcp_list`, `mcp_get_resource`, and `mcp_call_tool` utilities.
+  - Integrated MCP session management into the core engine.
+  - Support for GitHub MCP via Copilot API.
 
 ## Features
 
@@ -232,7 +210,7 @@ npx tsx src/cli.ts message "hello"
 
 ## MCP Setup
 
-LiteClaw 0.8.2 adds native MCP client support. MCP tools are discovered at startup and injected into the agent like built-in tools, while MCP prompts and resources are available through `mcp_*` utility tools.
+LiteClaw 0.8.3 adds native MCP client support. MCP tools are discovered at startup and injected into the agent like built-in tools, while MCP prompts and resources are available through `mcp_*` utility tools.
 
 ### Quick GitHub setup
 

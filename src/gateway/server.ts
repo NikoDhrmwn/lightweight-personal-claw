@@ -368,7 +368,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.8.2',
+      version: '0.8.3',
       name: config.agent?.name ?? 'LiteClaw',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
@@ -445,7 +445,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.8.2',
+        version: config.meta?.version ?? '0.8.3',
       },
       paths: {
         stateDir: getStateDir(),

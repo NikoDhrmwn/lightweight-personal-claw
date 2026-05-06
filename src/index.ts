@@ -31,7 +31,7 @@ import './tools/vision.js';
 import './tools/channel.js';
 import './tools/mcp.js';
 
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 const log = createLogger('main');
 
 export async function startGateway(portOverride?: number): Promise<void> {
