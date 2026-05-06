@@ -59,6 +59,7 @@ export interface LiteClawConfig {
     compaction?: {
       mode?: string;
       softThresholdTokens?: number;
+      softThresholdPct?: number;
     };
     planner?: {
       enabled?: boolean;
@@ -201,7 +202,7 @@ export function getDefaultConfig(): LiteClawConfig {
       thinkingDefault: 'medium',
       compaction: {
         mode: 'safeguard',
-        softThresholdTokens: 48000,
+        softThresholdPct: 90,
       },
       planner: {
         enabled: true,
@@ -287,12 +288,13 @@ export function loadSystemPrompt(): string {
   }
 
   if (!basePrompt) {
-    basePrompt = `You are LiteClaw, a helpful AI assistant running locally. Be concise and helpful.`;
+    basePrompt = `You are {{BOT_NAME}}, a helpful AI assistant running locally. Be concise and helpful.`;
   }
 
   // ── Inject dynamic values ──
   basePrompt = basePrompt.replace(/\{\{DATE\}\}/g, new Date().toLocaleDateString());
   basePrompt = basePrompt.replace(/\{\{STATE_DIR\}\}/g, stateDir.replace(/\\/g, '/'));
+  basePrompt = basePrompt.replace(/\{\{BOT_NAME\}\}/g, config.agent?.name ?? 'LiteClaw');
 
   // ── Load personality files ──
   const PERSONALITY_FILES = [

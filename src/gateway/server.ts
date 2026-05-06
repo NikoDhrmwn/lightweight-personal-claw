@@ -13,6 +13,7 @@ import { join, dirname, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager, buildWebUIConfirmation } from '../core/confirmation.js';
+import { resolveContextThresholds } from '../core/context.js';
 import { mcpManager } from '../core/mcp.js';
 import { MemoryStore } from '../core/memory.js';
 import { getConfig, getConfigPath, getStateDir, loadConfig, reloadConfig, saveConfig, type LiteClawConfig } from '../config.js';
@@ -151,7 +152,19 @@ export class GatewayServer {
         const memory = new MemoryStore();
         const metrics = memory.getSessionMetrics(req.params.sessionKey);
         memory.close();
-        res.json(metrics);
+        const thresholds = resolveContextThresholds();
+        const progressPct = thresholds.softThresholdTokens > 0
+          ? Math.round((metrics.estimatedTokens / thresholds.softThresholdTokens) * 100)
+          : 0;
+        res.json({
+          ...metrics,
+          contextMaxTokens: thresholds.maxContextTokens,
+          contextBudgetPct: thresholds.budgetPct,
+          contextBudgetTokens: thresholds.budgetTokens,
+          compactionThresholdPct: thresholds.compactionPct,
+          compactionThresholdTokens: thresholds.softThresholdTokens,
+          compactionProgressPct: progressPct,
+        });
       } catch (err: any) {
         res.status(500).json({ error: err.message });
       }
@@ -217,6 +230,22 @@ export class GatewayServer {
           }
         }
         res.json({ response: fullResponse });
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // REST API: unfurl URL
+    this.app.get('/api/unfurl', async (req, res) => {
+      try {
+        const { unfurlUrl } = await import('../channels/utils.js');
+        const url = String(req.query.url || '');
+        if (!url) {
+          res.status(400).json({ error: 'url query is required' });
+          return;
+        }
+        const mediaUrl = await unfurlUrl(url);
+        res.json({ mediaUrl });
       } catch (err: any) {
         res.status(500).json({ error: err.message });
       }
@@ -340,6 +369,7 @@ export class GatewayServer {
     return {
       status: 'ok',
       version: '0.8.2',
+      name: config.agent?.name ?? 'LiteClaw',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
       uptime: process.uptime(),
@@ -437,12 +467,18 @@ export class GatewayServer {
         availableModels,
       },
       agent: {
+        name: config.agent?.name ?? 'LiteClaw',
         workspace: this.resolveWorkspace(),
         maxTurns: config.agent?.maxTurns ?? 20,
         toolLoading: config.agent?.toolLoading ?? 'lazy',
         thinkingDefault: config.agent?.thinkingDefault ?? 'medium',
         contextTokens: config.agent?.contextTokens ?? 64000,
         contextBudgetPct: config.agent?.contextBudgetPct ?? 80,
+        compaction: {
+          mode: config.agent?.compaction?.mode ?? 'safeguard',
+          softThresholdPct: config.agent?.compaction?.softThresholdPct ?? 90,
+          softThresholdTokens: resolveContextThresholds().softThresholdTokens,
+        },
         planner: {
           enabled: config.agent?.planner?.enabled ?? true,
           mode: config.agent?.planner?.mode ?? 'auto',
@@ -765,15 +801,22 @@ export class GatewayServer {
 
     return new Promise((resolve) => {
       this.server.listen(port, bind, () => {
-        log.info({ port, bind }, 'Gateway server listening');
+        log.info({ port, bind }, 'Gateway server started');
         resolve();
       });
     });
   }
 
-  stop(): void {
-    this.server.close();
-    this.wss.close();
+  async stop(): Promise<void> {
+    return new Promise((resolve) => {
+      this.server.close(() => {
+        log.info('Gateway server stopped');
+        resolve();
+      });
+    });
+  }
+
+  dispose(): void {
     for (const path of this.watchedFiles) {
       unwatchFile(path);
     }
@@ -797,10 +840,22 @@ export class GatewayServer {
     const memory = new MemoryStore();
     const metrics = memory.getSessionMetrics(sessionKey);
     memory.close();
+    const thresholds = resolveContextThresholds();
+    const progressPct = thresholds.softThresholdTokens > 0
+      ? Math.round((metrics.estimatedTokens / thresholds.softThresholdTokens) * 100)
+      : 0;
     return {
       type: 'session_metrics',
       sessionKey,
-      metrics,
+      metrics: {
+        ...metrics,
+        contextMaxTokens: thresholds.maxContextTokens,
+        contextBudgetPct: thresholds.budgetPct,
+        contextBudgetTokens: thresholds.budgetTokens,
+        compactionThresholdPct: thresholds.compactionPct,
+        compactionThresholdTokens: thresholds.softThresholdTokens,
+        compactionProgressPct: progressPct,
+      },
     };
   }
 }
@@ -820,12 +875,21 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
 
   if (patch.agent) {
     next.agent ??= {};
+    if (patch.agent.name !== undefined) next.agent.name = String(patch.agent.name || '').trim();
     if (patch.agent.workspace !== undefined) next.agent.workspace = String(patch.agent.workspace || '').trim();
     if (patch.agent.maxTurns !== undefined) next.agent.maxTurns = Number(patch.agent.maxTurns);
     if (patch.agent.toolLoading !== undefined) next.agent.toolLoading = patch.agent.toolLoading === 'all' ? 'all' : 'lazy';
     if (patch.agent.thinkingDefault !== undefined) next.agent.thinkingDefault = String(patch.agent.thinkingDefault);
     if (patch.agent.contextTokens !== undefined) next.agent.contextTokens = Number(patch.agent.contextTokens);
     if (patch.agent.contextBudgetPct !== undefined) next.agent.contextBudgetPct = Number(patch.agent.contextBudgetPct);
+    if (patch.agent.compaction) {
+      next.agent.compaction ??= {};
+      if (patch.agent.compaction.mode !== undefined) next.agent.compaction.mode = String(patch.agent.compaction.mode);
+      if (patch.agent.compaction.softThresholdPct !== undefined) {
+        next.agent.compaction.softThresholdPct = Number(patch.agent.compaction.softThresholdPct);
+        delete next.agent.compaction.softThresholdTokens;
+      }
+    }
     if (patch.agent.planner) {
       next.agent.planner ??= {};
       if (patch.agent.planner.enabled !== undefined) next.agent.planner.enabled = !!patch.agent.planner.enabled;
@@ -908,6 +972,10 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
 
   if (next.agent?.contextBudgetPct && (next.agent.contextBudgetPct < 1 || next.agent.contextBudgetPct > 100)) {
     throw new Error('agent.contextBudgetPct must be between 1 and 100');
+  }
+
+  if (next.agent?.compaction?.softThresholdPct && (next.agent.compaction.softThresholdPct < 1 || next.agent.compaction.softThresholdPct > 100)) {
+    throw new Error('agent.compaction.softThresholdPct must be between 1 and 100');
   }
 
   return next;

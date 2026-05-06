@@ -126,6 +126,12 @@ export async function migrateFromOpenClaw(openclawDir: string): Promise<void> {
     },
   };
 
+  const migratedThreshold = Number(oc.agents?.defaults?.compaction?.memoryFlush?.softThresholdTokens ?? 0);
+  const migratedBudgetTokens = Math.floor((config.agent?.contextTokens ?? 64000) * ((config.agent?.contextBudgetPct ?? 80) / 100));
+  if (migratedThreshold > 0 && migratedBudgetTokens > 0) {
+    config.agent!.compaction!.softThresholdPct = Math.max(1, Math.min(100, Math.round((migratedThreshold / migratedBudgetTokens) * 100)));
+  }
+
   // ─── Map model providers ──────────────────────────────────────
   if (oc.models?.providers) {
     for (const [provId, prov] of Object.entries(oc.models.providers)) {
@@ -363,7 +369,7 @@ You are **Molty**, an AI agent running locally via LiteClaw.
 ## Runtime
 
 - **Engine:** LiteClaw v0.1 (Node.js, single-process)
-- **Model:** Gemma 4 E4B (local, 64K context)
+- **Model:** {{MODEL}}
 - **Channels:** WebUI, Discord (slash commands + reactions + dynamic status), WhatsApp
 - **Tools:** read_file, write_file, delete_file, list_dir, send_file, exec, web_search, web_fetch
 - **Vision:** Images are provided natively in the message content. Inspect them directly.
