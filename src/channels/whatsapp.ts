@@ -19,12 +19,23 @@ import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { join, basename, extname } from 'path';
 import { lookup } from 'mime-types';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
-import { ConfirmationManager } from '../core/confirmation.js';
+import { buildWhatsAppConfirmation, ConfirmationManager } from '../core/confirmation.js';
 import { getConfig, getStateDir } from '../config.js';
 import { createLogger, createSilentLogger } from '../logger.js';
 import { printStepDone, printStepWarn, printStepError } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
-import { sanitizeChannelContent, splitMessage, formatForWhatsApp } from './utils.js';
+import {
+  applyEventToChannelProgress,
+  buildOutgoingMessages,
+  createChannelProgressState,
+  formatDurationShort,
+  formatProgressPreview,
+  formatProgressStatusLabel,
+  formatTaskStatusIcon,
+  getProgressCounts,
+  type ChannelProgressState,
+} from './progress.js';
+import { unfurlUrl, downloadUnfurledMedia } from './utils.js';
 
 const log = createLogger('whatsapp');
 const baileysLog = createSilentLogger('baileys');
@@ -35,17 +46,7 @@ interface MentionTarget {
   aliases: string[];
 }
 
-interface WhatsAppProgressState {
-  startedAt: number;
-  status: 'starting' | 'thinking' | 'planning' | 'working' | 'done' | 'error';
-  planSummary?: string;
-  tasks: Array<{
-    id: string;
-    title: string;
-    status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked' | 'skipped';
-    summary?: string;
-  }>;
-  recentTools: string[];
+interface WhatsAppProgressState extends ChannelProgressState {
   currentTaskLabel?: string;
   error?: string;
   messageKey?: any;
@@ -343,12 +344,7 @@ export class WhatsAppChannel {
     let progress: WhatsAppProgressState | undefined;
 
     if (showProgress) {
-      progress = {
-        startedAt: Date.now(),
-        status: 'starting',
-        tasks: [],
-        recentTools: [],
-      };
+      progress = createWhatsAppProgressState();
       this.progresses.set(sessionKey, progress);
     }
 
@@ -497,15 +493,52 @@ export class WhatsAppChannel {
   ): Promise<void> {
     if (!this.sock) return;
 
-    const messages = buildOutgoingMessages(
-      content,
-      toolUpdates,
-      {
-        replyStyle: this.config.replyStyle ?? 'single',
-        showToolProgress: this.config.showToolProgress ?? false,
-      },
-      4000
-    );
+    let finalContent = content;
+
+    // Extract and send URLs as media if they contain gifs/videos
+    const urls = content.match(/https?:\/\/[^\s<)\]]+/g);
+    if (urls) {
+      const uniqueUrls = [...new Set(urls)];
+      for (const url of uniqueUrls) {
+        try {
+          const mediaUrl = await unfurlUrl(url);
+          if (mediaUrl) {
+            const downloaded = await downloadUnfurledMedia(mediaUrl);
+            if (downloaded) {
+              const { buffer, mimeType } = downloaded;
+              let sentMedia = false;
+              if (mimeType.startsWith('image/')) {
+                await this.sendMessageWithRetry(jid, { image: buffer, mimetype: mimeType });
+                sentMedia = true;
+              } else if (mimeType.startsWith('video/')) {
+                await this.sendMessageWithRetry(jid, { video: buffer, mimetype: mimeType });
+                sentMedia = true;
+              }
+              
+              if (sentMedia) {
+                const esc = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                finalContent = finalContent.replace(new RegExp(`\\[[^\\]]*\\]\\(${esc}\\)`, 'g'), '');
+                finalContent = finalContent.replace(new RegExp(esc, 'g'), '');
+              }
+            }
+          }
+        } catch (e) {
+          log.warn({ url, error: String(e) }, 'Failed to unfurl/send media for WhatsApp');
+        }
+      }
+    }
+
+    finalContent = finalContent.trim();
+    if (!finalContent && toolUpdates.length === 0) {
+      return; // If the message was entirely a link/gif, don't send an empty text message
+    }
+
+    const messages = buildOutgoingMessages(finalContent, toolUpdates, {
+      replyStyle: this.config.replyStyle ?? 'single',
+      showToolProgress: this.config.showToolProgress ?? false,
+      maxLen: 4000,
+      format: 'whatsapp',
+    });
 
     for (const chunk of messages) {
       const resolved = resolveWhatsAppMentions(chunk, mentionTargets);
@@ -661,8 +694,9 @@ export class WhatsAppChannel {
 
       try {
         // Try interactive buttons first
+        const payload = buildWhatsAppConfirmation(conf);
         await this.sendMessageWithRetry(jid, {
-          text: `⚠️ *Confirmation Required*\n\n${conf.description}\n\n_Tool: \`${conf.toolName}\`_\n_Timeout: ${conf.timeoutMs / 1000}s_\n\nReply *yes* to confirm or *no* to cancel.`,
+          text: `${payload.text}\n\nReply *yes* to confirm or *no* to cancel.`,
         } as any);
 
         // Set up a temporary listener for the response
@@ -704,8 +738,6 @@ export class WhatsAppChannel {
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────
-
-// chunkText is replaced by splitMessage from utils.js
 
 function buildStructuredIncomingMessage(
   meta: {
@@ -855,146 +887,13 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function buildOutgoingMessages(
-  content: string,
-  toolUpdates: string[],
-  options: { replyStyle: 'single' | 'rapid'; showToolProgress: boolean },
-  maxLen: number
-): string[] {
-  const sanitized = sanitizeChannelContent(content).trim();
-  const cleanedContent = formatForWhatsApp(sanitized);
-  const toolSummary = options.showToolProgress && toolUpdates.length > 0
-    ? toolUpdates.join('\n').trim()
-    : '';
-
-  const fullText = [toolSummary, cleanedContent].filter(Boolean).join('\n\n').trim() || '(No response)';
-
-  if (options.replyStyle === 'rapid') {
-    return splitRapidMessages(fullText, maxLen);
-  }
-
-  return splitMessage(fullText, maxLen);
-}
-
-// sanitizeChannelContent is imported from utils.js
-
-function splitRapidMessages(text: string, maxLen: number): string[] {
-  const paragraphs = text
-    .split(/\n{2,}/)
-    .map(p => p.trim())
-    .filter(Boolean);
-
-  const bursts: string[] = [];
-
-  for (const paragraph of paragraphs) {
-    if (paragraph.length <= Math.min(maxLen, 500)) {
-      bursts.push(paragraph);
-      continue;
-    }
-
-    const pieces = paragraph
-      .split(/(?<=[.!?])\s+|\n/)
-      .map(p => p.trim())
-      .filter(Boolean);
-
-    let current = '';
-    for (const piece of pieces) {
-      const candidate = current ? `${current} ${piece}` : piece;
-      if (candidate.length > Math.min(maxLen, 500)) {
-        if (current) bursts.push(current);
-        if (piece.length > Math.min(maxLen, 500)) {
-          bursts.push(...splitMessage(piece, Math.min(maxLen, 500)));
-          current = '';
-        } else {
-          current = piece;
-        }
-      } else {
-        current = candidate;
-      }
-    }
-
-    if (current) bursts.push(current);
-  }
-
-  return bursts.length > 0 ? bursts : ['(No response)'];
-}
-
 function applyEventToWhatsAppProgress(progress: WhatsAppProgressState, event: AgentStreamEvent): void {
-  switch (event.type) {
-    case 'thinking':
-      if (progress.status === 'starting') progress.status = 'thinking';
-      break;
-    case 'plan':
-      progress.status = 'planning';
-      progress.planSummary = event.plan?.summary ?? progress.planSummary;
-      progress.tasks = (event.plan?.tasks ?? []).map((task, index) => ({
-        id: task.id || `task_${index + 1}`,
-        title: task.title || `Task ${index + 1}`,
-        status: task.status || 'pending',
-        summary: task.summary,
-      }));
-      break;
-    case 'task_update': {
-      progress.status = event.taskStatus === 'in_progress' ? 'working' : progress.status;
-      if (event.plan?.summary) progress.planSummary = event.plan.summary;
-
-      const taskId = event.taskId || event.taskTitle || `task_${event.taskIndex ?? progress.tasks.length + 1}`;
-      const title = event.taskTitle || 'Task';
-      const existing = progress.tasks.find((task) => task.id === taskId);
-      if (existing) {
-        existing.title = title;
-        existing.status = event.taskStatus || existing.status;
-        existing.summary = event.taskSummary || existing.summary;
-      } else {
-        progress.tasks.push({
-          id: taskId,
-          title,
-          status: event.taskStatus || 'pending',
-          summary: event.taskSummary,
-        });
-      }
-
-      if (event.taskIndex && event.taskTotal) {
-        progress.currentTaskLabel = `[${event.taskIndex}/${event.taskTotal}] ${title}`;
-      } else {
-        progress.currentTaskLabel = title;
-      }
-      break;
-    }
-    case 'tool_start':
-      progress.status = 'working';
-      pushRecentToolUpdate(progress, `⚙ _${event.toolName ?? 'tool'}_...`);
-      break;
-    case 'tool_result':
-      pushRecentToolUpdate(
-        progress,
-        `${event.toolResult?.success ? '✓' : '✗'} _${event.toolName ?? 'tool'}_`
-      );
-      break;
-    case 'error':
-      progress.status = 'error';
-      progress.error = event.error;
-      break;
-    case 'done':
-      if (progress.status !== 'error') progress.status = 'done';
-      break;
-  }
-}
-
-function pushRecentToolUpdate(progress: WhatsAppProgressState, text: string): void {
-  progress.recentTools.push(text);
-  if (progress.recentTools.length > 5) {
-    progress.recentTools = progress.recentTools.slice(-5);
-  }
+  applyEventToChannelProgress(progress, event, 'whatsapp');
 }
 
 function buildWhatsAppProgressMessage(progress: WhatsAppProgressState, finalContent?: string): string {
   const elapsedMs = Date.now() - progress.startedAt;
-  const completed = progress.tasks.filter((task) => task.status === 'completed').length;
-  const active = progress.tasks.filter((task) => task.status === 'in_progress').length;
-  const total = progress.tasks.length;
-  const pending = Math.max(0, total - completed - active);
-  const failed = progress.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
+  const { completed, active, total, pending, failed } = getProgressCounts(progress);
 
   const lines = [
     `*LiteClaw · ${whatsappProgressStatusLabel(progress.status).toUpperCase()}*`,
@@ -1032,42 +931,22 @@ function buildWhatsAppProgressMessage(progress: WhatsAppProgressState, finalCont
     if (progress.status === 'error') {
       lines.push('_Failed to complete task._');
     } else {
-      const sanitized = sanitizeChannelContent(finalContent || '');
-      const formatted = formatForWhatsApp(sanitized).slice(0, 500);
-      lines.push(formatted ? `${formatted}${formatted.length >= 500 ? '...' : ''}` : '_Response sent below._');
+      const preview = formatProgressPreview(finalContent, 'whatsapp', 500);
+      lines.push(preview || '_Response sent below._');
     }
   }
 
   return lines.join('\n');
 }
 
+function createWhatsAppProgressState(): WhatsAppProgressState {
+  return createChannelProgressState();
+}
+
 function whatsappProgressStatusLabel(status: WhatsAppProgressState['status']): string {
-  switch (status) {
-    case 'thinking': return '🧠 Thinking';
-    case 'planning': return '🗺 Planning';
-    case 'working': return '⚙ Working';
-    case 'done': return '✅ Complete';
-    case 'error': return '❌ Error';
-    case 'starting':
-    default:
-      return '👀 Starting';
-  }
+  return formatProgressStatusLabel(status, 'whatsapp');
 }
 
 function whatsappTaskStatusIcon(status: string): string {
-  switch (status) {
-    case 'completed': return '✅';
-    case 'in_progress': return '🟡';
-    case 'failed': return '❌';
-    case 'blocked': return '⚠';
-    case 'skipped': return '⏭';
-    default: return '⏳';
-  }
-}
-
-function formatDurationShort(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(totalSec / 60);
-  const seconds = totalSec % 60;
-  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+  return formatTaskStatusIcon(status, 'whatsapp');
 }

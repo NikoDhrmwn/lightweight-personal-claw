@@ -86,10 +86,54 @@ export function formatForWhatsApp(text: string): string {
     // 7. Fix bullet points
     .replace(/^\s*[-*+]\s+/gm, '• ')
 
-    // 8. Strip GIF URLs (Tenor, Giphy) - WhatsApp doesn't embed these well
-    .replace(/https?:\/\/(?:www\.)?(?:tenor\.com\/view\/|giphy\.com\/gifs\/|gph\.is\/)\S+/gi, '')
-
-    // 9. Cleanup extra spaces
+    // 8. Cleanup extra spaces
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Attempts to unfurl a URL to find direct media links (og:image or og:video)
+ * using a Discordbot User-Agent to bypass some basic protections.
+ */
+export async function unfurlUrl(url: string): Promise<string | null> {
+  if (!url) return null;
+  // If it's already a direct media link, just return it
+  if (/\.(gif|mp4|webm|jpg|jpeg|png|webp)(\?.*)?$/i.test(url)) return url;
+
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' }
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    
+    // Check for og:video first, then og:image
+    const mVideo = text.match(/<meta[^>]*property=["']og:video(:url)?["'][^>]*content=["']([^"']+)["']/i) ||
+                   text.match(/<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:video(:url)?["']/i);
+    const mImage = text.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i) ||
+                   text.match(/<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:image["']/i);
+                   
+    return (mVideo ? mVideo[2] || mVideo[1] : null) || (mImage ? mImage[1] : null) || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Downloads media from a URL into a Buffer.
+ */
+export async function downloadUnfurledMedia(url: string): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' }
+    });
+    if (!res.ok) return null;
+    
+    const mimeType = res.headers.get('content-type') || 'application/octet-stream';
+    const arrayBuffer = await res.arrayBuffer();
+    return { buffer: Buffer.from(arrayBuffer), mimeType };
+  } catch (err) {
+    return null;
+  }
 }
