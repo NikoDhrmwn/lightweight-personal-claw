@@ -803,6 +803,8 @@ async function runInteractiveSetup(): Promise<void> {
   config.agent.workspace = await tuiInput({ message: 'Workspace path', default: config.agent.workspace ?? process.cwd() });
   config.agent.contextTokens = await tuiNumber({ message: 'Agent context tokens', default: Number(config.agent.contextTokens ?? contextWindow), min: 1024 });
   config.agent.contextBudgetPct = await tuiNumber({ message: 'Context budget %', default: Number(config.agent.contextBudgetPct ?? 80), min: 10, max: 100 });
+  config.agent.compaction ??= {};
+  config.agent.compaction.softThresholdPct = await tuiNumber({ message: 'Compaction threshold % of budget', default: Number(config.agent.compaction.softThresholdPct ?? 90), min: 1, max: 100 });
   config.agent.historyMessageLimit = await tuiNumber({ message: 'History message limit', default: Number(config.agent.historyMessageLimit ?? 20), min: 1 });
   config.agent.maxTurns = await tuiNumber({ message: 'Max tool turns per request', default: Number(config.agent.maxTurns ?? 20), min: 1 });
 

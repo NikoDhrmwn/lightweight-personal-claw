@@ -314,7 +314,7 @@ export function formatClassOption(cls: DndClassDef): string {
 
 /**
  * HP bar using Unicode block characters.
- * Example: "█████░░░░░ 50/100 HP"
+ * Example: "██████░░░░ 60/100 HP"
  */
 export function hpBar(current: number, maximum: number, width = 10): string {
   if (maximum <= 0) return `${'░'.repeat(width)} 0/0 HP ☠`;
@@ -364,10 +364,10 @@ export function formatConditions(conditions: string[]): string {
 }
 
 /**
- * Exhaustion display with bar.
+ * Exhaustion display with thin-line bar.
  */
 export function exhaustionDisplay(level: number): string {
   const labels = ['', 'Fatigued', 'Slowed', 'Struggling', 'Critical', 'Near Death', 'Dead'];
-  const bar = '▬'.repeat(level) + '▭'.repeat(6 - level);
-  return `Exhaustion ${bar} Lvl ${level} — ${labels[Math.min(level, 6)]}`;
+  const bar = '━'.repeat(level) + '┄'.repeat(6 - level);
+  return `Exhaustion \`${bar}\` ${level}/6 — ${labels[Math.min(level, 6)]}`;
 }

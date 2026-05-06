@@ -4464,37 +4464,22 @@ function buildOnboardingEmbed(summary: SessionSummary | DndSessionDetails, userI
   ].join('\n');
 
   const embed = new EmbedBuilder()
-    .setTitle(`Character Setup - ${session.title}`)
-    .setDescription(notice ?? 'Follow the guided setup below. Each step unlocks the next one so the flow stays clear from join to ready.')
-    .setColor(0x3498db)
+    .setAuthor({ name: `Character Setup · ${session.title}` })
+    .setDescription(notice ?? '*Follow the steps below. Each unlocks the next.*')
+    .setColor(0x3949AB)
     .addFields(
       { name: 'Progress', value: checklist, inline: false },
-      { name: 'Next Step', value: describeNextOnboardingStep(onboarding), inline: false },
-      {
-        name: 'Rolled Values',
-        value: onboarding.rolledStats.length === 6
-          ? onboarding.rolledStats.map(value => `\`${value}\``).join(', ')
-          : 'Not rolled yet.',
-        inline: false,
-      },
-      {
-        name: 'Selected Class',
-        value: classDef ? `${classDef.emoji} ${classDef.name}` : 'Choose your class first.',
-        inline: false,
-      },
-      {
-        name: 'Recommended Priority',
-        value: classDef ? formatRecommendedAbilityOrder(classDef) : 'Class choice unlocks the recommended stat order.',
-        inline: false,
-      },
+      { name: 'Next', value: describeNextOnboardingStep(onboarding), inline: false },
     );
 
+  if (classDef) {
+    embed.addFields({ name: 'Class', value: `${classDef.emoji} **${classDef.name}** · ${formatRecommendedAbilityOrder(classDef)}`, inline: false });
+  }
+  if (onboarding.rolledStats.length === 6) {
+    embed.addFields({ name: 'Rolled', value: onboarding.rolledStats.map(v => `\`${v}\``).join(' '), inline: false });
+  }
   if (sheet) {
-    embed.addFields({
-      name: 'Current Sheet Snapshot',
-      value: `**HP**: ${sheet.hp}/${sheet.maxHp}\n**AC**: ${sheet.ac}\n**Stats**: STR ${sheet.abilities.str}, DEX ${sheet.abilities.dex}, CON ${sheet.abilities.con}, INT ${sheet.abilities.int}, WIS ${sheet.abilities.wis}, CHA ${sheet.abilities.cha}`,
-      inline: false,
-    });
+    embed.addFields({ name: 'Sheet', value: `\`${hpBar(sheet.hp, sheet.maxHp, 8)}\` · AC ${sheet.ac}`, inline: false });
   }
 
   return embed;
@@ -4981,17 +4966,18 @@ function buildSessionEmbed(summary: SessionSummary | DndSessionDetails, descript
   const spotlight = activePlayerRecord(summary);
 
   const embed = new EmbedBuilder()
-    .setTitle(`LiteClaw DnD - ${session.title}`)
+    .setAuthor({ name: `LiteClaw DnD · ${session.title}` })
     .setDescription(description)
     .setColor(colorForPhase(session.phase))
     .addFields(
-      { name: 'Session', value: session.id, inline: true },
-      { name: 'Phase', value: session.phase.toUpperCase(), inline: true },
-      { name: 'Turn', value: `${session.roundNumber}.${session.turnNumber}`, inline: true },
-      { name: 'Active Player', value: activePlayerLabel(summary), inline: true },
-      { name: 'Tone', value: session.tone ?? 'Not set', inline: true },
-      { name: 'Combat', value: combat?.active ? `Round ${combat.round}` : 'Inactive', inline: true },
+      { name: 'Phase', value: `\`${session.phase.toUpperCase()}\``, inline: true },
+      { name: 'Turn', value: `\`${session.roundNumber}.${session.turnNumber}\``, inline: true },
+      { name: 'Spotlight', value: activePlayerLabel(summary), inline: true },
     );
+
+  if (combat?.active) {
+    embed.addFields({ name: 'Combat', value: `⚔️ Round ${combat.round}`, inline: true });
+  }
 
   if (session.phase === 'lobby') {
     const worldStatus = lobby
@@ -5003,31 +4989,31 @@ function buildSessionEmbed(summary: SessionSummary | DndSessionDetails, descript
     if (lobby) {
       const readyCount = lobby.readyPlayers.size;
       const totalCount = players.length;
+      const readyBar = totalCount > 0
+        ? `\`${'█'.repeat(readyCount)}${'░'.repeat(Math.max(0, totalCount - readyCount))}\` ${readyCount}/${totalCount}`
+        : '0/0';
+
       embed.addFields(
-        { name: 'Ready Status', value: `${readyCount}/${totalCount} players ready`, inline: true },
-        { name: 'World', value: lobby.worldLabel, inline: true },
-        { name: 'World Status', value: worldStatus, inline: true },
+        { name: 'Ready', value: readyBar, inline: true },
+        { name: 'World', value: `${lobby.worldLabel}\n${worldStatus}`, inline: true },
       );
 
       const playerList = players.map(p => {
-        let status = '⏳ Waiting';
-        if (lobby.readyPlayers.has(p.userId)) {
-          status = '✅ Ready';
-        } else if (!p.isHost && !isPlayerOnboardingComplete(p)) {
-          status = '🛠️ Creating Character';
-        }
-        return `${status} — **${p.characterName}** (@${p.userId})`;
-      }).join('\n');
+        let icon = '⏳';
+        if (lobby.readyPlayers.has(p.userId)) icon = '✅';
+        else if (!p.isHost && !isPlayerOnboardingComplete(p)) icon = '🛠️';
+        return `${icon} **${p.characterName}**`;
+      }).join(' · ');
 
-      embed.addFields({ name: 'Player Readiness', value: playerList || 'No players', inline: false });
+      embed.addFields({ name: 'Players', value: playerList || 'No players', inline: false });
     } else {
       embed.addFields(
-        { name: 'World Status', value: worldStatus, inline: true },
+        { name: 'World', value: worldStatus, inline: true },
         { name: 'Players', value: formatPlayers(players), inline: false }
       );
     }
   } else {
-    embed.addFields({ name: 'Players', value: formatPlayers(players), inline: false });
+    embed.addFields({ name: 'Party', value: formatPlayers(players), inline: false });
   }
 
   applyPlayerPortrait(
@@ -5039,6 +5025,7 @@ function buildSessionEmbed(summary: SessionSummary | DndSessionDetails, descript
         ? `Party Lead: ${players[0].characterName}`
         : null,
   );
+  embed.setFooter({ text: session.id });
   return embed.setTimestamp(new Date(session.updatedAt));
 }
 
@@ -5049,32 +5036,24 @@ function buildTurnTrackerEmbed(summary: SessionSummary | DndSessionDetails): Emb
   const spotlight = activePlayerRecord(summary);
   const party = players.map(player => {
     const sheet = parseCharacterSheet(player.characterSheetJson);
-    const status = player.userId === session.activePlayerUserId ? '->' : player.status === 'unavailable' ? 'ZZ' : 'OK';
-    const hp = `${sheet.hp}/${sheet.maxHp} HP`;
-    const cls = player.className ?? '?';
-    return `${status} **${player.characterName}** (${cls} Lv${sheet.level}) ${hp}`;
+    const arrow = player.userId === session.activePlayerUserId ? '▸' : player.status === 'unavailable' ? '–' : ' ';
+    return `\`${arrow}\` **${player.characterName}** \`${hpBar(sheet.hp, sheet.maxHp, 6)}\``;
   }).join('\n').slice(0, 1024) || 'No party members.';
 
-  const combatState = combat?.active
-    ? `Round ${combat.round} · ${combat.order[combat.turnIndex]?.characterName ?? 'Unknown'} acting`
-    : 'Inactive';
-
   const embed = new EmbedBuilder()
-    .setTitle('Turn Tracker')
-    .setColor(combat?.active ? 0xc0392b : 0x2e86ab)
+    .setAuthor({ name: `Turn Tracker · ${session.title}` })
+    .setColor(combat?.active ? 0xB71C1C : 0x3949AB)
     .setDescription(
       combat?.active
-        ? 'Track the board here while combat resolves.'
-        : `Outside combat, the spotlight currently belongs to **${spotlight?.characterName ?? activePlayerLabel(summary)}**.`,
+        ? `⚔️ **Combat** Round ${combat.round} · ${combat.order[combat.turnIndex]?.characterName ?? 'Unknown'} acting`
+        : `Spotlight: **${spotlight?.characterName ?? activePlayerLabel(summary)}**`,
     )
     .addFields(
-      { name: 'Session', value: session.id, inline: true },
-      { name: 'Turn', value: `${session.roundNumber}.${session.turnNumber}`, inline: true },
+      { name: 'Turn', value: `\`${session.roundNumber}.${session.turnNumber}\``, inline: true },
       { name: 'Active', value: activePlayerLabel(summary), inline: true },
-      { name: 'Combat', value: combatState, inline: false },
-      { name: 'Party Status', value: party, inline: false },
+      { name: 'Party', value: party, inline: false },
     )
-    .setFooter({ text: session.title })
+    .setFooter({ text: session.id })
     .setTimestamp(new Date(session.updatedAt));
 
   return applyPlayerPortrait(embed, spotlight, spotlight ? `Spotlight: ${spotlight.characterName}` : null);
@@ -5105,49 +5084,65 @@ function buildStatsEmbed(
     ? `${sheet.xp} / ${nextLevelXp} XP`
     : `${sheet.xp} XP (max level)`;
 
-  const rewards = recentRewards.length > 0
-    ? recentRewards.map(event => `${event.type}: ${event.title} (+${event.xpAward} XP)`).join('\n')
-    : 'No recent rewards.';
+  const xpBar = nextLevelXp
+    ? `\`${'█'.repeat(Math.round((sheet.xp / nextLevelXp) * 10))}${'░'.repeat(Math.max(0, 10 - Math.round((sheet.xp / nextLevelXp) * 10)))}\``
+    : '';
 
   const conditionsLine = sheet.conditions.length > 0
     ? formatConditions(sheet.conditions)
-    : '-';
+    : '—';
 
   const exhaustionLine = sheet.exhaustion > 0
     ? exhaustionDisplay(sheet.exhaustion)
-    : '-';
+    : '—';
 
-  const inspirationIcon = sheet.inspiration ? 'Yes' : '-';
   const knownSkillsLine = formatKnownSkillsDetailed(sheet);
   const spellLine = formatSpellsDetailed(sheet);
   const loadoutLine = formatEquippedLoadout(sheet, inventory);
   const encumbranceLine = summarizeEncumbrance(sheet, inventory);
 
   const embed = new EmbedBuilder()
-    .setTitle(`Character Sheet - ${player.characterName}`)
-    .setColor(0x2e86ab)
-    .setDescription(`*${player.className ?? 'Unknown Class'} · ${player.race ?? 'Unknown Race'} · Level ${sheet.level}*`)
+    .setAuthor({ name: `${player.characterName} · Character Sheet` })
+    .setColor(0x3949AB)
+    .setDescription([
+      `*${player.className ?? 'Unknown'} · ${player.race ?? 'Unknown'} · Lv${sheet.level}*`,
+      '',
+      `❤️ \`${hpBar(sheet.hp, sheet.maxHp)}\``,
+      `🛡️ **${sheet.ac}** AC  ·  🏃 **${sheet.speed}** ft  ·  🎯 +**${sheet.proficiencyBonus}** Prof`,
+      `⭐ ${xpLine} ${xpBar}`,
+      sheet.inspiration ? '✨ **Inspired**' : '',
+    ].filter(Boolean).join('\n'))
     .addFields(
-      { name: 'HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: 'AC', value: `${sheet.ac}`, inline: true },
-      { name: 'Speed', value: `${sheet.speed} ft`, inline: true },
-      { name: 'Prof.', value: `+${sheet.proficiencyBonus}`, inline: true },
-      { name: 'XP', value: xpLine, inline: true },
-      { name: 'Passive', value: `${sheet.passivePerception}`, inline: true },
-      { name: 'Inspiration', value: inspirationIcon, inline: true },
       { name: 'Abilities', value: formatAbilityScoresDetailed(sheet), inline: false },
-      { name: 'Equipped Loadout', value: loadoutLine, inline: false },
-      { name: 'Encumbrance', value: encumbranceLine, inline: true },
-      { name: 'Known Skills', value: knownSkillsLine, inline: false },
-      { name: 'Spells / Magical Abilities', value: spellLine, inline: false },
+      { name: 'Loadout', value: loadoutLine, inline: false },
+      { name: 'Skills', value: knownSkillsLine, inline: false },
+      { name: 'Spells', value: spellLine, inline: false },
+    );
+
+  // Only add conditions/exhaustion if present
+  if (sheet.conditions.length > 0 || sheet.exhaustion > 0) {
+    embed.addFields(
       { name: 'Conditions', value: conditionsLine, inline: true },
       { name: 'Exhaustion', value: exhaustionLine, inline: true },
-      { name: 'Notes', value: sheet.notes || '-', inline: false },
-      { name: 'Recent Rewards', value: rewards, inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title} · ${session.id}` });
+    );
+  }
 
-  return applyPlayerPortrait(embed, player, `${player.characterName} - character sheet`);
+  if (sheet.notes) {
+    embed.addFields({ name: 'Notes', value: sheet.notes, inline: false });
+  }
+
+  const rewards = recentRewards.length > 0
+    ? recentRewards.map(event => `${event.type}: ${event.title} (+${event.xpAward} XP)`).join('\n')
+    : null;
+  if (rewards) {
+    embed.addFields({ name: 'Recent Rewards', value: rewards, inline: false });
+  }
+
+  embed
+    .addFields({ name: 'Carry', value: encumbranceLine, inline: true })
+    .setFooter({ text: session.id });
+
+  return applyPlayerPortrait(embed, player, `${player.characterName}`);
 }
 
 function buildVoteEmbed(
@@ -5171,15 +5166,15 @@ function buildVoteEmbed(
     : `Vote closes <t:${Math.floor(vote.vote.expiresAt / 1000)}:R>.`;
 
   return new EmbedBuilder()
-    .setTitle(`${vote.vote.kind === 'party_decision' ? 'Party Vote' : 'Vote'} - ${session.title}`)
+    .setAuthor({ name: `${vote.vote.kind === 'party_decision' ? 'Party Vote' : 'Vote'} · ${session.title}` })
     .setDescription(vote.vote.question)
-    .setColor(resolution ? 0x27ae60 : 0xf1c40f)
+    .setColor(resolution ? 0x00C853 : 0xFFC107)
     .addFields(
-      { name: 'Tally', value: tally, inline: false },
-      { name: 'Pending', value: pending.length > 0 ? pending.join(', ') : 'Everyone has voted.', inline: false },
+      { name: 'Tally', value: tally, inline: true },
+      { name: 'Pending', value: pending.length > 0 ? pending.join(', ') : '✅ All voted', inline: true },
       { name: 'Outcome', value: outcome, inline: false },
     )
-    .setFooter({ text: vote.vote.kind === 'party_decision' ? 'Outside combat only' : 'Skip vote' });
+    .setFooter({ text: session.id });
 }
 
 function buildProgressEventEmbed(
@@ -5189,27 +5184,25 @@ function buildProgressEventEmbed(
 ): EmbedBuilder {
   const share = players.length > 0 ? Math.floor(event.xpAward / players.length) : 0;
   return new EmbedBuilder()
-    .setTitle(`${capitalize(event.type)} Reward - ${session.title}`)
-    .setColor(event.type === 'quest' ? 0xf1c40f : 0xe67e22)
+    .setAuthor({ name: `${capitalize(event.type)} Reward · ${session.title}` })
+    .setColor(event.type === 'quest' ? 0xFFC107 : 0xFFAB00)
     .setDescription(event.notes ?? event.title)
     .addFields(
-      { name: 'Title', value: event.title, inline: true },
-      { name: 'Total XP', value: `${event.xpAward}`, inline: true },
-      { name: 'XP Per Player', value: `${share}`, inline: true },
+      { name: 'XP', value: `**${event.xpAward}** total · **${share}** per player`, inline: false },
     );
 }
 
 function buildProgressLogEmbed(session: DndSessionRecord, logEntries: DndProgressEvent[]): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Rewards Log - ${session.title}`)
-    .setColor(0xf1c40f)
+    .setAuthor({ name: `Rewards Log · ${session.title}` })
+    .setColor(0xFFC107)
     .setDescription(
       logEntries.length > 0
         ? logEntries.slice(-12).reverse().map(entry => {
           const when = `<t:${Math.floor(entry.createdAt / 1000)}:R>`;
           return `**${capitalize(entry.type)}** · ${entry.title} · ${entry.xpAward} XP · ${when}`;
         }).join('\n')
-        : 'No combat or quest rewards logged yet.',
+        : '*No rewards logged yet.*',
     );
 }
 
@@ -5242,15 +5235,14 @@ function buildCombatEmbed(
   const tableStatus = describeCombatTableStatus(players, combat, statusOverride ?? undefined);
 
   const embed = new EmbedBuilder()
-    .setTitle(`Combat - ${session.title}`)
-    .setColor(0xc0392b)
-    .setDescription(description || 'Combat in progress...')
+    .setAuthor({ name: `⚔️ Combat · ${session.title}` })
+    .setColor(0xB71C1C)
+    .setDescription(description || '*Combat in progress…*')
     .addFields(
-      { name: 'Round', value: `${combat.round}`, inline: true },
-      { name: 'Ready Status', value: tableStatus.readyStatus, inline: true },
-      { name: 'Participants', value: `${players.filter(player => player.status !== 'left').length} players / ${combat.enemies.filter(enemy => enemy.hp > 0).length} enemies`, inline: true },
-      { name: 'Table Status', value: `**${tableStatus.headline}**\n${tableStatus.detail}`, inline: false },
-      { name: 'Initiative Order', value: order, inline: false },
+      { name: 'Round', value: `\`${combat.round}\``, inline: true },
+      { name: 'Ready', value: tableStatus.readyStatus, inline: true },
+      { name: 'Board', value: `${players.filter(player => player.status !== 'left').length}P / ${combat.enemies.filter(enemy => enemy.hp > 0).length}E`, inline: true },
+      { name: 'Status', value: `**${tableStatus.headline}**\n${tableStatus.detail}`, inline: false },
     );
 
   // If we have a GM narrative or separate action intent, put the mechanical log in a field to avoid duplication
@@ -5332,13 +5324,12 @@ function buildCombatEndEmbed(
   summary: string,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Combat Ended - ${session.title}`)
-    .setColor(0x27ae60)
+    .setAuthor({ name: `Combat Ended · ${session.title}` })
+    .setColor(0x00C853)
     .setDescription(summary)
     .addFields(
-      { name: 'Party Members', value: `${players.filter(player => player.status !== 'left').length}`, inline: true },
-      { name: 'XP Awarded', value: `${event?.xpAward ?? 0}`, inline: true },
-      { name: 'Tracked', value: event ? 'Yes' : 'No XP awarded', inline: true },
+      { name: 'Party', value: `${players.filter(player => player.status !== 'left').length} members`, inline: true },
+      { name: 'XP', value: `${event?.xpAward ?? 0}`, inline: true },
     );
 }
 
@@ -5568,15 +5559,15 @@ function pickLoadingTip(sessionId: string, userId: string, mode: 'startup' | 'we
 
 function buildSessionListEmbed(sessions: DndSessionRecord[]): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle('LiteClaw DnD Sessions')
-    .setColor(0x6b4fa0)
+    .setAuthor({ name: 'LiteClaw DnD · Sessions' })
+    .setColor(0x5E35B1)
     .setDescription(
       sessions.length > 0
         ? sessions.slice(0, 12).map(session => {
           const updatedAt = `<t:${Math.floor(session.updatedAt / 1000)}:R>`;
-          return `**${session.title}**\nID: \`${session.id}\` · ${session.phase} · updated ${updatedAt}`;
+          return `**${session.title}** · \`${session.phase}\` · ${updatedAt}\n\`${session.id}\``;
         }).join('\n\n')
-        : 'No DnD sessions found in this guild yet.',
+        : '*No sessions found in this guild yet.*',
     );
 }
 
@@ -5585,16 +5576,16 @@ function buildCheckpointEmbed(
   checkpoints: Array<{ id: string; note: string | null; createdBy: string; createdAt: number }>,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Checkpoints - ${session.title}`)
-    .setColor(0xf39c12)
+    .setAuthor({ name: `Checkpoints · ${session.title}` })
+    .setColor(0xFFAB00)
     .setDescription(
       checkpoints.length > 0
         ? checkpoints.map(checkpoint => {
           const when = `<t:${Math.floor(checkpoint.createdAt / 1000)}:R>`;
-          const note = checkpoint.note ? ` - ${checkpoint.note}` : '';
+          const note = checkpoint.note ? ` — ${checkpoint.note}` : '';
           return `\`${checkpoint.id}\` by <@${checkpoint.createdBy}> ${when}${note}`;
         }).join('\n')
-        : 'No checkpoints have been saved for this session yet.',
+        : '*No checkpoints saved yet.*',
     );
 }
 
@@ -5683,16 +5674,15 @@ function buildGenerationStatusEmbed(
         : `The spotlight is moving to **${spotlight?.characterName ?? activePlayerLabel(summary)}**. Give the GM a moment to frame what happens next.`;
 
   const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setColor(mode === 'weave' ? 0x3498db : 0x6b4fa0)
+    .setAuthor({ name: title })
+    .setColor(mode === 'weave' ? 0x3949AB : 0x5E35B1)
     .setDescription(description)
     .addFields(
-      { name: 'Session', value: session.id, inline: true },
-      { name: 'Turn', value: `${session.roundNumber}.${session.turnNumber}`, inline: true },
+      { name: 'Turn', value: `\`${session.roundNumber}.${session.turnNumber}\``, inline: true },
       { name: 'Spotlight', value: spotlight?.characterName ?? activePlayerLabel(summary), inline: true },
-      { name: 'Tip', value: tip, inline: false },
+      { name: 'Tip', value: `*${tip}*`, inline: false },
     )
-    .setFooter({ text: session.title })
+    .setFooter({ text: session.id })
     .setTimestamp(new Date(session.updatedAt));
 
   return applyPlayerPortrait(embed, spotlight, spotlight ? `Spotlight: ${spotlight.characterName}` : null);
@@ -5711,11 +5701,11 @@ function buildResumeNotice(summary: SessionSummary, partialParty: boolean): stri
 
 function colorForPhase(phase: DndSessionRecord['phase']): number {
   switch (phase) {
-    case 'lobby': return 0x6b4fa0;
-    case 'active': return 0x2e86ab;
-    case 'paused': return 0xf39c12;
-    case 'completed': return 0x7f8c8d;
-    default: return 0x95a5a6;
+    case 'lobby': return 0x5E35B1;
+    case 'active': return 0x3949AB;
+    case 'paused': return 0xFFAB00;
+    case 'completed': return 0x546E7A;
+    default: return 0x546E7A;
   }
 }
 
@@ -5960,16 +5950,10 @@ function buildStatUpdateEmbed(
 ): EmbedBuilder {
   const fieldLabel = field.toUpperCase() === field ? field : capitalize(field);
   return new EmbedBuilder()
-    .setTitle(`✏️ Stat Updated — ${player.characterName}`)
-    .setColor(0x2e86ab)
-    .setDescription(`**${fieldLabel}** has been set to **${newValue}**`)
-    .addFields(
-      { name: '❤️ HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: '🛡️ AC', value: `${sheet.ac}`, inline: true },
-      { name: '⭐ Inspiration', value: sheet.inspiration ? '⭐ Yes' : '—', inline: true },
-      { name: '📊 Abilities', value: formatAbilityScoresDetailed(sheet), inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `${player.characterName} · Stat Updated` })
+    .setColor(0x3949AB)
+    .setDescription(`**${fieldLabel}** set to **${newValue}**\n\n❤️ \`${hpBar(sheet.hp, sheet.maxHp)}\` · 🛡️ **${sheet.ac}** AC${sheet.inspiration ? ' · ✨ Inspired' : ''}`)
+    .setFooter({ text: session.id });
 }
 
 function buildClassSelectedEmbed(
@@ -5979,20 +5963,15 @@ function buildClassSelectedEmbed(
   classDef: DndClassDef,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`${classDef.emoji} Class Selected — ${player.characterName}`)
-    .setColor(0xf1c40f)
-    .setDescription(`You are now a **${classDef.name}**!\n*${classDef.description}*`)
-    .addFields(
-      { name: '🎲 Hit Die', value: `d${classDef.hitDie}`, inline: true },
-      { name: '⚡ Primary', value: classDef.primaryAbility, inline: true },
-      { name: '🛡️ Saves', value: classDef.savingThrows.join(', '), inline: true },
-      { name: 'Recommended Order', value: formatRecommendedAbilityOrder(classDef), inline: false },
-      { name: '❤️ Starting HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: '🛡️ AC', value: `${sheet.ac}`, inline: true },
-      { name: '🏃 Speed', value: `${sheet.speed} ft`, inline: true },
-      { name: '📊 Abilities', value: formatAbilityScoresDetailed(sheet), inline: false },
-    )
-    .setFooter({ text: `Roll next to auto-assign using the recommended order · ${session.title}` });
+    .setAuthor({ name: `${classDef.emoji} ${player.characterName} · Class Selected` })
+    .setColor(0xFFC107)
+    .setDescription([
+      `You are now a **${classDef.name}**! *${classDef.description}*`,
+      '',
+      `🎲 d${classDef.hitDie} Hit Die · ⚡ ${classDef.primaryAbility} · 🛡️ ${classDef.savingThrows.join('/')}`,
+      `❤️ \`${hpBar(sheet.hp, sheet.maxHp)}\` · 🛡️ **${sheet.ac}** AC · 🏃 **${sheet.speed}** ft`,
+    ].join('\n'))
+    .setFooter({ text: `Roll next to auto-assign · ${session.id}` });
 }
 
 function buildStatRollEmbed(
@@ -6014,17 +5993,18 @@ function buildStatRollEmbed(
   ).join('\n');
 
   return new EmbedBuilder()
-    .setTitle('🎲 Ability Score Rolls')
-    .setColor(0xe67e22)
-    .setDescription(
-      `### 🎲 Your Ability Score Rolls\n\n${rollDisplay}\n\n` +
-      `**Available values:** \`${rolled.join(', ')}\`\n\n` +
-      `**Next step:**\n` +
-      (classDef
-        ? `Auto-assigned using **${classDef.name}** priority: \`${formatRecommendedAbilityOrder(classDef)}\`.\n\nUse **Adjust Stats** only if you want to override it manually.`
-        : `Choose your class next and LiteClaw will auto-assign these values using the recommended stat order for that class.`),
-    )
-    .setFooter({ text: `Session: ${session.title} · Re-roll with /stats roll` });
+    .setAuthor({ name: '🎲 Ability Score Rolls' })
+    .setColor(0xFFAB00)
+    .setDescription([
+      rollDisplay,
+      '',
+      `Values: \`${rolled.join(', ')}\``,
+      '',
+      classDef
+        ? `Auto-assigned using **${classDef.name}** priority. Use **Adjust Stats** to override.`
+        : `Choose your class next to auto-assign these values.`,
+    ].join('\n'))
+    .setFooter({ text: `Re-roll: /stats roll · ${session.id}` });
 }
 
 function buildAutoAssignmentEmbed(
@@ -6044,19 +6024,14 @@ function buildAutoAssignmentEmbed(
   ];
 
   return new EmbedBuilder()
-    .setTitle(`🧭 Auto Assignment — ${player.characterName}`)
-    .setColor(0x27ae60)
-    .setDescription(`Applied **${classDef.name}** priority automatically.`)
-    .addFields(
-      { name: 'Rolled Values', value: rolled.map(value => `\`${value}\``).join(', '), inline: false },
-      { name: 'Priority', value: formatRecommendedAbilityOrder(classDef), inline: false },
-      {
-        name: 'Assigned Abilities',
-        value: mapping.map(([label, value]) => `${label} ${value} (${formatModifier(value)})`).join('\n'),
-        inline: false,
-      },
-    )
-    .setFooter({ text: `Use Adjust Stats only if you want to override the automatic mapping · ${session.title}` });
+    .setAuthor({ name: `${player.characterName} · Auto Assignment` })
+    .setColor(0x00C853)
+    .setDescription([
+      `Applied **${classDef.name}** priority: \`${formatRecommendedAbilityOrder(classDef)}\``,
+      '',
+      mapping.map(([label, value]) => `**${label}** \`${value}\` (${formatModifier(value)})`).join(' · '),
+    ].join('\n'))
+    .setFooter({ text: `Adjust Stats to override · ${session.id}` });
 }
 
 function buildDocumentUploadEmbed(
@@ -6067,15 +6042,15 @@ function buildDocumentUploadEmbed(
     pdf: '📜', lore: '📖', transcript: '📝', text: '📄',
   };
   return new EmbedBuilder()
-    .setTitle(`${typeEmoji[doc.sourceType] ?? '📄'} Document Ingested`)
-    .setColor(0x27ae60)
-    .setDescription(`**${doc.filename}** has been processed and added to the campaign knowledge base.`)
+    .setAuthor({ name: `📜 Document Ingested` })
+    .setColor(0x00C853)
+    .setDescription(`**${doc.filename}** added to campaign knowledge.`)
     .addFields(
-      { name: 'Document ID', value: `\`${doc.id}\``, inline: true },
+      { name: 'ID', value: `\`${doc.id}\``, inline: true },
       { name: 'Type', value: doc.sourceType, inline: true },
-      { name: 'Chunks', value: `${doc.chunkCount} embeddings`, inline: true },
+      { name: 'Chunks', value: `${doc.chunkCount}`, inline: true },
     )
-    .setFooter({ text: `Session: ${session.title} · Search with /lore search` });
+    .setFooter({ text: session.id });
 }
 
 function buildDocumentListEmbed(
@@ -6095,10 +6070,10 @@ function buildDocumentListEmbed(
     : 'No documents have been uploaded to this session yet.\nUse `/lore upload` to add campaign PDFs, lore docs, or transcripts.';
 
   return new EmbedBuilder()
-    .setTitle(`📚 Campaign Lore — ${session.title}`)
-    .setColor(0x8e44ad)
+    .setAuthor({ name: `📚 Campaign Lore · ${session.title}` })
+    .setColor(0x7C4DFF)
     .setDescription(list)
-    .setFooter({ text: `${docs.length} document${docs.length !== 1 ? 's' : ''} total` });
+    .setFooter({ text: `${docs.length} document${docs.length !== 1 ? 's' : ''}` });
 }
 
 function buildLoreSearchEmbed(
@@ -6107,10 +6082,10 @@ function buildLoreSearchEmbed(
   context: string,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`🔍 Lore Search — "${query}"`)
-    .setColor(0x8e44ad)
+    .setAuthor({ name: `🔍 Lore Search · "${query}"` })
+    .setColor(0x7C4DFF)
     .setDescription(context.slice(0, 4000))
-    .setFooter({ text: `Session: ${session.title}` });
+    .setFooter({ text: session.id });
 }
 
 function buildRestEmbed(
@@ -6127,12 +6102,9 @@ function buildRestEmbed(
   const label = restType === 'short' ? 'Short Rest' : 'Long Rest';
 
   const embed = new EmbedBuilder()
-    .setTitle(`${emoji} ${label} — ${player.characterName}`)
-    .setColor(restType === 'short' ? 0xe67e22 : 0x2ecc71)
-    .addFields(
-      { name: '❤️ HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: '💚 Regained', value: `+${hpRegained} HP`, inline: true },
-    );
+    .setAuthor({ name: `${emoji} ${label} · ${player.characterName}` })
+    .setColor(restType === 'short' ? 0xFFAB00 : 0x43A047)
+    .setDescription(`❤️ \`${hpBar(sheet.hp, sheet.maxHp)}\` · +${hpRegained} HP regained`);
 
   if (restType === 'short' && hitDiceUsed > 0) {
     embed.addFields({ name: '🎲 Hit Dice Spent', value: `${hitDiceUsed}`, inline: true });
@@ -6164,14 +6136,10 @@ function buildConditionEmbed(
     : '— None';
 
   return new EmbedBuilder()
-    .setTitle(`${emoji} Condition ${verb} — ${player.characterName}`)
-    .setColor(action === 'add' ? 0xe74c3c : 0x2ecc71)
-    .setDescription(`**${conditionName}** has been ${verb.toLowerCase()}.`)
-    .addFields(
-      { name: '❤️ HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: '🔥 Active Conditions', value: currentConditions, inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `${emoji} Condition ${verb} · ${player.characterName}` })
+    .setColor(action === 'add' ? 0xD50000 : 0x43A047)
+    .setDescription(`**${conditionName}** ${verb.toLowerCase()}.\n\n❤️ \`${hpBar(sheet.hp, sheet.maxHp)}\`${sheet.conditions.length > 0 ? `\n🔥 ${currentConditions}` : ''}`)
+    .setFooter({ text: session.id });
 }
 
 function buildInventoryEmbed(
@@ -6210,19 +6178,22 @@ function buildInventoryEmbed(
     : 'None.';
 
   const embed = new EmbedBuilder()
-    .setTitle(`Inventory - ${player.characterName}`)
-    .setColor(0x27ae60)
+    .setAuthor({ name: `${player.characterName} · Inventory` })
+    .setColor(0x00C853)
     .addFields(
       { name: 'Gold', value: `${gold} gp`, inline: true },
-      { name: 'Item Count', value: `${items.length}`, inline: true },
-      { name: 'Encumbrance', value: encumbrance, inline: true },
+      { name: 'Items', value: `${items.length}`, inline: true },
+      { name: 'Carry', value: encumbrance, inline: true },
       { name: 'Equipped', value: formatEquippedLoadout(sheet, items), inline: false },
-      { name: 'Accessible Items', value: lines, inline: false },
-      { name: 'Confiscated / Stored', value: confiscated, inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+      { name: 'Accessible', value: lines, inline: false },
+    );
 
-  return applyPlayerPortrait(embed, player, `${player.characterName} - inventory`);
+  if (confiscatedItems.length > 0) {
+    embed.addFields({ name: 'Confiscated', value: confiscated, inline: false });
+  }
+
+  embed.setFooter({ text: session.id });
+  return applyPlayerPortrait(embed, player, `${player.characterName}`);
 }
 
 function buildSkillsEmbed(
@@ -6231,12 +6202,11 @@ function buildSkillsEmbed(
   sheet: DndCharacterSheet,
 ): EmbedBuilder {
   const embed = new EmbedBuilder()
-    .setTitle(`Skills - ${player.characterName}`)
-    .setColor(0x2e86ab)
+    .setAuthor({ name: `${player.characterName} · Skills` })
+    .setColor(0x3949AB)
     .setDescription(formatKnownSkillsDetailed(sheet))
-    .setFooter({ text: `Session: ${session.title}` });
-
-  return applyPlayerPortrait(embed, player, `${player.characterName} - skills`);
+    .setFooter({ text: session.id });
+  return applyPlayerPortrait(embed, player, `${player.characterName}`);
 }
 
 function buildSpellsEmbed(
@@ -6245,12 +6215,11 @@ function buildSpellsEmbed(
   sheet: DndCharacterSheet,
 ): EmbedBuilder {
   const embed = new EmbedBuilder()
-    .setTitle(`Spells - ${player.characterName}`)
-    .setColor(0x8e44ad)
+    .setAuthor({ name: `${player.characterName} · Spells` })
+    .setColor(0x7C4DFF)
     .setDescription(formatSpellsDetailed(sheet))
-    .setFooter({ text: `Session: ${session.title}` });
-
-  return applyPlayerPortrait(embed, player, `${player.characterName} - magic`);
+    .setFooter({ text: session.id });
+  return applyPlayerPortrait(embed, player, `${player.characterName}`);
 }
 
 function buildAvatarEmbed(
@@ -6259,14 +6228,13 @@ function buildAvatarEmbed(
   notice?: string,
 ): EmbedBuilder {
   const embed = new EmbedBuilder()
-    .setTitle(`Portrait - ${player.characterName}`)
-    .setColor(0x3498db)
-    .setDescription(notice ?? 'Manage how your character appears to the table.')
+    .setAuthor({ name: `${player.characterName} · Portrait` })
+    .setColor(0x3949AB)
+    .setDescription(notice ?? '*Manage how your character appears.*')
     .addFields(
       { name: 'Source', value: player.avatarSource ?? 'class_default', inline: true },
-      { name: 'URL', value: player.avatarUrl ?? 'No custom portrait set.', inline: false },
     )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setFooter({ text: session.id });
 
   if (player.avatarUrl) {
     embed.setImage(player.avatarUrl);
@@ -6281,15 +6249,14 @@ function buildInventoryItemAddedEmbed(
   targetUserId: string,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle('Item Added')
-    .setColor(0x27ae60)
-    .setDescription(`Added **${item.name}** ×${item.quantity} to <@${targetUserId}>.`)
+    .setAuthor({ name: 'Item Added' })
+    .setColor(0x00C853)
+    .setDescription(`**${item.name}** ×${item.quantity} → <@${targetUserId}>`)
     .addFields(
-      { name: 'Item ID', value: `\`${item.id}\``, inline: true },
-      { name: 'Category', value: item.category ?? '—', inline: true },
-      { name: 'Consumable', value: item.consumable ? 'Yes' : 'No', inline: true },
+      { name: 'ID', value: `\`${item.id}\``, inline: true },
+      { name: 'Type', value: `${item.category ?? '—'}${item.consumable ? ' · consumable' : ''}`, inline: true },
     )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setFooter({ text: session.id });
 }
 
 function buildInventorySpendEmbed(
@@ -6298,12 +6265,12 @@ function buildInventorySpendEmbed(
   spent: number,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle('Item Spent')
-    .setColor(0xe67e22)
+    .setAuthor({ name: 'Item Spent' })
+    .setColor(0xFFAB00)
     .setDescription(item
-      ? `Spent ${spent} from **${item.name}**. ${item.quantity} remaining.`
-      : `Spent the last ${spent} item(s). The stack is now gone.`)
-    .setFooter({ text: `Session: ${session.title}` });
+      ? `Used from **${item.name}**. **${item.quantity}** remaining.`
+      : `Last item consumed.`)
+    .setFooter({ text: session.id });
 }
 
 function buildInventoryDropEmbed(
@@ -6312,12 +6279,12 @@ function buildInventoryDropEmbed(
   removed: number,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle('Item Removed')
-    .setColor(0x95a5a6)
+    .setAuthor({ name: 'Item Removed' })
+    .setColor(0x546E7A)
     .setDescription(item
-      ? `Removed ${removed} from **${item.name}**. ${item.quantity} remaining.`
-      : `Removed the final ${removed} item(s) from inventory.`)
-    .setFooter({ text: `Session: ${session.title}` });
+      ? `Removed ${removed} from **${item.name}**. **${item.quantity}** remaining.`
+      : `Removed the final ${removed} item(s).`)
+    .setFooter({ text: session.id });
 }
 
 function buildGoldSpendEmbed(
@@ -6328,13 +6295,10 @@ function buildGoldSpendEmbed(
   reason: string | null,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Gold Spent - ${player.characterName}`)
-    .setColor(0xf1c40f)
-    .setDescription(reason ? `Spent ${spent} gp on ${reason}.` : `Spent ${spent} gp.`)
-    .addFields(
-      { name: 'Remaining Gold', value: `${sheet.gold} gp`, inline: true },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `${player.characterName} · Gold Spent` })
+    .setColor(0xFFC107)
+    .setDescription(reason ? `**${spent}** gp on ${reason}. **${sheet.gold}** gp remaining.` : `**${spent}** gp spent. **${sheet.gold}** gp remaining.`)
+    .setFooter({ text: session.id });
 }
 
 function buildShopEmbed(
@@ -6356,13 +6320,13 @@ function buildShopEmbed(
     : 'This shop is out of stock.';
 
   return new EmbedBuilder()
-    .setTitle(`Shop - ${shop.name}`)
-    .setColor(0x8e44ad)
+    .setAuthor({ name: `📜 ${shop.name}` })
+    .setColor(0x7C4DFF)
     .setDescription([description, shop.description].filter(Boolean).join('\n\n'))
     .addFields(
-      { name: 'Items', value: lines, inline: false },
+      { name: 'Wares', value: lines, inline: false },
     )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setFooter({ text: session.id });
 }
 
 function buildShopPurchaseEmbed(
@@ -6378,15 +6342,14 @@ function buildShopPurchaseEmbed(
   },
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Purchase - ${result.player.characterName}`)
-    .setColor(0x27ae60)
-    .setDescription(`Bought **${result.item.name}** ×${result.purchasedQuantity} from **${result.shop.name}** for **${result.totalCost} gp**.`)
+    .setAuthor({ name: `${result.player.characterName} · Purchase` })
+    .setColor(0x00C853)
+    .setDescription(`**${result.item.name}** ×${result.purchasedQuantity} from **${result.shop.name}** for **${result.totalCost} gp**.`)
     .addFields(
-      { name: 'Remaining Gold', value: `${result.sheet.gold} gp`, inline: true },
-      { name: 'Shop Stock Left', value: `${result.item.stock}`, inline: true },
-      { name: 'Inventory', value: `\`${result.inventoryItem.id}\` ${result.inventoryItem.name} ×${result.inventoryItem.quantity}`, inline: false },
+      { name: 'Gold', value: `${result.sheet.gold} gp`, inline: true },
+      { name: 'Stock', value: `${result.item.stock}`, inline: true },
     )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setFooter({ text: session.id });
 }
 
 function parseShopItemsInput(raw: string): Array<{
@@ -6442,20 +6405,23 @@ function buildDowntimeResultEmbed(
     ? `${record.goldAfter} gp`
     : `${record.goldAfter} gp (${record.goldDelta > 0 ? '+' : ''}${record.goldDelta} gp)`;
 
-  return new EmbedBuilder()
-    .setTitle(`Downtime - ${player.characterName}`)
-    .setColor(0xf1c40f)
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: `${player.characterName} · Downtime` })
+    .setColor(0xFFC107)
     .setDescription(record.summary)
     .addFields(
-      { name: 'Activity', value: `${humanizeDowntimeActivity(record.activityId)}${record.focus ? ` - ${record.focus}` : ''}`, inline: false },
-      { name: 'Time Spent', value: formatDowntimeWindow(record), inline: true },
+      { name: 'Activity', value: `${humanizeDowntimeActivity(record.activityId)}${record.focus ? ` — ${record.focus}` : ''}`, inline: false },
+      { name: 'Time', value: formatDowntimeWindow(record), inline: true },
       { name: 'Gold', value: goldLine, inline: true },
-      { name: 'Next Downtime', value: `<t:${Math.floor(record.cooldownUntil / 1000)}:R>`, inline: true },
-      { name: 'Current HP', value: `\`${hpBar(sheet.hp, sheet.maxHp)}\``, inline: false },
-      { name: 'Open Projects', value: activeProgress || 'None', inline: false },
-      { name: 'Guidance', value: 'Quick tasks work best in 15m-1h bursts. Longer 3h-6h blocks are better for training or crafting progress.', inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title} · Cooldowns prevent downtime farming.` });
+      { name: 'Next', value: `<t:${Math.floor(record.cooldownUntil / 1000)}:R>`, inline: true },
+      { name: 'HP', value: `\`${hpBar(sheet.hp, sheet.maxHp, 8)}\``, inline: false },
+    );
+
+  if (activeProgress) {
+    embed.addFields({ name: 'Projects', value: activeProgress, inline: false });
+  }
+
+  return embed.setFooter({ text: session.id });
 }
 
 function buildDowntimeStatusEmbed(
@@ -6479,17 +6445,16 @@ function buildDowntimeStatusEmbed(
     : 'Ready now';
 
   return new EmbedBuilder()
-    .setTitle(`Downtime Status - ${player.characterName}`)
-    .setColor(0x2e86ab)
+    .setAuthor({ name: `${player.characterName} · Downtime Status` })
+    .setColor(0x3949AB)
     .addFields(
       { name: 'Gold', value: `${sheet.gold} gp`, inline: true },
-      { name: 'Next Downtime', value: cooldownLine, inline: true },
-      { name: 'Session Phase', value: capitalize(session.phase), inline: true },
-      { name: 'Latest Activity', value: latest ? latest.summary : 'No downtime recorded yet.', inline: false },
+      { name: 'Next', value: cooldownLine, inline: true },
+      { name: 'Phase', value: capitalize(session.phase), inline: true },
+      { name: 'Latest', value: latest ? latest.summary : '*No downtime recorded yet.*', inline: false },
       { name: 'Projects', value: progressLine, inline: false },
-      { name: 'Suggested Rhythm', value: '15m for quick flavor, 30-60m for useful progress, 3-6h for focused projects.', inline: false },
     )
-    .setFooter({ text: 'Downtime is available while the session is paused or completed.' });
+    .setFooter({ text: session.id });
 }
 
 function buildDowntimeHistoryEmbed(
@@ -6505,8 +6470,8 @@ function buildDowntimeHistoryEmbed(
     : 'No downtime history yet.';
 
   return new EmbedBuilder()
-    .setTitle(`Downtime History - ${session.title}`)
-    .setColor(0x95a5a6)
+    .setAuthor({ name: `Downtime History · ${session.title}` })
+    .setColor(0x546E7A)
     .setDescription(body);
 }
 
@@ -6526,14 +6491,10 @@ function buildInspirationEmbed(
   grantedByUserId: string,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Inspiration Granted - ${player.characterName}`)
-    .setColor(0xf1c40f)
-    .setDescription(`<@${grantedByUserId}> granted inspiration to **${player.characterName}**.`)
-    .addFields(
-      { name: 'Inspiration', value: sheet.inspiration ? '⭐ Ready to spend' : '—', inline: true },
-      { name: 'Use Case', value: 'Can be spent on a death save reroll or tracked for future roll contexts.', inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `✨ Inspiration · ${player.characterName}` })
+    .setColor(0xFFC107)
+    .setDescription(`<@${grantedByUserId}> granted inspiration to **${player.characterName}**.${sheet.inspiration ? ' ⭐ Ready to spend.' : ''}`)
+    .setFooter({ text: session.id });
 }
 
 function buildDeathSaveEmbed(
@@ -6546,15 +6507,10 @@ function buildDeathSaveEmbed(
 ): EmbedBuilder {
   const tracker = formatDeathSaveTracker(sheet);
   return new EmbedBuilder()
-    .setTitle(`Death Save - ${player.characterName}`)
-    .setColor(sheet.deathSaves.dead ? 0xa32d2d : sheet.hp > 0 ? 0x27ae60 : 0x2c2c2c)
-    .setDescription(event)
-    .addFields(
-      { name: 'Roll', value: `${roll}${usedInspiration ? ' (with inspiration)' : ''}`, inline: true },
-      { name: 'HP', value: `${sheet.hp}/${sheet.maxHp}`, inline: true },
-      { name: 'Tracker', value: tracker, inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `☠️ Death Save · ${player.characterName}` })
+    .setColor(sheet.deathSaves.dead ? 0x212121 : sheet.hp > 0 ? 0x00C853 : 0x212121)
+    .setDescription(`${event}\n\n🎲 **${roll}**${usedInspiration ? ' (inspired)' : ''} · HP ${sheet.hp}/${sheet.maxHp}\n${tracker}`)
+    .setFooter({ text: session.id });
 }
 
 function buildDeathSaveStatusEmbed(
@@ -6563,14 +6519,10 @@ function buildDeathSaveStatusEmbed(
   sheet: DndCharacterSheet,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Death Save Status - ${player.characterName}`)
-    .setColor(0x2c2c2c)
-    .addFields(
-      { name: 'HP', value: `${sheet.hp}/${sheet.maxHp}`, inline: true },
-      { name: 'Condition', value: sheet.deathSaves.dead ? 'Dead' : sheet.deathSaves.stable ? 'Stable' : 'Dying', inline: true },
-      { name: 'Tracker', value: formatDeathSaveTracker(sheet), inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `☠️ Death Save Status · ${player.characterName}` })
+    .setColor(0x212121)
+    .setDescription(`HP ${sheet.hp}/${sheet.maxHp} · ${sheet.deathSaves.dead ? '**Dead**' : sheet.deathSaves.stable ? 'Stable' : 'Dying'}\n${formatDeathSaveTracker(sheet)}`)
+    .setFooter({ text: session.id });
 }
 
 function buildDeathSaveDamageEmbed(
@@ -6581,14 +6533,10 @@ function buildDeathSaveDamageEmbed(
   critical: boolean,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Death Save Damage - ${player.characterName}`)
-    .setColor(sheet.deathSaves.dead ? 0xa32d2d : 0xe67e22)
-    .setDescription(`Damage at 0 HP caused ${critical ? 'two' : 'one'} automatic death save failure${critical ? 's' : ''}.`)
-    .addFields(
-      { name: 'Damage', value: `${damage}${critical ? ' (critical)' : ''}`, inline: true },
-      { name: 'Tracker', value: formatDeathSaveTracker(sheet), inline: false },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `☠️ Death Save Damage · ${player.characterName}` })
+    .setColor(sheet.deathSaves.dead ? 0x212121 : 0xD50000)
+    .setDescription(`**${damage}** damage${critical ? ' (critical)' : ''} at 0 HP → ${critical ? 'two' : 'one'} automatic failure${critical ? 's' : ''}.\n${formatDeathSaveTracker(sheet)}`)
+    .setFooter({ text: session.id });
 }
 
 function buildDeathSaveResetEmbed(
@@ -6597,13 +6545,10 @@ function buildDeathSaveResetEmbed(
   sheet: DndCharacterSheet,
 ): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Death Saves Reset - ${player.characterName}`)
-    .setColor(0x95a5a6)
-    .addFields(
-      { name: 'Tracker', value: formatDeathSaveTracker(sheet), inline: false },
-      { name: 'HP', value: `${sheet.hp}/${sheet.maxHp}`, inline: true },
-    )
-    .setFooter({ text: `Session: ${session.title}` });
+    .setAuthor({ name: `Death Saves Reset · ${player.characterName}` })
+    .setColor(0x546E7A)
+    .setDescription(`HP ${sheet.hp}/${sheet.maxHp}\n${formatDeathSaveTracker(sheet)}`)
+    .setFooter({ text: session.id });
 }
 
 function formatDeathSaveTracker(sheet: DndCharacterSheet): string {

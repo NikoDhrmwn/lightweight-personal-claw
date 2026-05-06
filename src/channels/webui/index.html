@@ -198,6 +198,10 @@
         <section class="settings-card">
           <div class="panel-head"><span>Agent</span></div>
           <label class="field field-wide">
+            <span>Agent name</span>
+            <input id="settingAgentName" type="text" placeholder="LiteClaw">
+          </label>
+          <label class="field field-wide">
             <span>Workspace</span>
             <input id="settingWorkspace" type="text" placeholder="D:\projects\workspace">
           </label>
@@ -225,6 +229,10 @@
             <label class="field">
               <span>Budget %</span>
               <input id="settingContextBudgetPct" type="number" min="1" max="100">
+            </label>
+            <label class="field">
+              <span>Compaction %</span>
+              <input id="settingCompactionThresholdPct" type="number" min="1" max="100">
             </label>
             <label class="field">
               <span>Max skills</span>
@@ -317,6 +325,24 @@
       <div class="settings-actions">
         <button class="cta cta-outline dangerish" id="confirmReject" type="button">Cancel</button>
         <button class="cta cta-solid" id="confirmAccept" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Onboarding Modal ────────────────────────────────────────── -->
+  <div class="modal-overlay" id="onboardingModal" hidden>
+    <div class="modal-card onboarding-card">
+      <div class="eyebrow">Initialization</div>
+      <h3>Welcome to LiteClaw</h3>
+      <p>Let's personalize your experience. What would you like to call your agent?</p>
+      
+      <label class="field field-wide" style="margin-top: 20px;">
+        <span>Agent name</span>
+        <input id="onboardingName" type="text" placeholder="LiteClaw" value="LiteClaw">
+      </label>
+
+      <div class="settings-actions" style="margin-top: 32px;">
+        <button class="cta cta-solid" id="onboardingSubmit" type="button">Get started</button>
       </div>
     </div>
   </div>
