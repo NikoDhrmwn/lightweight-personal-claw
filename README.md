@@ -12,13 +12,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-
-#### Added
-
-- **First-Class MCP Support**: LiteClaw can now connect to MCP servers over `stdio` and remote HTTP, expose MCP tools directly to the agent, and access MCP resources/prompts through built-in utility tools.
-- **GitHub MCP Preset**: Added `liteclaw mcp add github` and `liteclaw mcp login github` for quick setup of GitHub's remote MCP server using a token stored in the LiteClaw state `.env`.
-- **MCP Health & Reloading**: Gateway status now reports MCP server health, and MCP connections are reloaded automatically when config or `.env` changes.
-
 ### [0.8.2] - 2026-05-05
 
 #### Added
