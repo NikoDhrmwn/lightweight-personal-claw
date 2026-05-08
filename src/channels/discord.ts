@@ -41,10 +41,21 @@ import { basename, extname } from 'path';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager } from '../core/confirmation.js';
 import { getConfig, getStateDir } from '../config.js';
+import { resolveContextThresholds } from '../core/context.js';
 import { createLogger } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
 import type { InteractiveChoiceRequest } from '../core/tools.js';
-import { sanitizeChannelContent, splitMessage } from './utils.js';
+import {
+  applyEventToChannelProgress,
+  buildOutgoingMessages,
+  createChannelProgressState,
+  formatDurationShort,
+  formatProgressPreview,
+  formatProgressStatusLabel,
+  formatTaskStatusIcon,
+  getProgressCounts,
+  type ChannelProgressState,
+} from './progress.js';
 import { DND_SLASH_COMMANDS, DndDiscordController } from '../dnd/discord.js';
 import type { DndSessionDetails } from '../dnd/types.js';
 
@@ -56,20 +67,7 @@ interface MentionTarget {
   aliases: string[];
 }
 
-interface DiscordProgressState {
-  startedAt: number;
-  status: 'starting' | 'thinking' | 'planning' | 'working' | 'done' | 'error';
-  planSummary: string;
-  tasks: Array<{
-    id: string;
-    title: string;
-    status: string;
-    summary?: string;
-  }>;
-  currentTaskLabel?: string;
-  recentTools: string[];
-  error?: string;
-}
+type DiscordProgressState = ChannelProgressState;
 
 // ─── Reaction Emojis (progress indicators) ──────────────────────────
 
@@ -539,30 +537,26 @@ export class DiscordChannel {
       const rest = new REST({ version: '10' }).setToken(token);
       const commandData = SLASH_COMMANDS.map(cmd => cmd.toJSON());
       const configuredGuildId = this.config.guildId ?? process.env.DISCORD_GUILD_ID;
-      const connectedGuildIds = this.client.guilds.cache.map(guild => guild.id);
-      const guildIds = configuredGuildId
-        ? [configuredGuildId]
-        : connectedGuildIds;
+      if (configuredGuildId) {
+        // Explicit guild mode: fast propagation in one guild, but no DM slash commands.
+        await rest.put(Routes.applicationCommands(clientId), { body: [] });
+        log.info('Cleared global slash commands because explicit guild-only registration is active');
 
-      if (guildIds.length > 0) {
-        // Clear stale global commands so Discord does not show duplicate
-        // entries when this bot has previously registered globally.
-        await rest.put(Routes.applicationCommands(clientId), { body: commandData });
-        log.info({ count: commandData.length }, 'Registered global slash commands');
-
-        for (const guildId of guildIds) {
-          await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commandData });
-          log.info({ guildId, count: commandData.length }, 'Registered guild slash commands');
-          console.log(`  ✓ Registered ${commandData.length} guild slash commands for ${guildId}`);
-        }
-        if (!configuredGuildId && guildIds.length > 1) {
-          console.log(`  ✓ Registered commands across ${guildIds.length} connected guilds for faster Discord propagation`);
-        }
+        await rest.put(Routes.applicationGuildCommands(clientId, configuredGuildId), { body: commandData });
+        log.info({ guildId: configuredGuildId, count: commandData.length }, 'Registered guild slash commands');
+        console.log(`  ✓ Registered ${commandData.length} guild slash commands for ${configuredGuildId}`);
+        console.log('  ℹ Guild-only slash commands are active; DM slash commands are disabled in this mode.');
       } else {
-        // Fallback when the bot is not yet aware of any guilds.
+        // Default mode: global commands work in DMs and guilds without duplicate guild entries.
         await rest.put(Routes.applicationCommands(clientId), { body: commandData });
         log.info({ count: commandData.length }, 'Registered global slash commands');
         console.log(`  ✓ Registered ${commandData.length} global slash commands (may take up to 1h to show up)`);
+
+        // Clear any previously configured guild commands to prevent duplicate slash entries.
+        for (const guildId of this.client.guilds.cache.map(guild => guild.id)) {
+          await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: [] });
+          log.info({ guildId }, 'Cleared guild slash commands because global registration is active');
+        }
       }
     } catch (err: any) {
       log.error({ error: err.message }, 'Failed to register slash commands');
@@ -696,7 +690,7 @@ export class DiscordChannel {
 
     let fullContent = '';
     const toolUpdates: string[] = [];
-    const progress = createDiscordProgressState();
+      const progress = createDiscordProgressState();
     let lastProgressFlush = 0;
 
     const flushProgress = async (force = false, finalContent?: string): Promise<void> => {
@@ -799,15 +793,12 @@ export class DiscordChannel {
         });
       } else {
         // Non-DnD: standard text output
-        const messages = buildOutgoingMessages(
-          structuredNarrative.content,
-          toolUpdates,
-          {
-            replyStyle: this.config.replyStyle ?? 'single',
-            showToolProgress: this.config.showToolProgress ?? false,
-          },
-          1900
-        );
+        const messages = buildOutgoingMessages(structuredNarrative.content, toolUpdates, {
+          replyStyle: this.config.replyStyle ?? 'single',
+          showToolProgress: this.config.showToolProgress ?? false,
+          maxLen: 1900,
+          format: 'plain',
+        });
         await flushProgress(true, messages[0] ?? '(No response)');
         for (let i = 1; i < messages.length; i++) {
           await interaction.followUp(messages[i]);
@@ -837,14 +828,14 @@ export class DiscordChannel {
     } catch { /* offline */ }
 
     const embed = new EmbedBuilder()
-      .setTitle('🦎 LiteClaw Status')
-      .addFields(
-        { name: 'Gateway', value: gatewayStatus, inline: true },
-        { name: 'Active Requests', value: `${this.activeRequests}`, inline: true },
-        { name: 'Current State', value: this.currentState, inline: true },
-        { name: 'Pending Confirmations', value: `${this.confirmations.getPending().length}`, inline: true },
-      )
-      .setColor(0x6c63ff)
+      .setAuthor({ name: 'LiteClaw · System Status' })
+      .setColor(0x00897B)
+      .setDescription([
+        `**Gateway** › ${gatewayStatus}`,
+        `**State** › \`${this.currentState}\``,
+        '',
+        `🔄 **${this.activeRequests}** active request${this.activeRequests !== 1 ? 's' : ''}  ·  ⏳ **${this.confirmations.getPending().length}** pending confirmation${this.confirmations.getPending().length !== 1 ? 's' : ''}`,
+      ].join('\n'))
       .setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
@@ -866,37 +857,27 @@ export class DiscordChannel {
 
   private async handleHelpCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const embed = new EmbedBuilder()
-      .setTitle('🦎 LiteClaw Help')
-      .setDescription('A lightweight AI agent running locally. Mention me or use slash commands.')
-      .addFields(
-        {
-          name: 'Slash Commands', value: [
-            '`/ask <message>` — Ask a question or give a task',
-            '`/status` — Show bot status and health',
-            '`/clear` — Clear conversation history',
-            '`/model` — Show current model info',
-            '`/help` — This help message',
-          ].join('\n')
-        },
-        { name: 'Mention', value: 'You can also @mention me with your message in any channel.' },
-        {
-          name: 'Tools', value: [
-            '📁 **File Operations** — read, write, delete, list, send files',
-            '💻 **Command Execution** — run shell commands',
-            '🔍 **Web Search** — Google Grounding + web fetch',
-            '👁️ **Vision** — attach an image and I will inspect it natively',
-          ].join('\n')
-        },
-        {
-          name: 'Reactions', value: [
-            '👀 Received your message',
-            '🧠 Thinking...',
-            '⚙️ Running a tool',
-            '✅ Done / ❌ Error',
-          ].join('\n')
-        },
-      )
-      .setColor(0x6c63ff);
+      .setAuthor({ name: 'LiteClaw · Help' })
+      .setColor(0x5E35B1)
+      .setDescription([
+        '*A lightweight AI agent running locally. Mention me or use slash commands.*',
+        '',
+        '**━━━ Commands ━━━**',
+        '`/ask` · Ask a question or give a task',
+        '`/status` · Show bot status and health',
+        '`/clear` · Clear conversation history',
+        '`/model` · Show current model info',
+        '`/tokens` · Show session token usage',
+        '',
+        '**━━━ Capabilities ━━━**',
+        '📁 File Operations · 💻 Shell Commands',
+        '🔍 Web Search · 👁️ Vision',
+        '',
+        '**━━━ Reactions ━━━**',
+        '👀 Received · 🧠 Thinking · ⚙️ Working · ✅ Done',
+        '',
+        '💬 You can also `@mention` me in any channel.',
+      ].join('\n'));
 
     await interaction.reply({ embeds: [embed] });
   }
@@ -908,10 +889,9 @@ export class DiscordChannel {
     const metrics = memory.getSessionMetrics(sessionKey);
     memory.close();
 
-    const config = getConfig();
-    const maxTokens = config.agent?.contextTokens ?? 64000;
-    const budgetPct = (config.agent?.contextBudgetPct ?? 80) / 100;
-    const threshold = config.agent?.compaction?.softThresholdTokens ?? Math.floor(maxTokens * (budgetPct * 0.9));
+    const thresholds = resolveContextThresholds();
+    const maxTokens = thresholds.maxContextTokens;
+    const threshold = thresholds.softThresholdTokens;
 
     const currentTokens = metrics.estimatedTokens;
 
@@ -920,18 +900,20 @@ export class DiscordChannel {
     if (percentage > 90) statusEmoji = '🔴';
     else if (percentage > 75) statusEmoji = '🟡';
 
+    const barLength = 16;
+    const filledCount = Math.round((percentage / 100) * barLength);
+    const tokenBar = '█'.repeat(Math.min(filledCount, barLength)) + '░'.repeat(Math.max(0, barLength - filledCount));
+
     const embed = new EmbedBuilder()
-      .setTitle('📊 Context Tokens')
-      .setDescription(`Current session in this channel.`)
-      .addFields(
-        { name: 'Estimated Usage', value: `${currentTokens.toLocaleString()} tokens`, inline: true },
-        { name: 'Messages', value: `${metrics.messageCount}`, inline: true },
-        { name: 'Images', value: `${metrics.imageCount}`, inline: true },
-        { name: 'Compaction Threshold', value: `${threshold.toLocaleString()} tokens`, inline: true },
-        { name: 'System Max', value: `${maxTokens.toLocaleString()} tokens`, inline: true },
-        { name: 'Status', value: `${statusEmoji} **${percentage}%** to compaction`, inline: false }
-      )
-      .setColor(0x6c63ff);
+      .setAuthor({ name: 'LiteClaw · Context Window' })
+      .setColor(percentage > 90 ? 0xD50000 : percentage > 75 ? 0xFFAB00 : 0x00897B)
+      .setDescription([
+        `${statusEmoji} \`${tokenBar}\` **${percentage}%**`,
+        `**${currentTokens.toLocaleString()}** / ${threshold.toLocaleString()} tokens`,
+        '',
+        `💬 **${metrics.messageCount}** messages · 🖼️ **${metrics.imageCount}** images`,
+        `📐 Budget: **${maxTokens.toLocaleString()}** max · compacts at **${thresholds.compactionPct}%**`,
+      ].join('\n'));
 
     await interaction.reply({ embeds: [embed] });
   }
@@ -1053,15 +1035,12 @@ export class DiscordChannel {
         await flushProgress();
       }
 
-      const messages = buildOutgoingMessages(
-        fullContent,
-        toolUpdates,
-        {
-          replyStyle: 'single',
-          showToolProgress: false,
-        },
-        1900,
-      );
+      const messages = buildOutgoingMessages(fullContent, toolUpdates, {
+        replyStyle: 'single',
+        showToolProgress: false,
+        maxLen: 1900,
+        format: 'plain',
+      });
 
       progress.status = progress.error ? 'error' : 'done';
       await flushProgress(true, messages[0] ?? '(No response)');
@@ -1083,20 +1062,20 @@ export class DiscordChannel {
     const activeProvider = this.engine.getLLMClient().getProviders()[0];
     const primaryId = activeProvider?.id ?? 'unknown';
 
-    const fields: { name: string; value: string; inline: boolean }[] = [];
-    for (const p of providers) {
+    const modelLines = providers.map(p => {
       const isPrimary = p.id === primaryId;
-      fields.push({
-        name: `${isPrimary ? '★ ' : ''}${p.id}`,
-        value: `Context: ${p.contextWindow} | Vision: ${p.supportsVision ? '✅' : '❌'}`,
-        inline: true,
-      });
-    }
+      const prefix = isPrimary ? '`▸`' : '`·`';
+      const vision = p.supportsVision ? '👁️' : '';
+      return `${prefix} **${p.id}** — ${p.contextWindow.toLocaleString()} ctx ${vision}`;
+    });
 
     const embed = new EmbedBuilder()
-      .setTitle('🤖 Model Configuration')
-      .addFields(fields.length > 0 ? fields : [{ name: 'No models', value: 'No models configured', inline: false }])
-      .setColor(0x6c63ff);
+      .setAuthor({ name: 'LiteClaw · Models' })
+      .setColor(0x5E35B1)
+      .setDescription(modelLines.length > 0
+        ? modelLines.join('\n')
+        : '*No models configured.*',
+      );
 
     await interaction.reply({ embeds: [embed] });
   }
@@ -1507,15 +1486,12 @@ export class DiscordChannel {
         }
       } else {
         // Non-DnD responses: standard text output
-        const messages = buildOutgoingMessages(
-          structuredNarrative.content,
-          toolUpdates,
-          {
-            replyStyle: this.config.replyStyle ?? 'single',
-            showToolProgress: this.config.showToolProgress ?? false,
-          },
-          1900
-        );
+        const messages = buildOutgoingMessages(structuredNarrative.content, toolUpdates, {
+          replyStyle: this.config.replyStyle ?? 'single',
+          showToolProgress: this.config.showToolProgress ?? false,
+          maxLen: 1900,
+          format: 'plain',
+        });
 
         const first = messages[0] ?? '(No response)';
         const resolvedFirst = resolveDiscordMentions(first, mentionTargets);
@@ -1667,15 +1643,12 @@ export class DiscordChannel {
       content = convertTablesToBullets(content);
     }
 
-    const messages = buildOutgoingMessages(
-      content,
-      toolUpdates,
-      {
-        replyStyle: this.config.replyStyle ?? 'single',
-        showToolProgress: this.config.showToolProgress ?? false,
-      },
-      1900
-    );
+    const messages = buildOutgoingMessages(content, toolUpdates, {
+      replyStyle: this.config.replyStyle ?? 'single',
+      showToolProgress: this.config.showToolProgress ?? false,
+      maxLen: 1900,
+      format: 'plain',
+    });
 
     for (let i = 0; i < messages.length; i++) {
       const resolved = resolveDiscordMentions(messages[i], mentionTargets);
@@ -1858,14 +1831,14 @@ export class DiscordChannel {
         );
 
         const embed = new EmbedBuilder()
-          .setTitle('⚠️ Confirmation Required')
-          .setDescription(conf.description)
-          .addFields(
-            { name: 'Tool', value: `\`${conf.toolName}\``, inline: true },
-            { name: 'Timeout', value: `${conf.timeoutMs / 1000}s`, inline: true },
-          )
-          .setColor(0xffaa00)
-          .setFooter({ text: `ID: ${conf.id}` });
+          .setAuthor({ name: 'LiteClaw · Confirmation Required' })
+          .setColor(0xFFAB00)
+          .setDescription([
+            conf.description,
+            '',
+            `⚙️ \`${conf.toolName}\` · ⏱️ ${conf.timeoutMs / 1000}s timeout`,
+          ].join('\n'))
+          .setFooter({ text: conf.id });
 
         await (channel as any).send({ embeds: [embed], components: [row] });
       } catch (err: any) {
@@ -2213,322 +2186,135 @@ function summarizeAttachments(attachments: Message['attachments']): string {
     .join(' ');
 }
 
-function buildOutgoingMessages(
-  content: string,
-  toolUpdates: string[],
-  options: { replyStyle: 'single' | 'rapid'; showToolProgress: boolean },
-  maxLen: number
-): string[] {
-  const cleanedContent = sanitizeChannelContent(content).trim();
-  const toolSummary = (options.showToolProgress || !cleanedContent) && toolUpdates.length > 0
-    ? toolUpdates.join('\n').trim()
-    : '';
-
-  const fullText = [toolSummary, cleanedContent].filter(Boolean).join('\n\n').trim() || '(No response)';
-
-  if (options.replyStyle === 'rapid') {
-    return splitRapidMessages(fullText, maxLen);
-  }
-
-  return splitMessage(fullText, maxLen);
-}
-
 function createDiscordProgressState(): DiscordProgressState {
-  return {
-    startedAt: Date.now(),
-    status: 'starting',
-    planSummary: '',
-    tasks: [],
-    recentTools: [],
-  };
+  return createChannelProgressState();
 }
 
 function applyEventToDiscordProgress(progress: DiscordProgressState, event: AgentStreamEvent): void {
-  switch (event.type) {
-    case 'thinking':
-      if (progress.status === 'starting') progress.status = 'thinking';
-      break;
-    case 'plan':
-      progress.status = 'planning';
-      progress.planSummary = event.plan?.summary ?? progress.planSummary;
-      progress.tasks = (event.plan?.tasks ?? []).map((task, index) => ({
-        id: task.id || `task_${index + 1}`,
-        title: task.title || `Task ${index + 1}`,
-        status: task.status || 'pending',
-        summary: task.summary,
-      }));
-      break;
-    case 'task_update': {
-      progress.status = event.taskStatus === 'in_progress' ? 'working' : progress.status;
-      if (event.plan?.summary) progress.planSummary = event.plan.summary;
-
-      const taskId = event.taskId || event.taskTitle || `task_${event.taskIndex ?? progress.tasks.length + 1}`;
-      const title = event.taskTitle || 'Task';
-      const existing = progress.tasks.find((task) => task.id === taskId);
-      if (existing) {
-        existing.title = title;
-        existing.status = event.taskStatus || existing.status;
-        existing.summary = event.taskSummary || existing.summary;
-      } else {
-        progress.tasks.push({
-          id: taskId,
-          title,
-          status: event.taskStatus || 'pending',
-          summary: event.taskSummary,
-        });
-      }
-
-      if (event.taskIndex && event.taskTotal) {
-        progress.currentTaskLabel = `[${event.taskIndex}/${event.taskTotal}] ${title}`;
-      } else {
-        progress.currentTaskLabel = title;
-      }
-      break;
-    }
-    case 'tool_start':
-      progress.status = 'working';
-      pushRecentToolUpdate(progress, `Running ${event.toolName ?? 'tool'}...`);
-      break;
-    case 'tool_result':
-      pushRecentToolUpdate(
-        progress,
-        `${event.toolResult?.success ? 'Done' : 'Failed'} ${event.toolName ?? 'tool'}`
-      );
-      break;
-    case 'error':
-      progress.status = 'error';
-      progress.error = event.error;
-      break;
-    case 'done':
-      if (progress.status !== 'error') progress.status = 'done';
-      break;
-  }
-}
-
-function pushRecentToolUpdate(progress: DiscordProgressState, text: string): void {
-  progress.recentTools.push(text);
-  if (progress.recentTools.length > 5) {
-    progress.recentTools = progress.recentTools.slice(-5);
-  }
+  applyEventToChannelProgress(progress, event, 'discord');
 }
 
 function buildDiscordProgressEmbed(progress: DiscordProgressState, finalContent?: string): EmbedBuilder {
   const elapsedMs = Date.now() - progress.startedAt;
-  const completed = progress.tasks.filter((task) => task.status === 'completed').length;
-  const failed = progress.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
-  const active = progress.tasks.filter((task) => task.status === 'in_progress').length;
-  const total = progress.tasks.length;
-  const pending = Math.max(0, total - completed - failed - active);
+  const { completed, failed, active, total } = getProgressCounts(progress);
 
-  const embed = new EmbedBuilder()
-    .setTitle(embedTitleForProgress(progress))
-    .setColor(progress.status === 'error' ? 0xff5f6d : progress.status === 'done' ? 0x7eff37 : 0xffa928)
-    .setDescription(buildOverviewBlock(progress, elapsedMs, total, completed, active, pending, failed))
-    .setFooter({ text: footerForProgress(progress) })
-    .setTimestamp();
+  const statusColor = progress.status === 'error' ? 0xD50000
+    : progress.status === 'done' ? 0x00C853
+    : 0x5E35B1;
 
+  // Clean monospace progress bar
+  const barLen = 16;
+  const filledN = total > 0 ? Math.round((completed / total) * barLen) : 0;
+  const activeN = total > 0 ? Math.min(Math.round((active / total) * barLen), barLen - filledN) : 0;
+  const emptyN = Math.max(0, barLen - filledN - activeN);
+  const progressBar = total > 0
+    ? `${'█'.repeat(filledN + activeN)}${'░'.repeat(emptyN)}`
+    : '';
+
+  // Compact header
+  const statusLine = `${discordProgressStatusLabel(progress.status)} · ${formatDurationShort(elapsedMs)}`;
+  const countsText = total > 0
+    ? ` · **${completed}**/${total} done${active ? ` · ${active} active` : ''}${failed ? ` · ${failed} failed` : ''}`
+    : '';
+
+  const descParts = [`${statusLine}${countsText}`];
+  if (progressBar) {
+    descParts.push(`\`${progressBar}\``);
+  }
   if (progress.planSummary) {
-    embed.addFields({
-      name: '\u{1F5FA} Plan',
-      value: truncateDiscordEmbedField(progress.planSummary, 1024),
-      inline: false,
-    });
+    descParts.push(`> ${truncateDiscordEmbedField(progress.planSummary, 150)}`);
   }
 
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: embedTitleForProgress(progress) })
+    .setColor(statusColor)
+    .setDescription(descParts.join('\n'))
+    .setTimestamp(new Date(progress.startedAt));
+
+  // Tasks — compact list without separate Legend
   if (progress.tasks.length > 0) {
     const taskLines = progress.tasks
-      .slice(0, 8)
-      .map((task, index) => `${index + 1}. ${discordTaskStatusIcon(task.status)} ${task.title}${task.summary ? ` - ${task.summary}` : ''}`);
+      .slice(0, 10)
+      .map((task) => {
+        const icon = discordTaskStatusIcon(task.status);
+        const summary = task.summary
+          ? ` — ${truncateDiscordEmbedField(task.summary.replace(/\n/g, ' '), 80)}`
+          : '';
+        return `${icon} **${task.title}**${summary}`;
+      });
     embed.addFields({
-      name: '\u{1F4CB} Tasks',
+      name: 'Tasks',
       value: truncateDiscordEmbedField(taskLines.join('\n'), 1024),
       inline: false,
     });
-    embed.addFields({
-      name: '\u{1F4D8} Legend',
-      value: `${discordTaskStatusIcon('completed')} completed\n${discordTaskStatusIcon('in_progress')} active\n${discordTaskStatusIcon('pending')} pending\n${discordTaskStatusIcon('blocked')} blocked\n${discordTaskStatusIcon('failed')} failed`,
-      inline: false,
-    });
   }
 
-  if (progress.currentTaskLabel || progress.recentTools.length > 0 || progress.error) {
-    const activityLines = [
-      progress.currentTaskLabel ? `Current focus\n${progress.currentTaskLabel}` : '',
-      ...progress.recentTools.map((line) => `- ${line}`),
-      progress.error ? `Error: ${progress.error}` : '',
-    ].filter(Boolean);
-
-    if (activityLines.length > 0) {
+  // Activity — only when actively working
+  if (progress.status !== 'done' && progress.status !== 'error') {
+    const activityParts: string[] = [];
+    if (progress.currentTaskLabel) {
+      activityParts.push(`▸ ${progress.currentTaskLabel}`);
+    }
+    if (progress.recentTools.length > 0) {
+      activityParts.push(...progress.recentTools.slice(-3).map(l => `\`·\` ${l}`));
+    }
+    if (activityParts.length > 0) {
       embed.addFields({
-        name: '\u{2699} Activity',
-        value: truncateDiscordEmbedField(activityLines.join('\n'), 1024),
+        name: 'Activity',
+        value: truncateDiscordEmbedField(activityParts.join('\n'), 1024),
         inline: false,
       });
     }
   }
 
-  const finalState = buildFinalStateBlock(progress, finalContent);
-  if (finalState) {
+  // Error / outcome
+  if (progress.status === 'error' && progress.error) {
     embed.addFields({
-      name: '\u{1F3C1} Outcome',
-      value: truncateDiscordEmbedField(finalState, 1024),
+      name: '⚠ Error',
+      value: truncateDiscordEmbedField(progress.error, 1024),
       inline: false,
     });
+  }
+
+  if (finalContent && progress.status === 'done') {
+    const preview = formatProgressPreview(finalContent, 'discord', 280);
+    if (preview) {
+      embed.addFields({
+        name: 'Outcome',
+        value: truncateDiscordEmbedField(preview, 1024),
+        inline: false,
+      });
+    }
   }
 
   return embed;
 }
 
 function discordProgressStatusLabel(status: DiscordProgressState['status']): string {
-  switch (status) {
-    case 'thinking': return '\u{1F9E0} Thinking';
-    case 'planning': return '\u{1F5FA} Planning';
-    case 'working': return '\u{2699} Working';
-    case 'done': return '\u{2705} Complete';
-    case 'error': return '\u{274C} Error';
-    case 'starting':
-    default:
-      return '\u{1F440} Starting';
-  }
+  return formatProgressStatusLabel(status, 'discord');
 }
 
 function discordTaskStatusIcon(status: string): string {
-  switch (status) {
-    case 'completed': return '\u{2705}';
-    case 'in_progress': return '\u{1F7E1}';
-    case 'failed': return '\u{274C}';
-    case 'blocked': return '\u{26A0}';
-    default: return '\u{23F3}';
-  }
-}
-
-function formatDurationShort(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(totalSec / 60);
-  const seconds = totalSec % 60;
-  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+  return formatTaskStatusIcon(status, 'discord');
 }
 
 function truncateDiscordEmbedField(value: string, max: number): string {
   if (value.length <= max) return value;
-  return `${value.slice(0, Math.max(0, max - 1)).trimEnd()}...`;
+  return `${value.slice(0, Math.max(0, max - 3)).trimEnd()}…`;
 }
 
 function embedTitleForProgress(progress: DiscordProgressState): string {
   switch (progress.status) {
-    case 'planning':
-      return 'LiteClaw \u00B7 Task Planner';
-    case 'working':
-      return 'LiteClaw \u00B7 In Progress';
-    case 'done':
-      return 'LiteClaw \u00B7 Completed';
-    case 'error':
-      return 'LiteClaw \u00B7 Needs Attention';
-    case 'thinking':
-      return 'LiteClaw \u00B7 Thinking';
+    case 'planning': return 'LiteClaw · Planning';
+    case 'working': return 'LiteClaw · Working';
+    case 'done': return 'LiteClaw · Done';
+    case 'error': return 'LiteClaw · Error';
+    case 'thinking': return 'LiteClaw · Thinking';
     case 'starting':
-    default:
-      return 'LiteClaw \u00B7 Starting';
+    default: return 'LiteClaw · Starting';
   }
 }
 
-function buildOverviewBlock(
-  progress: DiscordProgressState,
-  elapsedMs: number,
-  total: number,
-  completed: number,
-  active: number,
-  pending: number,
-  failed: number
-): string {
-  const lines = [
-    `\u{1F4CA} Overview`,
-    `${discordProgressStatusLabel(progress.status)}  \u2022  ${formatDurationShort(elapsedMs)}`,
-    '',
-    `${discordTaskStatusIcon('completed')} ${completed}/${total || 0} done  \u2022  ${discordTaskStatusIcon('in_progress')} ${active} active`,
-    `${discordTaskStatusIcon('pending')} ${pending} pending${failed ? `  \u2022  ${discordTaskStatusIcon('blocked')} ${failed} issue${failed === 1 ? '' : 's'}` : ''}`,
-  ];
-
-  if (progress.currentTaskLabel && progress.status !== 'done' && progress.status !== 'error') {
-    lines.push('');
-    lines.push(`Current: ${progress.currentTaskLabel}`);
-  }
-
-  return lines.join('\n');
-}
-
-function footerForProgress(progress: DiscordProgressState): string {
-  switch (progress.status) {
-    case 'done':
-      return 'Plan execution finished';
-    case 'error':
-      return 'Plan execution stopped with an error';
-    default:
-      return 'Live progress updates';
-  }
-}
-
-function buildFinalStateBlock(progress: DiscordProgressState, finalContent?: string): string | null {
-  if (progress.status !== 'done' && progress.status !== 'error') {
-    return null;
-  }
-
-  if (progress.status === 'error') {
-    return progress.error
-      ? `The task ended with an error:\n${progress.error}`
-      : 'The task ended before a final answer was produced.';
-  }
-
-  const condensed = sanitizeChannelContent(finalContent ?? '').replace(/\s+/g, ' ').trim();
-  if (!condensed) {
-    return 'Reply sent below.';
-  }
-
-  return 'Reply sent below.';
-}
-
-// sanitizeChannelContent is imported from utils.js
-
-function splitRapidMessages(text: string, maxLen: number): string[] {
-  const paragraphs = text
-    .split(/\n{2,}/)
-    .map(p => p.trim())
-    .filter(Boolean);
-
-  const bursts: string[] = [];
-
-  for (const paragraph of paragraphs) {
-    if (paragraph.length <= Math.min(maxLen, 500)) {
-      bursts.push(paragraph);
-      continue;
-    }
-
-    const pieces = paragraph
-      .split(/(?<=[.!?])\s+|\n/)
-      .map(p => p.trim())
-      .filter(Boolean);
-
-    let current = '';
-    for (const piece of pieces) {
-      const candidate = current ? `${current} ${piece}` : piece;
-      if (candidate.length > Math.min(maxLen, 500)) {
-        if (current) bursts.push(current);
-        if (piece.length > Math.min(maxLen, 500)) {
-          bursts.push(...splitMessage(piece, Math.min(maxLen, 500)));
-          current = '';
-        } else {
-          current = piece;
-        }
-      } else {
-        current = candidate;
-      }
-    }
-
-    if (current) bursts.push(current);
-  }
-
-  return bursts.length > 0 ? bursts : ['(No response)'];
-}
 
 function convertTablesToBullets(text: string): string {
   const lines = text.split('\n');

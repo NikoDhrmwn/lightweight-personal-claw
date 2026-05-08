@@ -6,12 +6,14 @@
  */
 
 import { existsSync, readdirSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import YAML from 'yaml';
 import { createLogger } from '../logger.js';
 import { getConfig, getStateDir } from '../config.js';
 
 const log = createLogger('skills');
+const moduleDir = dirname(fileURLToPath(import.meta.url));
 
 export interface LoadedSkill {
   name: string;
@@ -102,9 +104,11 @@ function getSkillDirectories(): string[] {
   const stateDir = getStateDir();
   const configured = config.agent?.skills?.directories ?? [];
   const workspace = config.agent?.workspace;
+  const builtInSkillsDir = resolve(moduleDir, '..', '..', 'skills');
 
   return uniquePaths([
     join(stateDir, 'skills'),
+    builtInSkillsDir,
     join(process.cwd(), 'skills'),
     workspace ? join(workspace, 'skills') : '',
     ...configured,

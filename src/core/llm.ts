@@ -7,6 +7,7 @@
  */
 
 import OpenAI from 'openai';
+import { GoogleAuth } from 'google-auth-library';
 import { EventEmitter } from 'events';
 import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
@@ -233,6 +234,7 @@ export class LLMClient extends EventEmitter {
   private providers: LLMProvider[];
   private allProviders: LLMProvider[];
   private initialized = false;
+  private googleAuth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
 
   constructor() {
     super();
@@ -311,10 +313,28 @@ export class LLMClient extends EventEmitter {
     }, 'LLM Providers refreshed');
   }
 
-  private createOpenAIClient(provider: LLMProvider): OpenAI {
+  private async createOpenAIClient(provider: LLMProvider): Promise<OpenAI> {
+    let apiKey = provider.apiKey;
+    let baseUrl = provider.baseUrl;
+
+    if (provider.providerId === 'google' && baseUrl.includes('aiplatform.googleapis.com')) {
+      const isExpress = provider.rawProvider?.express === true;
+      if (!isExpress) {
+        try {
+          const client = await this.googleAuth.getClient();
+          const token = await client.getAccessToken();
+          if (token.token) {
+            apiKey = token.token;
+          }
+        } catch (err: any) {
+          log.error({ error: err.message }, 'Failed to get Vertex AI access token');
+        }
+      }
+    }
+
     return new OpenAI({
-      baseURL: provider.baseUrl,
-      apiKey: provider.apiKey,
+      baseURL: baseUrl,
+      apiKey: apiKey,
       timeout: 120_000, // 2 min timeout for slow local models
     });
   }
@@ -333,7 +353,7 @@ export class LLMClient extends EventEmitter {
     let lastError: Error | null = null;
 
     for (const provider of this.providers) {
-      const client = this.createOpenAIClient(provider);
+      const client = await this.createOpenAIClient(provider);
       const maxAttempts = isRetryFriendlyProvider(provider) ? 3 : 1;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -665,7 +685,7 @@ export class LLMClient extends EventEmitter {
   async complete(messages: LLMMessage[], options?: { maxTokens?: number }): Promise<string> {
     this.refreshProviders();
     for (const provider of this.providers) {
-      const client = this.createOpenAIClient(provider);
+      const client = await this.createOpenAIClient(provider);
       const maxAttempts = isRetryFriendlyProvider(provider) ? 3 : 1;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
@@ -742,7 +762,22 @@ function resolveReasoningConfig(options?: { disableReasoning?: boolean; reasonin
 
 function getProviderBaseUrl(provId: string, providerConfig: Record<string, any>): string {
   let baseUrl = providerConfig.baseUrl ?? '';
-  if (!baseUrl && provId === 'google') baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+  if (!baseUrl && provId === 'google') {
+    if (providerConfig.express) {
+      // Vertex AI Express Mode uses the simplified AI Studio endpoints (global by default, API Key only)
+      baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+    } else if (providerConfig.vertex || (process.env.GCP_PROJECT && (process.env.GCP_REGION || process.env.GCP_LOCATION || !baseUrl))) {
+      const project = providerConfig.project ?? process.env.GCP_PROJECT ?? 'my-project';
+      const region = providerConfig.region ?? process.env.GCP_REGION ?? process.env.GCP_LOCATION ?? 'global';
+      if (region === 'global') {
+        baseUrl = `https://aiplatform.googleapis.com/v1beta1/projects/${project}/locations/global/endpoints/openapi`;
+      } else {
+        baseUrl = `https://${region}-aiplatform.googleapis.com/v1beta1/projects/${project}/locations/${region}/endpoints/openapi`;
+      }
+    } else {
+      baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+    }
+  }
   if (!baseUrl && provId === 'nvidia') baseUrl = 'https://integrate.api.nvidia.com/v1';
   if (!baseUrl && provId === 'deepseek') baseUrl = 'https://api.deepseek.com';
   return baseUrl;
@@ -785,7 +820,7 @@ function inferSupportsReasoning(
   const model = modelId.toLowerCase();
   const url = baseUrl.toLowerCase();
 
-  if (provider === 'google' || url.includes('generativelanguage.googleapis.com')) {
+  if (provider === 'google' || url.includes('generativelanguage.googleapis.com') || url.includes('aiplatform.googleapis.com')) {
     return model.includes('gemini-2.5') || model.includes('gemini-3');
   }
   if (provider === 'deepseek' || url.includes('api.deepseek.com')) {
@@ -1145,7 +1180,9 @@ function normalizeNativeToolResultContent(content: string | LLMContentPart[] | n
 }
 
 function isGoogleProvider(provider: Pick<LLMProvider, 'id' | 'baseUrl'>): boolean {
-  return provider.id.startsWith('google/') || provider.baseUrl.includes('generativelanguage.googleapis.com');
+  return provider.id.startsWith('google/') ||
+         provider.baseUrl.includes('generativelanguage.googleapis.com') ||
+         provider.baseUrl.includes('aiplatform.googleapis.com');
 }
 
 function isNvidiaProvider(provider: Pick<LLMProvider, 'id' | 'baseUrl'>): boolean {

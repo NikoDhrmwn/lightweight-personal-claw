@@ -10,7 +10,17 @@
   let currentConfig = {};
   let healthData = {};
   let sessions = [];
-  let currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
+  let currentSessionMetrics = {
+    estimatedTokens: 0,
+    messageCount: 0,
+    imageCount: 0,
+    contextMaxTokens: 0,
+    contextBudgetPct: 80,
+    contextBudgetTokens: 0,
+    compactionThresholdPct: 90,
+    compactionThresholdTokens: 0,
+    compactionProgressPct: 0,
+  };
   let pendingConfirmationId = null;
   let pendingRegeneration = null;
   let isRegenerating = false;
@@ -80,6 +90,7 @@
     settingPlannerMaxReplans: $("#settingPlannerMaxReplans"),
     settingContextTokens: $("#settingContextTokens"),
     settingContextBudgetPct: $("#settingContextBudgetPct"),
+    settingCompactionThresholdPct: $("#settingCompactionThresholdPct"),
     settingSkillsMaxInjected: $("#settingSkillsMaxInjected"),
     toggleSkillsEnabled: $("#toggleSkillsEnabled"),
     toggleDiscord: $("#toggleDiscord"),
@@ -99,6 +110,25 @@
     settingGatewayPort: $("#settingGatewayPort"),
     settingGatewayBind: $("#settingGatewayBind"),
     gatewayAuthNote: $("#gatewayAuthNote"),
+    settingAgentName: $("#settingAgentName"),
+    toggleGoogleVertex: $("#toggleGoogleVertex"),
+    toggleGoogleExpress: $("#toggleGoogleExpress"),
+    settingGoogleProject: $("#settingGoogleProject"),
+    settingGoogleRegion: $("#settingGoogleRegion"),
+    onboardingModal: $("#onboardingModal"),
+    onboardingName: $("#onboardingName"),
+    onboardingSubmit: $("#onboardingSubmit"),
+    // Extensions: D&D
+    toggleDndEnabled: $("#toggleDndEnabled"),
+    dndExtensionBody: $("#dndExtensionBody"),
+    settingDndNarrativeModel: $("#settingDndNarrativeModel"),
+    settingDndLoadoutModel: $("#settingDndLoadoutModel"),
+    settingDndWorld: $("#settingDndWorld"),
+    settingDndTone: $("#settingDndTone"),
+    settingDndMaxPlayers: $("#settingDndMaxPlayers"),
+    settingDndNarrativeTemp: $("#settingDndNarrativeTemp"),
+    settingDndNarrativeMaxTokens: $("#settingDndNarrativeMaxTokens"),
+    toggleDndAutoProvision: $("#toggleDndAutoProvision"),
   };
 
   // ─── Sidebar Toggle ──────────────────────────────────────────────
@@ -160,6 +190,7 @@
     try {
       healthData = await fetchJson("/health");
       renderHealth();
+      checkOnboarding();
     } catch (error) {
       showNotice(`Failed to refresh health: ${error.message || error}`, "error", 2600);
     }
@@ -272,7 +303,17 @@
       renderSessionMetrics();
     } catch {
       if (sessionKey !== currentSessionKey) return;
-      currentSessionMetrics = { estimatedTokens: 0, messageCount: 0, imageCount: 0 };
+      currentSessionMetrics = {
+        estimatedTokens: 0,
+        messageCount: 0,
+        imageCount: 0,
+        contextMaxTokens: 0,
+        contextBudgetPct: 80,
+        contextBudgetTokens: 0,
+        compactionThresholdPct: 90,
+        compactionThresholdTokens: 0,
+        compactionProgressPct: 0,
+      };
       renderSessionMetrics();
     }
   }
@@ -280,9 +321,11 @@
   function renderSessionMetrics() {
     if (!refs.tokenLabel) return;
     const tokens = Number(currentSessionMetrics.estimatedTokens || 0).toLocaleString();
-    const messages = Number(currentSessionMetrics.messageCount || 0);
-    const images = Number(currentSessionMetrics.imageCount || 0);
-    refs.tokenLabel.textContent = `Tokens ${tokens} / msg ${messages} / img ${images}`;
+    const threshold = Number(currentSessionMetrics.compactionThresholdTokens || 0);
+    const progress = Number(currentSessionMetrics.compactionProgressPct || 0);
+    refs.tokenLabel.textContent = threshold > 0
+      ? `Tokens ${tokens} / compaction ${progress}% of ${threshold.toLocaleString()}`
+      : `Tokens ${tokens}`;
   }
 
   async function loadSessionHistory(sessionKey) {
@@ -331,13 +374,15 @@
 
   function addRestoredTaskPlan(plan) {
     hideWelcome();
+    const name = healthData.name || "LiteClaw";
+    const initial = name.charAt(0).toUpperCase();
     const el = document.createElement("div");
     el.className = "message assistant restored-plan";
     el.dataset.messageRole = "plan";
     el.innerHTML = `
-      <div class="message-avatar">LC</div>
+      <div class="message-avatar">${escapeHtml(initial)}</div>
       <div class="message-body">
-        <div class="message-sender">LiteClaw</div>
+        <div class="message-sender">${escapeHtml(name)}</div>
         <div class="message-content"></div>
       </div>
     `;
@@ -352,11 +397,22 @@
   // ─── Health Rendering ─────────────────────────────────────────────
 
   function renderHealth() {
-    if (refs.modelBadge) refs.modelBadge.textContent = healthData.model || "--";
-    if (refs.healthLabel) {
-      const status = healthData.status || "unknown";
-      refs.healthLabel.textContent = `Health (${healthData.sessionCount || sessions.length || 0})`;
-    }
+    const primary = healthData.model || "unknown";
+    const name = healthData.name || "LiteClaw";
+    
+    // Update brand name in sidebar
+    const brandName = $(".brand-name");
+    if (brandName) brandName.textContent = name;
+    
+    // Update welcome screen if visible
+    const welcomeTitle = $(".welcome-card h2");
+    if (welcomeTitle) welcomeTitle.textContent = `I'm ${name}`;
+
+    if (inputEl) inputEl.placeholder = `Message ${name}...`;
+
+    refs.healthDot.className = "indicator-dot online";
+    if (refs.healthLabel) refs.healthLabel.textContent = `Health (${healthData.sessionCount || sessions.length || 0})`;
+    
     applyChannelState(refs.chWebui, healthData.channels?.webui?.status || "online");
     applyChannelState(refs.chDiscord, healthData.channels?.discord?.status || "unknown");
     applyChannelState(refs.chWhatsapp, healthData.channels?.whatsapp?.status || "unknown");
@@ -388,12 +444,14 @@
     refs.settingMaxOutputTokens.value = llmDefaults.maxOutputTokens ?? 8192;
     updateLlmParamsVisibility();
 
-    refs.settingWorkspace.value = config.agent?.workspace || "";
-    refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
+    if (refs.settingAgentName) refs.settingAgentName.value = config.agent?.name || "";
+    if (refs.settingWorkspace) refs.settingWorkspace.value = config.agent?.workspace || "";
+    if (refs.settingMaxTurns) refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
     refs.settingPlannerMode.value = config.agent?.planner?.mode || "auto";
     refs.settingPlannerMaxReplans.value = config.agent?.planner?.maxReplans ?? 2;
     refs.settingContextTokens.value = config.agent?.contextTokens || 64000;
     refs.settingContextBudgetPct.value = config.agent?.contextBudgetPct || 80;
+    refs.settingCompactionThresholdPct.value = config.agent?.compaction?.softThresholdPct || 90;
     refs.settingSkillsMaxInjected.value = config.agent?.skills?.maxInjected || 2;
     refs.toggleSkillsEnabled.checked = !!config.agent?.skills?.enabled;
 
@@ -416,11 +474,40 @@
     refs.toggleConfirmDelete.checked = !!config.tools?.filesystem?.confirmDelete;
     refs.toggleVisionEnabled.checked = !!config.tools?.vision?.enabled;
     refs.settingVisionMaxDimension.value = config.tools?.vision?.maxDimensionPx || 1024;
+
+    const google = config.llm?.providers?.google || {};
+    if (refs.toggleGoogleVertex) refs.toggleGoogleVertex.checked = !!google.vertex;
+    if (refs.toggleGoogleExpress) refs.toggleGoogleExpress.checked = !!google.express;
+    if (refs.settingGoogleProject) refs.settingGoogleProject.value = google.project || "";
+    if (refs.settingGoogleRegion) refs.settingGoogleRegion.value = google.region || "global";
+    updateGoogleVisibility();
+
     refs.settingGatewayPort.value = config.gateway?.port || 7860;
     refs.settingGatewayBind.value = config.gateway?.bind || "loopback";
     refs.gatewayAuthNote.textContent = config.gateway?.authEnabled
       ? "Auth: gateway token configured"
       : "Auth: local WebUI endpoints open";
+
+    // Extensions: D&D
+    const dnd = config.extensions?.dnd || {};
+    if (refs.toggleDndEnabled) refs.toggleDndEnabled.checked = dnd.enabled !== false;
+    updateDndVisibility();
+
+    // Populate DnD model selects from available models list
+    const dndModels = config.llm?.availableModels || [];
+    for (const sel of [refs.settingDndNarrativeModel, refs.settingDndLoadoutModel]) {
+      if (!sel) continue;
+      sel.innerHTML = `<option value="">(use primary model)</option>`
+        + dndModels.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join("");
+    }
+    if (refs.settingDndNarrativeModel) refs.settingDndNarrativeModel.value = dnd.narrativeModel || "";
+    if (refs.settingDndLoadoutModel) refs.settingDndLoadoutModel.value = dnd.loadoutModel || "";
+    if (refs.settingDndWorld) refs.settingDndWorld.value = dnd.defaultWorld || "elyndor";
+    if (refs.settingDndTone) refs.settingDndTone.value = dnd.defaultTone || "heroic";
+    if (refs.settingDndMaxPlayers) refs.settingDndMaxPlayers.value = dnd.maxPlayers || 6;
+    if (refs.settingDndNarrativeTemp) refs.settingDndNarrativeTemp.value = dnd.narrativeTemperature ?? 0.9;
+    if (refs.settingDndNarrativeMaxTokens) refs.settingDndNarrativeMaxTokens.value = dnd.narrativeMaxTokens || 4096;
+    if (refs.toggleDndAutoProvision) refs.toggleDndAutoProvision.checked = dnd.autoProvision !== false;
   }
 
   function updateLlmParamsVisibility() {
@@ -429,7 +516,32 @@
     }
   }
 
+  function updateGoogleVisibility() {
+    const isExpress = refs.toggleGoogleExpress?.checked;
+    if (refs.settingGoogleProject) {
+      refs.settingGoogleProject.disabled = isExpress;
+      refs.settingGoogleProject.closest(".field").style.opacity = isExpress ? "0.5" : "1";
+    }
+    if (refs.settingGoogleRegion) {
+      refs.settingGoogleRegion.disabled = isExpress;
+      refs.settingGoogleRegion.closest(".field").style.opacity = isExpress ? "0.5" : "1";
+    }
+  }
+
   refs.settingModel.addEventListener("change", updateLlmParamsVisibility);
+  if (refs.toggleGoogleExpress) {
+    refs.toggleGoogleExpress.addEventListener("change", updateGoogleVisibility);
+  }
+
+  function updateDndVisibility() {
+    if (!refs.dndExtensionBody) return;
+    const enabled = refs.toggleDndEnabled?.checked ?? true;
+    refs.dndExtensionBody.classList.toggle("disabled", !enabled);
+  }
+
+  if (refs.toggleDndEnabled) {
+    refs.toggleDndEnabled.addEventListener("change", updateDndVisibility);
+  }
 
   function gatherSettingsPayload() {
     const toolLoading = document.querySelector("#toolLoadingGroup .toggle-chip.active")?.dataset.value || "lazy";
@@ -442,8 +554,9 @@
         maxOutputTokens: Number(refs.settingMaxOutputTokens.value || 8192),
       },
       agent: {
+        name: refs.settingAgentName.value.trim(),
         workspace: refs.settingWorkspace.value.trim(),
-        maxTurns: Number(refs.settingMaxTurns.value || 20),
+        maxTurns: parseInt(refs.settingMaxTurns.value, 10),
         planner: {
           mode: refs.settingPlannerMode.value || "auto",
           maxReplans: Number(refs.settingPlannerMaxReplans.value || 2),
@@ -452,6 +565,9 @@
         thinkingDefault: refs.settingThinking.value,
         contextTokens: Number(refs.settingContextTokens.value || 64000),
         contextBudgetPct: Number(refs.settingContextBudgetPct.value || 80),
+        compaction: {
+          softThresholdPct: Number(refs.settingCompactionThresholdPct.value || 90),
+        },
         skills: {
           enabled: refs.toggleSkillsEnabled.checked,
           maxInjected: Number(refs.settingSkillsMaxInjected.value || 2),
@@ -490,6 +606,25 @@
       gateway: {
         port: Number(refs.settingGatewayPort.value || 7860),
         bind: refs.settingGatewayBind.value,
+      },
+      google: {
+        vertex: refs.toggleGoogleVertex?.checked ?? false,
+        express: refs.toggleGoogleExpress?.checked ?? false,
+        project: refs.settingGoogleProject?.value.trim() ?? "",
+        region: refs.settingGoogleRegion?.value.trim() ?? "global",
+      },
+      extensions: {
+        dnd: {
+          enabled: refs.toggleDndEnabled?.checked ?? true,
+          narrativeModel: refs.settingDndNarrativeModel?.value ?? "",
+          loadoutModel: refs.settingDndLoadoutModel?.value ?? "",
+          defaultWorld: refs.settingDndWorld?.value ?? "elyndor",
+          defaultTone: refs.settingDndTone?.value ?? "heroic",
+          maxPlayers: Number(refs.settingDndMaxPlayers?.value || 6),
+          autoProvision: refs.toggleDndAutoProvision?.checked ?? true,
+          narrativeTemperature: Number(refs.settingDndNarrativeTemp?.value || 0.9),
+          narrativeMaxTokens: Number(refs.settingDndNarrativeMaxTokens?.value || 4096),
+        },
       },
     };
   }
@@ -569,12 +704,13 @@
 
   function showWelcome() {
     if ($("#welcomeScreen")) return;
+    const name = healthData.name || "LiteClaw";
     messagesEl.innerHTML = `
       <div class="welcome-panel" id="welcomeScreen">
         <div class="welcome-content">
           <div class="eyebrow">Launch pad</div>
           <h3>What can I help you with?</h3>
-          <p>Chat with LiteClaw to inspect, edit, search, or plan across your workspace.</p>
+          <p>Chat with ${escapeHtml(name)} to inspect, edit, search, or plan across your workspace.</p>
           <div class="welcome-actions">
             <button class="welcome-chip" data-prompt="Inspect the current workspace and tell me what this project is.">Inspect workspace</button>
             <button class="welcome-chip" data-prompt="Read README.md and propose the next milestone.">Plan next milestone</button>
@@ -673,12 +809,14 @@
 
   function addRestoredAssistantMessage(content) {
     const el = document.createElement("div");
+    const name = healthData.name || "LiteClaw";
+    const initial = name.charAt(0).toUpperCase();
     el.className = "message assistant";
     el.dataset.messageRole = "assistant";
     el.innerHTML = `
-      <div class="message-avatar">LC</div>
+      <div class="message-avatar">${escapeHtml(initial)}</div>
       <div class="message-body">
-        <div class="message-sender">LiteClaw</div>
+        <div class="message-sender">${escapeHtml(name)}</div>
         <div class="message-content">${renderMarkdown(content)}</div>
       </div>
     `;
@@ -691,13 +829,15 @@
   function ensureAssistantMessage() {
     if (currentAssistantEl) return;
     hideWelcome();
+    const name = healthData.name || "LiteClaw";
+    const initial = name.charAt(0).toUpperCase();
     currentAssistantEl = document.createElement("div");
     currentAssistantEl.className = "message assistant";
     currentAssistantEl.dataset.messageRole = "assistant";
     currentAssistantEl.innerHTML = `
-      <div class="message-avatar">LC</div>
+      <div class="message-avatar">${escapeHtml(initial)}</div>
       <div class="message-body">
-        <div class="message-sender">LiteClaw</div>
+        <div class="message-sender">${escapeHtml(name)}</div>
         <div class="message-content"></div>
       </div>
     `;
@@ -739,6 +879,69 @@
     contentEl.innerHTML = renderMarkdown(visibleContent) + (isStreaming ? '<span class="streaming-cursor"></span>' : "");
     addCopyButtons(contentEl);
     scrollToBottom();
+    if (!isStreaming) {
+      unfurlLinks(currentAssistantEl, visibleContent);
+    }
+  }
+
+  function unfurlLinks(assistantEl, text) {
+    const urls = text.match(/https?:\/\/[^\s<)\]]+/g);
+    if (!urls) return;
+    
+    const uniqueUrls = [...new Set(urls)];
+    let unfurlContainer = assistantEl.querySelector('.unfurl-container');
+    if (!unfurlContainer) {
+      unfurlContainer = document.createElement('div');
+      unfurlContainer.className = 'unfurl-container';
+      unfurlContainer.style.display = 'flex';
+      unfurlContainer.style.flexWrap = 'wrap';
+      unfurlContainer.style.gap = '8px';
+      unfurlContainer.style.marginTop = '8px';
+      assistantEl.querySelector(".message-body").appendChild(unfurlContainer);
+    }
+
+    uniqueUrls.forEach(async url => {
+      if (unfurlContainer.querySelector(`[data-url="${CSS.escape(url)}"]`)) return;
+      
+      const placeholder = document.createElement('div');
+      placeholder.dataset.url = url;
+      placeholder.style.display = 'none';
+      unfurlContainer.appendChild(placeholder);
+
+      try {
+        const data = await fetchJson(`/api/unfurl?url=${encodeURIComponent(url)}`);
+        if (data.mediaUrl) {
+          placeholder.style.display = 'block';
+          if (data.mediaUrl.endsWith('.mp4') || data.mediaUrl.endsWith('.webm')) {
+            placeholder.innerHTML = `<video src="${escapeHtml(data.mediaUrl)}" autoplay loop muted playsinline style="max-width:300px; max-height:300px; border-radius:8px; object-fit:contain;"></video>`;
+          } else {
+            placeholder.innerHTML = `<img src="${escapeHtml(data.mediaUrl)}" alt="media" style="max-width:300px; max-height:300px; border-radius:8px; object-fit:contain;" />`;
+          }
+          
+          // Hide bare links from text nodes and empty links
+          const contentEl = assistantEl.querySelector(".message-content");
+          if (contentEl) {
+            const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            while(node = walker.nextNode()) {
+              if (node.nodeValue.includes(url)) {
+                 node.nodeValue = node.nodeValue.replace(url, '').trim();
+              }
+            }
+            const links = contentEl.querySelectorAll(`a[href="${CSS.escape(url)}"]`);
+            links.forEach(link => {
+               if (link.textContent === url || link.textContent === '') {
+                 link.style.display = 'none';
+               }
+            });
+          }
+          
+          scrollToBottom();
+        }
+      } catch (e) {
+        console.error('Failed to unfurl', url, e);
+      }
+    });
   }
 
   function appendThinking(text) {
@@ -753,7 +956,7 @@
 
     if (!wrapper || wrapper.dataset.closed === "true") {
       wrapper = document.createElement("div");
-      wrapper.className = "thinking-wrapper expanded"; // Show by default during streaming
+      wrapper.className = "thinking-wrapper"; // Collapsed by default as requested
 
       const header = document.createElement("button");
       header.className = "thinking-header";
@@ -1075,16 +1278,33 @@
       if (looksLikeMarkdownTable(trimmed)) {
         return renderMarkdownTable(trimmed);
       }
-      if (/^[-*] /m.test(trimmed)) {
-        const items = trimmed.split("\n").filter(Boolean).map((line) => {
-          if (/^[-*] /.test(line)) return `<li>${line.slice(2)}</li>`;
-          return `<li>${line}</li>`;
-        }).join("");
-        return `<ul>${items}</ul>`;
-      }
-      if (/^\d+\. /m.test(trimmed)) {
-        const items = trimmed.split("\n").filter(Boolean).map((line) => `<li>${line.replace(/^\d+\. /, "")}</li>`).join("");
-        return `<ol>${items}</ol>`;
+      if (/^[-*]\s+/m.test(trimmed) || /^\d+\.\s+/m.test(trimmed)) {
+        const lines = trimmed.split("\n");
+        const result = [];
+        let currentListType = null; // 'ul', 'ol', or null
+
+        for (const line of lines) {
+          const ulMatch = line.match(/^[-*]\s+(.+)$/);
+          const olMatch = line.match(/^(\d+)\.\s+(.+)$/);
+          const type = ulMatch ? "ul" : (olMatch ? "ol" : null);
+
+          if (type) {
+            if (currentListType !== type) {
+              if (currentListType) result.push(`</${currentListType}>`);
+              result.push(`<${type}>`);
+              currentListType = type;
+            }
+            result.push(`<li>${ulMatch ? ulMatch[1] : olMatch[2]}</li>`);
+          } else {
+            if (currentListType) {
+              result.push(`</${currentListType}>`);
+              currentListType = null;
+            }
+            result.push(line);
+          }
+        }
+        if (currentListType) result.push(`</${currentListType}>`);
+        return result.join("\n");
       }
       return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
     }).join("");
@@ -1611,6 +1831,41 @@
   if (sidebarBackdrop) {
     sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
   }
+
+  // ─── Onboarding ───────────────────────────────────────────────────
+
+  async function checkOnboarding() {
+    // If agent name is default "LiteClaw", show onboarding
+    if (healthData.name === "LiteClaw" || !healthData.name) {
+      refs.onboardingModal.hidden = false;
+    }
+  }
+
+  refs.onboardingSubmit?.addEventListener("click", async () => {
+    const newName = refs.onboardingName.value.trim();
+    if (!newName) return;
+    
+    try {
+      refs.onboardingSubmit.disabled = true;
+      refs.onboardingSubmit.textContent = "Setting up...";
+      
+      await fetchJson("/api/config", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agent: { name: newName }
+        })
+      });
+      
+      refs.onboardingModal.hidden = true;
+      showNotice(`Welcome, ${newName}!`, "success");
+      fetchHealth(); // Refresh UI
+    } catch (error) {
+      showNotice(`Failed to set name: ${error.message}`, "error");
+      refs.onboardingSubmit.disabled = false;
+      refs.onboardingSubmit.textContent = "Get started";
+    }
+  });
 
   // ─── Initialization ───────────────────────────────────────────────
 

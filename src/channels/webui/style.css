@@ -1607,6 +1607,69 @@ button {
   margin-top: 10px;
 }
 
+/* ─── Extensions ───────────────────────────────────────────────────── */
+
+.settings-card-extensions {
+  grid-column: 1 / -1;
+  border-image: linear-gradient(90deg, var(--violet), var(--cyan), var(--green)) 1;
+}
+
+.extension-cards {
+  margin-top: 8px;
+}
+
+.extension-subcard {
+  padding: 14px;
+  position: relative;
+  overflow: hidden;
+}
+
+.extension-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.extension-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1;
+}
+
+.extension-icon {
+  font-size: 1.8rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.extension-desc {
+  color: var(--muted);
+  font-size: 0.78rem;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.extension-toggle {
+  flex-shrink: 0;
+  margin-top: 0;
+}
+
+.extension-body {
+  transition: opacity 200ms ease, max-height 300ms ease;
+  max-height: 600px;
+  overflow: hidden;
+}
+
+.extension-body.disabled {
+  opacity: 0.35;
+  pointer-events: none;
+  max-height: 0;
+  margin: 0;
+  padding: 0;
+}
+
 .eyebrow {
   font-size: 0.72rem;
   text-transform: uppercase;

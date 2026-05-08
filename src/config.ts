@@ -59,6 +59,7 @@ export interface LiteClawConfig {
     compaction?: {
       mode?: string;
       softThresholdTokens?: number;
+      softThresholdPct?: number;
     };
     planner?: {
       enabled?: boolean;
@@ -96,6 +97,19 @@ export interface LiteClawConfig {
   mcp?: {
     enabled?: boolean;
     servers?: Record<string, MCPServerConfig>;
+  };
+  extensions?: {
+    dnd?: {
+      enabled?: boolean;
+      narrativeModel?: string;
+      loadoutModel?: string;
+      defaultWorld?: string;
+      defaultTone?: string;
+      maxPlayers?: number;
+      autoProvision?: boolean;
+      narrativeTemperature?: number;
+      narrativeMaxTokens?: number;
+    };
   };
   gateway?: {
     port?: number;
@@ -170,7 +184,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.8.2' },
+    meta: { version: '0.8.4' },
     llm: {
       providers: {
         local: {
@@ -201,7 +215,7 @@ export function getDefaultConfig(): LiteClawConfig {
       thinkingDefault: 'medium',
       compaction: {
         mode: 'safeguard',
-        softThresholdTokens: 48000,
+        softThresholdPct: 90,
       },
       planner: {
         enabled: true,
@@ -240,6 +254,19 @@ export function getDefaultConfig(): LiteClawConfig {
     mcp: {
       enabled: true,
       servers: {},
+    },
+    extensions: {
+      dnd: {
+        enabled: true,
+        narrativeModel: '',
+        loadoutModel: '',
+        defaultWorld: 'elyndor',
+        defaultTone: 'heroic',
+        maxPlayers: 6,
+        autoProvision: true,
+        narrativeTemperature: 0.9,
+        narrativeMaxTokens: 4096,
+      },
     },
     gateway: {
       port: 7860,
@@ -287,12 +314,13 @@ export function loadSystemPrompt(): string {
   }
 
   if (!basePrompt) {
-    basePrompt = `You are LiteClaw, a helpful AI assistant running locally. Be concise and helpful.`;
+    basePrompt = `You are {{BOT_NAME}}, a helpful AI assistant running locally. Be concise and helpful.`;
   }
 
   // ── Inject dynamic values ──
   basePrompt = basePrompt.replace(/\{\{DATE\}\}/g, new Date().toLocaleDateString());
   basePrompt = basePrompt.replace(/\{\{STATE_DIR\}\}/g, stateDir.replace(/\\/g, '/'));
+  basePrompt = basePrompt.replace(/\{\{BOT_NAME\}\}/g, config.agent?.name ?? 'LiteClaw');
 
   // ── Load personality files ──
   const PERSONALITY_FILES = [

@@ -63,6 +63,36 @@ export interface ContextBudget {
   available: number;
 }
 
+export interface ContextThresholdInfo {
+  maxContextTokens: number;
+  budgetPct: number;
+  budgetTokens: number;
+  compactionPct: number;
+  softThresholdTokens: number;
+}
+
+function clampPct(value: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(100, Math.max(1, value));
+}
+
+export function resolveContextThresholds(): ContextThresholdInfo {
+  const config = getConfig();
+  const maxContextTokens = config.agent?.contextTokens ?? 64000;
+  const budgetPct = clampPct(config.agent?.contextBudgetPct ?? 80, 80);
+  const budgetTokens = Math.floor(maxContextTokens * (budgetPct / 100));
+  const compactionPct = clampPct(config.agent?.compaction?.softThresholdPct ?? 90, 90);
+  const softThresholdTokens = Math.floor(budgetTokens * (compactionPct / 100));
+
+  return {
+    maxContextTokens,
+    budgetPct,
+    budgetTokens,
+    compactionPct,
+    softThresholdTokens,
+  };
+}
+
 export class ContextManager {
   private llmClient: LLMClient;
   private maxContextTokens: number;
@@ -71,11 +101,10 @@ export class ContextManager {
 
   constructor(llmClient: LLMClient) {
     this.llmClient = llmClient;
-    const config = getConfig();
-    this.maxContextTokens = config.agent?.contextTokens ?? 64000;
-    this.budgetPct = (config.agent?.contextBudgetPct ?? 80) / 100;
-    const defaultThreshold = Math.floor(this.maxContextTokens * (this.budgetPct * 0.9));
-    this.softThreshold = config.agent?.compaction?.softThresholdTokens ?? defaultThreshold;
+    const thresholds = resolveContextThresholds();
+    this.maxContextTokens = thresholds.maxContextTokens;
+    this.budgetPct = thresholds.budgetPct / 100;
+    this.softThreshold = thresholds.softThresholdTokens;
   }
 
   /**
