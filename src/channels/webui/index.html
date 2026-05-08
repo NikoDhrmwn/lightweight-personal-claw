@@ -196,6 +196,22 @@
         </section>
 
         <section class="settings-card">
+          <div class="panel-head"><span>Google Cloud / Vertex AI</span></div>
+          <div class="settings-two">
+            <label class="check-line"><input id="toggleGoogleVertex" type="checkbox"><span>Enable Vertex AI</span></label>
+            <label class="check-line"><input id="toggleGoogleExpress" type="checkbox"><span>Express Mode</span></label>
+          </div>
+          <label class="field field-wide" style="margin-top: 12px;">
+            <span>GCP Project ID</span>
+            <input id="settingGoogleProject" type="text" placeholder="my-project-id">
+          </label>
+          <label class="field field-wide">
+            <span>GCP Region</span>
+            <input id="settingGoogleRegion" type="text" placeholder="global">
+          </label>
+        </section>
+
+        <section class="settings-card">
           <div class="panel-head"><span>Agent</span></div>
           <label class="field field-wide">
             <span>Agent name</span>
@@ -306,6 +322,71 @@
             </label>
           </div>
           <div class="settings-note" id="gatewayAuthNote">Auth: --</div>
+        </section>
+
+        <section class="settings-card settings-card-extensions">
+          <div class="panel-head"><span>🧩 Extensions</span></div>
+          <div class="extension-cards">
+            <div class="subcard extension-subcard">
+              <div class="extension-header">
+                <div class="extension-info">
+                  <span class="extension-icon">🐉</span>
+                  <div>
+                    <div class="subcard-head">Dungeons &amp; Dragons</div>
+                    <div class="extension-desc">Multiplayer tabletop RPG engine with AI Game Master, combat, lore RAG, and character management.</div>
+                  </div>
+                </div>
+                <label class="check-line extension-toggle"><input id="toggleDndEnabled" type="checkbox"><span>Enabled</span></label>
+              </div>
+
+              <div class="extension-body" id="dndExtensionBody">
+                <div class="settings-two" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-light);">
+                  <label class="field">
+                    <span>Narrative model</span>
+                    <select id="settingDndNarrativeModel"><option value="">(use primary model)</option></select>
+                  </label>
+                  <label class="field">
+                    <span>Loadout model</span>
+                    <select id="settingDndLoadoutModel"><option value="">(use primary model)</option></select>
+                  </label>
+                  <label class="field">
+                    <span>Default world</span>
+                    <select id="settingDndWorld">
+                      <option value="elyndor">📚 Elyndor</option>
+                      <option value="random">🎲 Random (AI-generated)</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Default tone</span>
+                    <select id="settingDndTone">
+                      <option value="heroic">⚔️ Heroic</option>
+                      <option value="dark">🌑 Dark</option>
+                      <option value="comedic">😂 Comedic</option>
+                      <option value="mystery">🔍 Mystery</option>
+                      <option value="horror">👻 Horror</option>
+                      <option value="sandbox">🗺️ Sandbox</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Max players</span>
+                    <input id="settingDndMaxPlayers" type="number" min="2" max="12" placeholder="6">
+                  </label>
+                  <label class="field">
+                    <span>Narrative temp</span>
+                    <input id="settingDndNarrativeTemp" type="number" step="0.05" min="0" max="2" placeholder="0.9">
+                  </label>
+                  <label class="field">
+                    <span>Narrative max tokens</span>
+                    <input id="settingDndNarrativeMaxTokens" type="number" min="256" max="32768" placeholder="4096">
+                  </label>
+                </div>
+                <label class="check-line" style="margin-top: 8px;">
+                  <input id="toggleDndAutoProvision" type="checkbox">
+                  <span>Auto-provision combat loadouts on session start</span>
+                </label>
+              </div>
+            </div>
+          </div>
         </section>
       </div>
 

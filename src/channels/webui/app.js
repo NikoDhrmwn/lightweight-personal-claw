@@ -111,9 +111,24 @@
     settingGatewayBind: $("#settingGatewayBind"),
     gatewayAuthNote: $("#gatewayAuthNote"),
     settingAgentName: $("#settingAgentName"),
+    toggleGoogleVertex: $("#toggleGoogleVertex"),
+    toggleGoogleExpress: $("#toggleGoogleExpress"),
+    settingGoogleProject: $("#settingGoogleProject"),
+    settingGoogleRegion: $("#settingGoogleRegion"),
     onboardingModal: $("#onboardingModal"),
     onboardingName: $("#onboardingName"),
     onboardingSubmit: $("#onboardingSubmit"),
+    // Extensions: D&D
+    toggleDndEnabled: $("#toggleDndEnabled"),
+    dndExtensionBody: $("#dndExtensionBody"),
+    settingDndNarrativeModel: $("#settingDndNarrativeModel"),
+    settingDndLoadoutModel: $("#settingDndLoadoutModel"),
+    settingDndWorld: $("#settingDndWorld"),
+    settingDndTone: $("#settingDndTone"),
+    settingDndMaxPlayers: $("#settingDndMaxPlayers"),
+    settingDndNarrativeTemp: $("#settingDndNarrativeTemp"),
+    settingDndNarrativeMaxTokens: $("#settingDndNarrativeMaxTokens"),
+    toggleDndAutoProvision: $("#toggleDndAutoProvision"),
   };
 
   // ─── Sidebar Toggle ──────────────────────────────────────────────
@@ -459,11 +474,40 @@
     refs.toggleConfirmDelete.checked = !!config.tools?.filesystem?.confirmDelete;
     refs.toggleVisionEnabled.checked = !!config.tools?.vision?.enabled;
     refs.settingVisionMaxDimension.value = config.tools?.vision?.maxDimensionPx || 1024;
+
+    const google = config.llm?.providers?.google || {};
+    if (refs.toggleGoogleVertex) refs.toggleGoogleVertex.checked = !!google.vertex;
+    if (refs.toggleGoogleExpress) refs.toggleGoogleExpress.checked = !!google.express;
+    if (refs.settingGoogleProject) refs.settingGoogleProject.value = google.project || "";
+    if (refs.settingGoogleRegion) refs.settingGoogleRegion.value = google.region || "global";
+    updateGoogleVisibility();
+
     refs.settingGatewayPort.value = config.gateway?.port || 7860;
     refs.settingGatewayBind.value = config.gateway?.bind || "loopback";
     refs.gatewayAuthNote.textContent = config.gateway?.authEnabled
       ? "Auth: gateway token configured"
       : "Auth: local WebUI endpoints open";
+
+    // Extensions: D&D
+    const dnd = config.extensions?.dnd || {};
+    if (refs.toggleDndEnabled) refs.toggleDndEnabled.checked = dnd.enabled !== false;
+    updateDndVisibility();
+
+    // Populate DnD model selects from available models list
+    const dndModels = config.llm?.availableModels || [];
+    for (const sel of [refs.settingDndNarrativeModel, refs.settingDndLoadoutModel]) {
+      if (!sel) continue;
+      sel.innerHTML = `<option value="">(use primary model)</option>`
+        + dndModels.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join("");
+    }
+    if (refs.settingDndNarrativeModel) refs.settingDndNarrativeModel.value = dnd.narrativeModel || "";
+    if (refs.settingDndLoadoutModel) refs.settingDndLoadoutModel.value = dnd.loadoutModel || "";
+    if (refs.settingDndWorld) refs.settingDndWorld.value = dnd.defaultWorld || "elyndor";
+    if (refs.settingDndTone) refs.settingDndTone.value = dnd.defaultTone || "heroic";
+    if (refs.settingDndMaxPlayers) refs.settingDndMaxPlayers.value = dnd.maxPlayers || 6;
+    if (refs.settingDndNarrativeTemp) refs.settingDndNarrativeTemp.value = dnd.narrativeTemperature ?? 0.9;
+    if (refs.settingDndNarrativeMaxTokens) refs.settingDndNarrativeMaxTokens.value = dnd.narrativeMaxTokens || 4096;
+    if (refs.toggleDndAutoProvision) refs.toggleDndAutoProvision.checked = dnd.autoProvision !== false;
   }
 
   function updateLlmParamsVisibility() {
@@ -472,7 +516,32 @@
     }
   }
 
+  function updateGoogleVisibility() {
+    const isExpress = refs.toggleGoogleExpress?.checked;
+    if (refs.settingGoogleProject) {
+      refs.settingGoogleProject.disabled = isExpress;
+      refs.settingGoogleProject.closest(".field").style.opacity = isExpress ? "0.5" : "1";
+    }
+    if (refs.settingGoogleRegion) {
+      refs.settingGoogleRegion.disabled = isExpress;
+      refs.settingGoogleRegion.closest(".field").style.opacity = isExpress ? "0.5" : "1";
+    }
+  }
+
   refs.settingModel.addEventListener("change", updateLlmParamsVisibility);
+  if (refs.toggleGoogleExpress) {
+    refs.toggleGoogleExpress.addEventListener("change", updateGoogleVisibility);
+  }
+
+  function updateDndVisibility() {
+    if (!refs.dndExtensionBody) return;
+    const enabled = refs.toggleDndEnabled?.checked ?? true;
+    refs.dndExtensionBody.classList.toggle("disabled", !enabled);
+  }
+
+  if (refs.toggleDndEnabled) {
+    refs.toggleDndEnabled.addEventListener("change", updateDndVisibility);
+  }
 
   function gatherSettingsPayload() {
     const toolLoading = document.querySelector("#toolLoadingGroup .toggle-chip.active")?.dataset.value || "lazy";
@@ -537,6 +606,25 @@
       gateway: {
         port: Number(refs.settingGatewayPort.value || 7860),
         bind: refs.settingGatewayBind.value,
+      },
+      google: {
+        vertex: refs.toggleGoogleVertex?.checked ?? false,
+        express: refs.toggleGoogleExpress?.checked ?? false,
+        project: refs.settingGoogleProject?.value.trim() ?? "",
+        region: refs.settingGoogleRegion?.value.trim() ?? "global",
+      },
+      extensions: {
+        dnd: {
+          enabled: refs.toggleDndEnabled?.checked ?? true,
+          narrativeModel: refs.settingDndNarrativeModel?.value ?? "",
+          loadoutModel: refs.settingDndLoadoutModel?.value ?? "",
+          defaultWorld: refs.settingDndWorld?.value ?? "elyndor",
+          defaultTone: refs.settingDndTone?.value ?? "heroic",
+          maxPlayers: Number(refs.settingDndMaxPlayers?.value || 6),
+          autoProvision: refs.toggleDndAutoProvision?.checked ?? true,
+          narrativeTemperature: Number(refs.settingDndNarrativeTemp?.value || 0.9),
+          narrativeMaxTokens: Number(refs.settingDndNarrativeMaxTokens?.value || 4096),
+        },
       },
     };
   }
