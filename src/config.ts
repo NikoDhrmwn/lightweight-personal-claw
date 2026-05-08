@@ -98,6 +98,19 @@ export interface LiteClawConfig {
     enabled?: boolean;
     servers?: Record<string, MCPServerConfig>;
   };
+  extensions?: {
+    dnd?: {
+      enabled?: boolean;
+      narrativeModel?: string;
+      loadoutModel?: string;
+      defaultWorld?: string;
+      defaultTone?: string;
+      maxPlayers?: number;
+      autoProvision?: boolean;
+      narrativeTemperature?: number;
+      narrativeMaxTokens?: number;
+    };
+  };
   gateway?: {
     port?: number;
     bind?: string;
@@ -241,6 +254,19 @@ export function getDefaultConfig(): LiteClawConfig {
     mcp: {
       enabled: true,
       servers: {},
+    },
+    extensions: {
+      dnd: {
+        enabled: true,
+        narrativeModel: '',
+        loadoutModel: '',
+        defaultWorld: 'elyndor',
+        defaultTone: 'heroic',
+        maxPlayers: 6,
+        autoProvision: true,
+        narrativeTemperature: 0.9,
+        narrativeMaxTokens: 4096,
+      },
     },
     gateway: {
       port: 7860,

@@ -560,7 +560,12 @@ export class DndDiscordController {
 
   private createLoadoutEngine(): LLMClient {
     const config = getConfig();
-    const selectedId = String(config.llm?.defaults?.loadoutModel ?? '').trim();
+    // Prefer extensions.dnd.loadoutModel, fall back to legacy llm.defaults.loadoutModel
+    const selectedId = String(
+      config.extensions?.dnd?.loadoutModel
+      ?? config.llm?.defaults?.loadoutModel
+      ?? ''
+    ).trim();
     if (!selectedId) {
       return this.engine;
     }

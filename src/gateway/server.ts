@@ -445,7 +445,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.8.3',
+        version: config.meta?.version ?? '0.8.4',
       },
       paths: {
         stateDir: getStateDir(),
@@ -528,6 +528,19 @@ export class GatewayServer {
         port: config.gateway?.port ?? 7860,
         bind: config.gateway?.bind ?? 'loopback',
         authEnabled: !!(config.gateway?.auth?.token ?? process.env.GATEWAY_TOKEN),
+      },
+      extensions: {
+        dnd: {
+          enabled: config.extensions?.dnd?.enabled ?? true,
+          narrativeModel: config.extensions?.dnd?.narrativeModel ?? '',
+          loadoutModel: config.extensions?.dnd?.loadoutModel ?? config.llm?.defaults?.loadoutModel ?? '',
+          defaultWorld: config.extensions?.dnd?.defaultWorld ?? 'elyndor',
+          defaultTone: config.extensions?.dnd?.defaultTone ?? 'heroic',
+          maxPlayers: config.extensions?.dnd?.maxPlayers ?? 6,
+          autoProvision: config.extensions?.dnd?.autoProvision ?? true,
+          narrativeTemperature: config.extensions?.dnd?.narrativeTemperature ?? 0.9,
+          narrativeMaxTokens: config.extensions?.dnd?.narrativeMaxTokens ?? 4096,
+        },
       },
     };
   }
@@ -873,6 +886,16 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
     if (patch.llm.maxOutputTokens !== undefined) next.llm.defaults.maxOutputTokens = Number(patch.llm.maxOutputTokens);
   }
 
+  if (patch.google) {
+    next.llm ??= {};
+    next.llm.providers ??= {};
+    next.llm.providers.google ??= {};
+    if (patch.google.vertex !== undefined) next.llm.providers.google.vertex = !!patch.google.vertex;
+    if (patch.google.express !== undefined) next.llm.providers.google.express = !!patch.google.express;
+    if (patch.google.project !== undefined) next.llm.providers.google.project = String(patch.google.project).trim();
+    if (patch.google.region !== undefined) next.llm.providers.google.region = String(patch.google.region).trim();
+  }
+
   if (patch.agent) {
     next.agent ??= {};
     if (patch.agent.name !== undefined) next.agent.name = String(patch.agent.name || '').trim();
@@ -964,6 +987,25 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
     next.gateway ??= {};
     if (patch.gateway.port !== undefined) next.gateway.port = Number(patch.gateway.port);
     if (patch.gateway.bind !== undefined) next.gateway.bind = patch.gateway.bind === '0.0.0.0' ? '0.0.0.0' : 'loopback';
+  }
+
+  if (patch.extensions?.dnd) {
+    next.extensions ??= {};
+    next.extensions.dnd ??= {};
+    const dnd = patch.extensions.dnd;
+    if (dnd.enabled !== undefined) next.extensions.dnd.enabled = !!dnd.enabled;
+    if (dnd.narrativeModel !== undefined) next.extensions.dnd.narrativeModel = String(dnd.narrativeModel).trim();
+    if (dnd.loadoutModel !== undefined) next.extensions.dnd.loadoutModel = String(dnd.loadoutModel).trim();
+    if (dnd.defaultWorld !== undefined) next.extensions.dnd.defaultWorld = String(dnd.defaultWorld).trim();
+    if (dnd.defaultTone !== undefined) next.extensions.dnd.defaultTone = String(dnd.defaultTone).trim();
+    if (dnd.maxPlayers !== undefined) next.extensions.dnd.maxPlayers = Math.max(2, Math.min(12, Number(dnd.maxPlayers)));
+    if (dnd.autoProvision !== undefined) next.extensions.dnd.autoProvision = !!dnd.autoProvision;
+    if (dnd.narrativeTemperature !== undefined) next.extensions.dnd.narrativeTemperature = Math.max(0, Math.min(2, Number(dnd.narrativeTemperature)));
+    if (dnd.narrativeMaxTokens !== undefined) next.extensions.dnd.narrativeMaxTokens = Math.max(256, Math.min(32768, Number(dnd.narrativeMaxTokens)));
+    // Migrate loadoutModel to extensions if set at top-level
+    if (next.llm?.defaults?.loadoutModel && !next.extensions.dnd.loadoutModel) {
+      next.extensions.dnd.loadoutModel = next.llm.defaults.loadoutModel;
+    }
   }
 
   if (next.agent?.maxTurns && next.agent.maxTurns < 1) {
