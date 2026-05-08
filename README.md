@@ -41,16 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Percentage-Based Compaction**: Replaced absolute token thresholds with percentage-based `softThresholdPct` for more resilient context management.
 - **D&D Session Polish**: Refined Discord embeds for a more compact and consistent visual style across all DnD commands.
 
-### [0.8.2] - 2026-05-05
-
-#### Added
-
-- **Model Context Protocol (MCP)**: Native client support for MCP servers.
-  - Automated tool discovery and registration from MCP servers.
-  - Added `mcp_list`, `mcp_get_resource`, and `mcp_call_tool` utilities.
-  - Integrated MCP session management into the core engine.
-  - Support for GitHub MCP via Copilot API.
-
 ## Features
 
 - **Autonomous Task Planner**: Breaks down complex requests into multi-step executable plans.
