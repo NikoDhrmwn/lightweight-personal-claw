@@ -184,7 +184,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.8.3' },
+    meta: { version: '0.8.4' },
     llm: {
       providers: {
         local: {

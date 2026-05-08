@@ -11,6 +11,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.8.4] - 2026-05-08
+
+#### Added
+
+- **Extensions Tab**: New "Extensions" section in WebUI settings panel for managing opt-in features.
+- **DnD as Extension**: The D&D system is now a fully configurable extension with:
+  - Dedicated **Narrative Model** and **Loadout Model** selectors (falls back to primary model when unset).
+  - **Default World** and **Tone** presets (Heroic, Dark, Comedic, Mystery, Horror, Sandbox).
+  - **Max Players**, **Narrative Temperature**, and **Max Tokens** tuning.
+  - **Auto-Provision** toggle for combat loadout generation on session start.
+
+#### Changed
+
+- **Config Schema**: Added `extensions.dnd` section to `LiteClawConfig` for persistent DnD settings.
+- **Backward Compatibility**: `llm.defaults.loadoutModel` is still respected as a fallback when `extensions.dnd.loadoutModel` is unset.
+- **Gateway API**: `GET /api/config` and `PATCH /api/config` now expose and accept `extensions.dnd` fields.
+
 ### [0.8.3] - 2026-05-06
 
 #### Added
@@ -210,7 +227,7 @@ npx tsx src/cli.ts message "hello"
 
 ## MCP Setup
 
-LiteClaw 0.8.3 adds native MCP client support. MCP tools are discovered at startup and injected into the agent like built-in tools, while MCP prompts and resources are available through `mcp_*` utility tools.
+LiteClaw 0.8.4 adds native MCP client support and an extensible plugin system. MCP tools are discovered at startup and injected into the agent like built-in tools, while MCP prompts and resources are available through `mcp_*` utility tools.
 
 ### Quick GitHub setup
 

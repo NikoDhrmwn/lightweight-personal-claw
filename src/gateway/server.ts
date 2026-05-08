@@ -368,7 +368,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.8.3',
+      version: '0.8.4',
       name: config.agent?.name ?? 'LiteClaw',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
